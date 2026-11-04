@@ -1,6 +1,6 @@
 //! The instance and the executor: the two halves of the public lifecycle.
 
-use std::sync::{Arc, RwLock, Weak};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use tokio_util::sync::CancellationToken;
@@ -40,10 +40,6 @@ pub struct Executor {
     monitor_tasks: Tasks,
     /// Cancelled when shutdown begins, which is what the producers' loops watch to stop.
     stopping: CancellationToken,
-    /// The instance that launched this executor, held weakly: the instance owns the executor, so
-    /// a strong reference back would be a cycle. Only compared, never upgraded — it is how a
-    /// [`WorkflowRef`](crate::WorkflowRef) recognises the ambient executor as its own.
-    instance: WeakDBOS,
 }
 
 impl Executor {
@@ -58,11 +54,7 @@ impl Executor {
     /// a workflow started the instant launch returns is `PENDING` under this executor's id too,
     /// and a sweep running any later would tear it off its runner and offer it to the fleet. It is
     /// one write rather than a list of workflows to run, so nothing about it is backgrounded.
-    async fn start(
-        config: &Config,
-        workflows: Snapshot,
-        instance: WeakDBOS,
-    ) -> Result<(Self, Vec<String>)> {
+    async fn start(config: &Config, workflows: Snapshot) -> Result<(Self, Vec<String>)> {
         config.validate()?;
 
         if workflows.is_empty() {
@@ -113,7 +105,6 @@ impl Executor {
             workflow_tasks: Tasks::default(),
             monitor_tasks: Tasks::default(),
             stopping: CancellationToken::new(),
-            instance,
         };
         Ok((executor, recovered))
     }
@@ -125,11 +116,6 @@ impl Executor {
     /// connection and be called by a [`Client`](crate::Client) too — see that module.
     pub(crate) fn connection(&self) -> &Arc<Connection> {
         &self.conn
-    }
-
-    /// Whether `instance` is the one that launched this executor.
-    pub(crate) fn launched_by(&self, instance: &WeakDBOS) -> bool {
-        self.instance.ptr_eq(instance)
     }
 
     /// The system database this executor is running against.
@@ -396,34 +382,14 @@ pub struct ShutdownOptions {
 #[derive(Clone)]
 pub struct DBOS(Arc<Inner>);
 
-/// A [`DBOS`] that does not keep the instance alive.
-///
-/// For what the instance itself owns — a [`WorkflowRef`](crate::WorkflowRef) captured in a
-/// registered closure, the executor — where a strong reference would be a cycle and the
-/// instance, its executor and its connection pool would never be freed.
-#[derive(Clone)]
-pub(crate) struct WeakDBOS(Weak<Inner>);
-
-impl WeakDBOS {
-    /// The instance, if any handle to it is still alive.
-    pub(crate) fn upgrade(&self) -> Option<DBOS> {
-        self.0.upgrade().map(DBOS)
-    }
-
-    /// Whether the two name the same instance.
-    pub(crate) fn ptr_eq(&self, other: &WeakDBOS) -> bool {
-        Weak::ptr_eq(&self.0, &other.0)
-    }
-}
-
 struct Inner {
     config: Config,
     /// Every workflow registered so far. Lives on the instance rather than the executor, because
     /// registration happens before there is an executor.
     registry: Registry,
-    /// `None` until launched. Read on every operation, written twice in a process's life, so a
-    /// reader-biased lock rather than the async one below.
-    executor: RwLock<Option<Arc<Executor>>>,
+    /// `None` until launched. Shared with every [`WorkflowRef`](crate::WorkflowRef) — see
+    /// [`ExecutorSlot`].
+    executor: Arc<ExecutorSlot>,
     /// Serializes launch against shutdown, and either against itself.
     ///
     /// **This guard is deliberately held across await points** — `Executor::start` connects and
@@ -444,7 +410,7 @@ impl Drop for Inner {
         // `shutdown` is async and `Drop` is not, so this can only report. Closing here would mean
         // blocking on a runtime from inside a drop, which deadlocks when the drop is itself on
         // that runtime.
-        if self.executor.get_mut().is_ok_and(|slot| slot.is_some()) {
+        if self.executor.read().is_some() {
             tracing::warn!(
                 app_name = self.config.app_name,
                 "DBOS dropped while still launched: call `shutdown().await` to close the system \
@@ -461,14 +427,9 @@ impl DBOS {
         Self(Arc::new(Inner {
             config,
             registry: Registry::default(),
-            executor: RwLock::new(None),
+            executor: Arc::default(),
             lifecycle: tokio::sync::Mutex::new(()),
         }))
-    }
-
-    /// A handle to this instance that does not keep it alive.
-    pub(crate) fn downgrade(&self) -> WeakDBOS {
-        WeakDBOS(Arc::downgrade(&self.0))
     }
 
     /// The configuration this instance was built with.
@@ -502,9 +463,7 @@ impl DBOS {
         // Freezing the registry and reading it are one act, so a registration cannot land between
         // the two and be handed back a `WorkflowRef` for a workflow this executor will not have.
         let workflows = self.0.registry.snapshot();
-        let instance = self.downgrade();
-        let (executor, recovered) = match Executor::start(&self.0.config, workflows, instance).await
-        {
+        let (executor, recovered) = match Executor::start(&self.0.config, workflows).await {
             Ok(started) => started,
             Err(error) => {
                 // Nothing was installed, so nothing holds the snapshot and registration is open
@@ -657,24 +616,60 @@ impl DBOS {
     ///
     /// The operation is named because the useful half of the error is which call was too early.
     pub(crate) fn executor(&self, operation: &'static str) -> Result<Arc<Executor>> {
-        self.read_executor().ok_or(Error::NotLaunched {
+        self.0.executor.get(operation)
+    }
+
+    /// The slot this instance's executor is installed in, for a [`WorkflowRef`](crate::WorkflowRef)
+    /// to hold in place of the instance.
+    pub(crate) fn executor_slot(&self) -> Arc<ExecutorSlot> {
+        Arc::clone(&self.0.executor)
+    }
+
+    fn read_executor(&self) -> Option<Arc<Executor>> {
+        self.0.executor.read()
+    }
+
+    fn write_executor(&self) -> std::sync::RwLockWriteGuard<'_, Option<Arc<Executor>>> {
+        self.0.executor.write()
+    }
+}
+
+/// Where an instance's executor is installed: `None` until launched and again after shutdown.
+///
+/// **Its own allocation rather than a field of the instance**, so that a
+/// [`WorkflowRef`](crate::WorkflowRef) can hold it without holding the instance. A workflow body
+/// starts a child through a reference captured in its registered closure, and the registry that
+/// owns the closure lives on the instance, so a reference that held the instance would hold
+/// itself: the instance, its registry and its configuration would never be freed. Holding the
+/// slot instead makes a cycle only through the executor — slot, executor, its registry snapshot,
+/// the closure, the reference, the slot — and shutdown breaks it by emptying the slot. A
+/// reference also starts workflows for as long as the instance is launched, whether or not any
+/// handle to the instance itself is still held.
+///
+/// Read on every operation, written twice in a process's life, so a reader-biased lock rather than
+/// an async one.
+#[derive(Default)]
+pub(crate) struct ExecutorSlot(RwLock<Option<Arc<Executor>>>);
+
+impl ExecutorSlot {
+    /// The running executor, or [`Error::NotLaunched`] naming the operation that wanted it.
+    pub(crate) fn get(&self, operation: &'static str) -> Result<Arc<Executor>> {
+        self.read().ok_or(Error::NotLaunched {
             operation: operation.into(),
         })
     }
 
-    fn read_executor(&self) -> Option<Arc<Executor>> {
+    fn read(&self) -> Option<Arc<Executor>> {
         // A poisoned lock here cannot mean torn state: the guarded value is one `Option<Arc<_>>`
         // and every section under the lock is infallible, so a panic elsewhere leaves it whole.
         self.0
-            .executor
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
     }
 
-    fn write_executor(&self) -> std::sync::RwLockWriteGuard<'_, Option<Arc<Executor>>> {
+    fn write(&self) -> std::sync::RwLockWriteGuard<'_, Option<Arc<Executor>>> {
         self.0
-            .executor
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }

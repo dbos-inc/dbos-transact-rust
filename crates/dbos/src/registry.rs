@@ -14,9 +14,8 @@ use std::sync::{Arc, RwLock};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use crate::context::Ctx;
 use crate::error::{DurableError, EncodedError, EngineOnly, Failure};
-use crate::instance::WeakDBOS;
+use crate::instance::ExecutorSlot;
 use crate::serialization::{PayloadEncoding, SerializationFormat, decode_input, encode};
 pub(crate) use crate::sysdb::types::QualifiedWorkflowName;
 use crate::{DBOS, Error, Executor, Result};
@@ -184,11 +183,16 @@ impl Registry {
 /// This is what registration returns and what a call site holds. The registry stores only the
 /// erased form; the types live here, so a caller gets them checked once at registration rather
 /// than at every invocation by string.
+///
+/// A reference starts workflows while its instance is launched, whether or not a [`DBOS`] handle
+/// is still held beside it, and answers [`Error::NotLaunched`] before launch and after
+/// [`shutdown`](DBOS::shutdown). It does not keep the instance itself alive, which is what makes
+/// capturing one in a registered workflow — to start a child — safe.
 pub struct WorkflowRef<P, R, E = EngineOnly> {
-    /// Weak, so a reference captured in a registered closure — the way a workflow body starts a
-    /// child — does not keep the instance alive. The registry that owns the closure lives on the
-    /// instance, so a strong one would be a cycle and the instance would never be freed.
-    dbos: WeakDBOS,
+    /// The instance's executor slot rather than the instance, so a reference captured in a
+    /// registered closure — the way a workflow body starts a child — does not keep the instance
+    /// alive. See [`ExecutorSlot`].
+    executor: Arc<ExecutorSlot>,
     name: Arc<QualifiedWorkflowName>,
     /// How a start writes this workflow unless it chooses otherwise.
     serialization: SerializationFormat,
@@ -213,27 +217,8 @@ impl<P, R, E> WorkflowRef<P, R, E> {
 
     /// The executor that serves a start of this workflow, or [`Error::NotLaunched`] naming
     /// `operation`.
-    ///
-    /// **Inside a workflow running on this workflow's instance, the ambient one**, as a step takes
-    /// it, so nothing has to reach the instance. Elsewhere the instance's current executor — which
-    /// is also what a workflow running on *another* instance gets, so the placement that follows
-    /// can refuse it as [`Error::WrongInstance`]. An instance every handle to has been dropped has
-    /// no executor to offer, and answers as one never launched does.
     pub(crate) fn executor(&self, operation: &'static str) -> Result<Arc<Executor>> {
-        let ambient = Ctx::with_current(|ctx| {
-            ctx.map(Ctx::executor)
-                .filter(|executor| executor.launched_by(&self.dbos))
-                .cloned()
-        });
-        match ambient {
-            Some(executor) => Ok(executor),
-            None => match self.dbos.upgrade() {
-                Some(dbos) => dbos.executor(operation),
-                None => Err(Error::NotLaunched {
-                    operation: operation.into(),
-                }),
-            },
-        }
+        self.executor.get(operation)
     }
 
     /// How a start writes this workflow when it does not choose.
@@ -247,7 +232,7 @@ impl<P, R, E> WorkflowRef<P, R, E> {
 impl<P, R, E> Clone for WorkflowRef<P, R, E> {
     fn clone(&self) -> Self {
         Self {
-            dbos: self.dbos.clone(),
+            executor: Arc::clone(&self.executor),
             name: Arc::clone(&self.name),
             serialization: self.serialization,
             types: PhantomData,
@@ -299,8 +284,8 @@ impl DBOS {
     /// # Ok(()) }
     /// ```
     ///
-    /// A reference does not keep the instance alive, and a start inside a workflow takes its
-    /// executor from the ambient context the way a step does.
+    /// A reference holds the instance's executor rather than the instance, so it keeps nothing
+    /// alive past [`shutdown`](DBOS::shutdown).
     pub fn register_workflow<P, R, E, F, Fut>(
         &self,
         name: impl Into<QualifiedWorkflowName>,
@@ -398,7 +383,7 @@ impl DBOS {
         )?;
         tracing::debug!(workflow = %name, "registered a workflow");
         Ok(WorkflowRef {
-            dbos: self.downgrade(),
+            executor: self.executor_slot(),
             name: Arc::new(name),
             serialization: options.serialization,
             types: PhantomData,

@@ -8,8 +8,8 @@ use dbos::sysdb::SystemDatabase;
 use dbos::sysdb::postgres::{PostgresSystemDatabase, Settings};
 use dbos::sysdb::types::{Outcome, WorkflowStatus};
 use dbos::{
-    Config, DBOS, DuplicationPolicy, Error, QueueConflict, QueueOptions, QueueRequest, RunOptions,
-    StartOptions, Timeout, WorkflowIdReusePolicy,
+    Config, DBOS, Debouncer, DuplicationPolicy, Error, QueueConflict, QueueOptions, QueueRequest,
+    RunOptions, StartOptions, Timeout, WorkflowIdReusePolicy,
 };
 
 use dbos_test_support::{Backend, TestDatabase, owner_token, test_database};
@@ -3360,9 +3360,11 @@ async fn bad_enqueue_options_are_refused_before_the_step_id_is_taken() {
 /// instance alive.
 ///
 /// The registry that owns the closure lives on the instance, so a reference that held the instance
-/// strongly would be a cycle and the instance, its executor and its connection pool would never be
-/// freed. The probe is captured beside the reference: the closure is dropped only with the
-/// registry, and the registry only with the instance, so the probe's going is the instance's.
+/// would be a cycle and the instance, its executor and its connection pool would never be freed.
+/// The probe is captured beside the reference: the closure is dropped only with the registry, and
+/// the registry only with the instance, so the probe's going is the instance's. Every form a
+/// workflow body starts a child through is exercised — start, run and debounce — since each one
+/// reaches the executor through the reference.
 #[tokio::test]
 async fn a_captured_workflow_ref_does_not_keep_the_instance_alive() {
     let db = test_database().await;
@@ -3380,13 +3382,18 @@ async fn a_captured_workflow_ref_does_not_keep_the_instance_alive() {
             async move {
                 let started = child.start(n).await?.result().await?;
                 let ran = child.run(n + 1).await?;
-                Ok::<u32, Error>(started + ran)
+                let debounced = Debouncer::new(&child)
+                    .debounce("captured", Duration::from_millis(10), n + 2)
+                    .await?
+                    .result()
+                    .await?;
+                Ok::<u32, Error>(started + ran + debounced)
             }
         })
         .unwrap();
     dbos.launch().await.expect("launch failed");
 
-    assert_eq!(parent.run(1).await.expect("the parent failed"), 6);
+    assert_eq!(parent.run(1).await.expect("the parent failed"), 2 + 4 + 6);
 
     dbos.shutdown().await;
     drop(dbos);
@@ -3395,8 +3402,8 @@ async fn a_captured_workflow_ref_does_not_keep_the_instance_alive() {
         "the instance is still alive: something holds it after its last handle was dropped"
     );
 
-    // A reference that outlived its instance has nothing to start through, and says so the way an
-    // unlaunched instance does.
+    // A reference that outlived its instance has nothing to start through: the slot it holds was
+    // emptied by shutdown.
     let error = parent
         .start(1)
         .await
