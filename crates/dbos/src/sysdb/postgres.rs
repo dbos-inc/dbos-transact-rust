@@ -156,7 +156,8 @@ fn empty_to_none(value: Option<&str>) -> Option<&str> {
 /// | `40001`, `40P01` | serialization failure, deadlock detected | conflict |
 /// | `25P03` | the session sat idle in a transaction too long, and was ended | connection |
 /// | `08P01` at `ERROR` | protocol violation — a malformed request | permanent |
-/// | `57014`, `57P04` | statement cancelled, database dropped | permanent |
+/// | `57014` | statement cancelled — but see CockroachDB's drain below | permanent |
+/// | `57P04` | database dropped | permanent |
 /// | anything else | the request reached the database and was refused | permanent |
 ///
 /// `53` is grouped with connections: `53300 too_many_connections` is a failure to obtain a
@@ -175,19 +176,29 @@ fn empty_to_none(value: Option<&str>) -> Option<&str> {
 /// `57014` is a statement cancelled while the connection stayed healthy, by `statement_timeout`
 /// or by someone cancelling the backend; a timeout fires again on every attempt, and a deliberate
 /// cancel is meant to stop the work, not delay it. `57P04` names a database that was dropped,
-/// which no wait brings back.
+/// which no wait brings back: a standby reports it when the primary drops the database.
+///
+/// **CockroachDB's bare `query execution canceled` is the exception to `57014`.** A node that
+/// drains, as every rolling restart does, cuts off in-flight statements with it (or with `57P01`,
+/// depending on timing) and then closes the session; reconnecting reaches a live node. Its
+/// statement timeout says `query execution canceled due to statement timeout`, and Postgres's
+/// cancellations all start `canceling statement`, so the bare message is read as a connection
+/// failure and everything else under `57014` is not. The cost: a deliberate `CANCEL QUERY` on
+/// CockroachDB carries the same message and is retried.
 ///
 /// **`08P01` is split by severity**, because two different failures share it. Postgres raises it
 /// at `ERROR` for a malformed request — a bind that supplies the wrong number of parameters, say
 /// — and leaves the session usable; the same request is malformed on every attempt, so it is
-/// permanent. PgBouncer uses it as the code for every error of its own, at `FATAL`, closing the
-/// client connection: a pool wait that timed out, a server shutting down, a client limit reached.
-/// Those are what reconnecting is for, so a `FATAL` one is a connection error. The cost is that
-/// PgBouncer's permanent refusals, such as a failed login, are retried too.
+/// permanent. PgBouncer uses it as the code for the errors it raises itself, and sends the ones
+/// that close the client connection at `FATAL`: a pool wait that timed out, a server shutting
+/// down, a client limit reached. Those are what reconnecting is for, so a `FATAL` one is a
+/// connection error. The cost is that PgBouncer's permanent refusals, such as a failed login, are
+/// retried too.
 ///
 /// `08007`, transaction resolution unknown, stays in its class. Nothing Postgres raises carries
-/// it, and it is no more ambiguous than a connection lost during a commit, which arrives with no
-/// SQLSTATE and is retried like any other lost connection.
+/// it, and it is no more ambiguous than a connection lost during a commit, which usually arrives
+/// with no SQLSTATE, or as `57P01` when the backend is terminated, and is retried like any other
+/// lost connection.
 ///
 /// `XX`, the internal-error class, is the one prefix whose message is read as well as its code:
 /// CockroachDB reports a lost client connection as an internal error, so the code alone would
@@ -216,6 +227,10 @@ fn classify(error: &sqlx::Error, sqlstate: Option<&str>) -> BackendErrorKind {
     }
 }
 
+/// The message CockroachDB attaches to `57014` when it cuts off a statement by draining the node
+/// or cancelling the session, rather than by a statement timeout.
+const COCKROACH_SESSION_CANCELED: &str = "query execution canceled";
+
 /// [`classify`] for a failure the database answered, from its SQLSTATE, severity and message.
 ///
 /// `severity` is `None` only for an error sqlx did not decode from a server response.
@@ -228,8 +243,18 @@ fn classify_sqlstate(
         return BackendErrorKind::Conflict;
     }
     // Inside the connection classes, but nothing a reconnect cures; see [`classify`].
-    if matches!(code, "57014" | "57P04") {
+    if code == "57P04" {
         return BackendErrorKind::Permanent;
+    }
+    // A cancelled statement, unless it is CockroachDB ending the session under it; see
+    // [`classify`].
+    if code == "57014" {
+        return match message {
+            Some(message) if message.trim() == COCKROACH_SESSION_CANCELED => {
+                BackendErrorKind::Connection
+            }
+            _ => BackendErrorKind::Permanent,
+        };
     }
     // A session-ending `08P01` is a pooler closing the connection; any other is a malformed
     // request. See [`classify`].
@@ -8474,26 +8499,56 @@ mod tests {
     }
 
     /// A cancelled statement and a dropped database sit in connection classes, but asking again
-    /// cannot help, so they are refused rather than retried.
+    /// cannot help, so they are refused rather than retried, whatever the severity.
     #[test]
     fn the_connection_class_exceptions_are_permanent() {
-        for code in ["57014", "57P04"] {
+        let cancellations = [
+            Some("canceling statement due to statement timeout"),
+            Some("canceling statement due to user request"),
+            Some("query execution canceled due to statement timeout"),
+            None,
+        ];
+        for severity in [Some(PgSeverity::Error), Some(PgSeverity::Fatal), None] {
+            for message in cancellations {
+                assert_eq!(
+                    classify_sqlstate("57014", severity, message),
+                    BackendErrorKind::Permanent,
+                    "{severity:?} {message:?}"
+                );
+            }
             assert_eq!(
-                classify_sqlstate(code, Some(PgSeverity::Error), None),
+                classify_sqlstate("57P04", severity, None),
                 BackendErrorKind::Permanent,
-                "{code}"
+                "{severity:?}"
             );
         }
+    }
+
+    /// CockroachDB cuts off an in-flight statement with a bare `query execution canceled` when the
+    /// node drains (or with `57P01`, depending on timing), and reconnecting reaches a live node.
+    #[test]
+    fn a_cockroach_session_cancel_is_a_connection_failure() {
+        assert_eq!(
+            classify_sqlstate(
+                "57014",
+                Some(PgSeverity::Error),
+                Some("query execution canceled")
+            ),
+            BackendErrorKind::Connection
+        );
     }
 
     /// A protocol violation the server raises as an error is a malformed request; one that ends
     /// the session is a pooler closing the connection, which reconnecting cures.
     #[test]
     fn a_protocol_violation_is_split_by_severity() {
-        assert_eq!(
-            classify_sqlstate("08P01", Some(PgSeverity::Error), None),
-            BackendErrorKind::Permanent
-        );
+        for severity in [Some(PgSeverity::Error), Some(PgSeverity::Log), None] {
+            assert_eq!(
+                classify_sqlstate("08P01", severity, None),
+                BackendErrorKind::Permanent,
+                "{severity:?}"
+            );
+        }
         for severity in [PgSeverity::Fatal, PgSeverity::Panic] {
             assert_eq!(
                 classify_sqlstate("08P01", Some(severity), Some("query_wait_timeout")),
