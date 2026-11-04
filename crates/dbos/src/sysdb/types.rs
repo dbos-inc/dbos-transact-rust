@@ -3106,13 +3106,15 @@ impl RewindOptions<'_> {
 /// application's, and the DBOS console relies on it: a step whose name starts with `DBOS.` is shown
 /// as a framework action, not as user code. After the prefix, each name is the operation's words
 /// in camelCase — `send_bulk` records `DBOS.sendBulk`, and [`DBOS::cancel`](crate::DBOS::cancel)
-/// records `DBOS.cancelWorkflow` — the spelling the other SDKs sharing the database use for their
-/// own steps, and the names Rust 0.5 recorded. The console reads some of them by exact name: it
-/// tells a parent's await of a child from the child's start by `DBOS.getResult`.
+/// records `DBOS.cancelWorkflow` — the casing the other SDKs sharing the database use for their
+/// own steps, and the names Rust 0.5 recorded. Several names are Rust's own or are spelled
+/// differently by one SDK, so the casing is shared but not every name is. The console reads some
+/// of them by exact name: it tells a parent's await of a child from the child's start by
+/// `DBOS.getResult`.
 ///
 /// **Renaming one breaks replay.** A replay compares each recorded name exactly, so a workflow
 /// recorded under the old name fails under the new one with [`Error::UnexpectedStep`] and is
-/// eventually parked. A workflow started by an older release must still finish under this one.
+/// eventually parked: its step names must read the same in every release that may recover it.
 ///
 /// **Public because a caller may legitimately need to name one** — filtering a step listing to the
 /// engine's own operations, or grouping by them — and retyping a string the engine already owns is

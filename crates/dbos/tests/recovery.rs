@@ -165,9 +165,11 @@ async fn a_relaunch_resumes_at_the_step_after_the_last_one_recorded() {
 /// replays under this release.
 ///
 /// The body sets an event, starts and awaits a child, and cancels another workflow, then blocks;
-/// `shutdown` abandons it there. The history must hold exactly 0.5's names for those steps —
-/// `DBOS.setEvent`, `DBOS.getResult`, `DBOS.cancelWorkflow` — and the relaunch must replay every
-/// one of them from its checkpoint, without starting the child again, and finish.
+/// `shutdown` abandons it there. The history's names are then overwritten with 0.5's literals —
+/// `DBOS.setEvent`, `DBOS.getResult`, `DBOS.cancelWorkflow` — so it is 0.5's history whatever
+/// this build's constants say, and the relaunch must replay every one of those steps from its
+/// checkpoint, without starting the child again, and finish. A constant renamed away from 0.5's
+/// spelling fails the replay with `UnexpectedStep`, not just a string comparison.
 #[dbos_test_support::test]
 async fn a_history_under_the_0_5_step_names_replays() {
     let child_runs = Arc::new(AtomicU32::new(0));
@@ -244,6 +246,26 @@ async fn a_history_under_the_0_5_step_names_replays() {
     let err = running.await.expect("the task panicked").unwrap_err();
     assert!(matches!(err, Error::Interrupted { .. }), "{err}");
 
+    // Write 0.5's names over whatever this build recorded.
+    let mut admin = db.admin_connection().await;
+    for (step, name) in [
+        (0, "DBOS.setEvent"),
+        (2, "DBOS.getResult"),
+        (3, "DBOS.cancelWorkflow"),
+    ] {
+        let updated = sqlx::query(
+            "UPDATE dbos.operation_outputs SET function_name = $3 \
+             WHERE workflow_uuid = $1 AND function_id = $2",
+        )
+        .bind(parent_id)
+        .bind(step)
+        .bind(name)
+        .execute(&mut admin)
+        .await
+        .expect("rewrite failed");
+        assert_eq!(updated.rows_affected(), 1, "no step {step} to rewrite");
+    }
+
     let reader = reader(&db).await;
     let recorded = |steps: Vec<dbos::sysdb::types::StepRecord>| {
         steps
@@ -263,7 +285,7 @@ async fn a_history_under_the_0_5_step_names_replays() {
         (2, "DBOS.getResult".to_owned()),
         (3, "DBOS.cancelWorkflow".to_owned()),
     ];
-    assert_eq!(history, expected, "the history holds 0.5's names");
+    assert_eq!(history, expected, "the history is 0.5's");
 
     dbos.launch().await.expect("relaunch failed");
     dbos::__rt::timeout(DEADLINE, reached_gate.notified())

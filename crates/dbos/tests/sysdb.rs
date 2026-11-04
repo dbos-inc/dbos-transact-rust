@@ -8747,7 +8747,7 @@ async fn the_recorded_step_name_follows_the_surface_not_the_size() {
             .iter()
             .map(|s| (s.step_id, s.step_name.as_str()))
             .collect::<Vec<_>>(),
-        [(0, "DBOS.send"), (1, "DBOS.sendBulk"), (2, "DBOS.sendBulk"),],
+        [(0, "DBOS.send"), (1, "DBOS.sendBulk"), (2, "DBOS.sendBulk")],
         "the name is the surface the caller reached for, and a batch of one is still a batch",
     );
 }
