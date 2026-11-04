@@ -3355,3 +3355,54 @@ async fn bad_enqueue_options_are_refused_before_the_step_id_is_taken() {
 
     dbos.shutdown().await;
 }
+
+/// A registered workflow that captures a `WorkflowRef` to start children does not keep the
+/// instance alive.
+///
+/// The registry that owns the closure lives on the instance, so a reference that held the instance
+/// strongly would be a cycle and the instance, its executor and its connection pool would never be
+/// freed. The probe is captured beside the reference: the closure is dropped only with the
+/// registry, and the registry only with the instance, so the probe's going is the instance's.
+#[tokio::test]
+async fn a_captured_workflow_ref_does_not_keep_the_instance_alive() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("captured-ref-app", &db));
+    let probe = Arc::new(());
+    let freed = Arc::downgrade(&probe);
+
+    let child = dbos
+        .register_workflow("child", |n: u32| async move { Ok::<u32, Error>(n * 2) })
+        .unwrap();
+    let parent = dbos
+        .register_workflow("parent", move |n: u32| {
+            let child = child.clone();
+            let _probe = Arc::clone(&probe);
+            async move {
+                let started = child.start(n).await?.result().await?;
+                let ran = child.run(n + 1).await?;
+                Ok::<u32, Error>(started + ran)
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    assert_eq!(parent.run(1).await.expect("the parent failed"), 6);
+
+    dbos.shutdown().await;
+    drop(dbos);
+    assert!(
+        freed.upgrade().is_none(),
+        "the instance is still alive: something holds it after its last handle was dropped"
+    );
+
+    // A reference that outlived its instance has nothing to start through, and says so the way an
+    // unlaunched instance does.
+    let error = parent
+        .start(1)
+        .await
+        .expect_err("started on a dropped instance");
+    assert!(
+        matches!(&error, Error::NotLaunched { .. }),
+        "expected not-launched, got {error:?}"
+    );
+}

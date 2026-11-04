@@ -1,6 +1,6 @@
 //! The instance and the executor: the two halves of the public lifecycle.
 
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, Weak};
 use std::time::{Duration, Instant};
 
 use tokio_util::sync::CancellationToken;
@@ -40,6 +40,10 @@ pub struct Executor {
     monitor_tasks: Tasks,
     /// Cancelled when shutdown begins, which is what the producers' loops watch to stop.
     stopping: CancellationToken,
+    /// The instance that launched this executor, held weakly: the instance owns the executor, so
+    /// a strong reference back would be a cycle. Only compared, never upgraded — it is how a
+    /// [`WorkflowRef`](crate::WorkflowRef) recognises the ambient executor as its own.
+    instance: WeakDBOS,
 }
 
 impl Executor {
@@ -54,7 +58,11 @@ impl Executor {
     /// a workflow started the instant launch returns is `PENDING` under this executor's id too,
     /// and a sweep running any later would tear it off its runner and offer it to the fleet. It is
     /// one write rather than a list of workflows to run, so nothing about it is backgrounded.
-    async fn start(config: &Config, workflows: Snapshot) -> Result<(Self, Vec<String>)> {
+    async fn start(
+        config: &Config,
+        workflows: Snapshot,
+        instance: WeakDBOS,
+    ) -> Result<(Self, Vec<String>)> {
         config.validate()?;
 
         if workflows.is_empty() {
@@ -105,6 +113,7 @@ impl Executor {
             workflow_tasks: Tasks::default(),
             monitor_tasks: Tasks::default(),
             stopping: CancellationToken::new(),
+            instance,
         };
         Ok((executor, recovered))
     }
@@ -116,6 +125,11 @@ impl Executor {
     /// connection and be called by a [`Client`](crate::Client) too — see that module.
     pub(crate) fn connection(&self) -> &Arc<Connection> {
         &self.conn
+    }
+
+    /// Whether `instance` is the one that launched this executor.
+    pub(crate) fn launched_by(&self, instance: &WeakDBOS) -> bool {
+        self.instance.ptr_eq(instance)
     }
 
     /// The system database this executor is running against.
@@ -382,6 +396,26 @@ pub struct ShutdownOptions {
 #[derive(Clone)]
 pub struct DBOS(Arc<Inner>);
 
+/// A [`DBOS`] that does not keep the instance alive.
+///
+/// For what the instance itself owns — a [`WorkflowRef`](crate::WorkflowRef) captured in a
+/// registered closure, the executor — where a strong reference would be a cycle and the
+/// instance, its executor and its connection pool would never be freed.
+#[derive(Clone)]
+pub(crate) struct WeakDBOS(Weak<Inner>);
+
+impl WeakDBOS {
+    /// The instance, if any handle to it is still alive.
+    pub(crate) fn upgrade(&self) -> Option<DBOS> {
+        self.0.upgrade().map(DBOS)
+    }
+
+    /// Whether the two name the same instance.
+    pub(crate) fn ptr_eq(&self, other: &WeakDBOS) -> bool {
+        Weak::ptr_eq(&self.0, &other.0)
+    }
+}
+
 struct Inner {
     config: Config,
     /// Every workflow registered so far. Lives on the instance rather than the executor, because
@@ -432,6 +466,11 @@ impl DBOS {
         }))
     }
 
+    /// A handle to this instance that does not keep it alive.
+    pub(crate) fn downgrade(&self) -> WeakDBOS {
+        WeakDBOS(Arc::downgrade(&self.0))
+    }
+
     /// The configuration this instance was built with.
     pub fn config(&self) -> &Config {
         &self.0.config
@@ -463,7 +502,9 @@ impl DBOS {
         // Freezing the registry and reading it are one act, so a registration cannot land between
         // the two and be handed back a `WorkflowRef` for a workflow this executor will not have.
         let workflows = self.0.registry.snapshot();
-        let (executor, recovered) = match Executor::start(&self.0.config, workflows).await {
+        let instance = self.downgrade();
+        let (executor, recovered) = match Executor::start(&self.0.config, workflows, instance).await
+        {
             Ok(started) => started,
             Err(error) => {
                 // Nothing was installed, so nothing holds the snapshot and registration is open
