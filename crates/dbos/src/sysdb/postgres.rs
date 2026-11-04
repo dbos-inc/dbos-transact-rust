@@ -68,7 +68,7 @@ mod notifier;
 use std::collections::{HashMap, HashSet};
 
 use async_trait::async_trait;
-use sqlx::postgres::PgPoolOptions;
+use sqlx::postgres::{PgDatabaseError, PgPoolOptions, PgSeverity};
 use sqlx::{AssertSqlSafe, PgPool, Row};
 
 use self::listener::Listener;
@@ -155,7 +155,7 @@ fn empty_to_none(value: Option<&str>) -> Option<&str> {
 /// | `53…` | insufficient resources — out of memory, too many connections | connection |
 /// | `40001`, `40P01` | serialization failure, deadlock detected | conflict |
 /// | `25P03` | the session sat idle in a transaction too long, and was ended | connection |
-/// | `08P01`, `08007` | protocol violation, commit outcome unknown | permanent |
+/// | `08P01` at `ERROR` | protocol violation — a malformed request | permanent |
 /// | `57014`, `57P04` | statement cancelled, database dropped | permanent |
 /// | anything else | the request reached the database and was refused | permanent |
 ///
@@ -171,22 +171,34 @@ fn empty_to_none(value: Option<&str>) -> Option<&str> {
 /// an ambiguous result, where the transaction may have committed and a replay could apply it
 /// twice. Both are permanent, so they reach the caller.
 ///
-/// **Four codes are carved out of the connection classes**, because asking again cannot help
-/// and may hurt. `08P01`, a protocol violation, is the server refusing a malformed request — a
-/// bind that supplies the wrong number of parameters, say — and the same request is malformed on
-/// every attempt. `08007`, transaction resolution unknown, is the `40003` case again: the commit
-/// may have applied. `57014` is a statement cancelled while the connection stayed healthy, by
-/// `statement_timeout` or by someone cancelling the backend; a timeout fires again on every
-/// attempt, and a deliberate cancel is meant to stop the work, not delay it. `57P04` names a
-/// database that was dropped, which no wait brings back.
+/// **Two codes are carved out of the connection classes**, because asking again cannot help.
+/// `57014` is a statement cancelled while the connection stayed healthy, by `statement_timeout`
+/// or by someone cancelling the backend; a timeout fires again on every attempt, and a deliberate
+/// cancel is meant to stop the work, not delay it. `57P04` names a database that was dropped,
+/// which no wait brings back.
+///
+/// **`08P01` is split by severity**, because two different failures share it. Postgres raises it
+/// at `ERROR` for a malformed request — a bind that supplies the wrong number of parameters, say
+/// — and leaves the session usable; the same request is malformed on every attempt, so it is
+/// permanent. PgBouncer uses it as the code for every error of its own, at `FATAL`, closing the
+/// client connection: a pool wait that timed out, a server shutting down, a client limit reached.
+/// Those are what reconnecting is for, so a `FATAL` one is a connection error. The cost is that
+/// PgBouncer's permanent refusals, such as a failed login, are retried too.
+///
+/// `08007`, transaction resolution unknown, stays in its class. Nothing Postgres raises carries
+/// it, and it is no more ambiguous than a connection lost during a commit, which arrives with no
+/// SQLSTATE and is retried like any other lost connection.
 ///
 /// `XX`, the internal-error class, is the one prefix whose message is read as well as its code:
 /// CockroachDB reports a lost client connection as an internal error, so the code alone would
 /// call a transport failure permanent. See [`is_transport_failure`].
-///
 fn classify(error: &sqlx::Error, sqlstate: Option<&str>) -> BackendErrorKind {
     if let Some(code) = sqlstate {
-        return classify_sqlstate(code, error.as_database_error().map(|e| e.message()));
+        let database = error.as_database_error();
+        let severity = database
+            .and_then(|e| e.try_downcast_ref::<PgDatabaseError>())
+            .map(PgDatabaseError::severity);
+        return classify_sqlstate(code, severity, database.map(|e| e.message()));
     }
     // No SQLSTATE means the database never answered, so the request never reached it. sqlx
     // names the transport failure as a variant, so no message text needs reading.
@@ -204,14 +216,28 @@ fn classify(error: &sqlx::Error, sqlstate: Option<&str>) -> BackendErrorKind {
     }
 }
 
-/// [`classify`] for a failure the database answered, from its SQLSTATE and message alone.
-fn classify_sqlstate(code: &str, message: Option<&str>) -> BackendErrorKind {
+/// [`classify`] for a failure the database answered, from its SQLSTATE, severity and message.
+///
+/// `severity` is `None` only for an error sqlx did not decode from a server response.
+fn classify_sqlstate(
+    code: &str,
+    severity: Option<PgSeverity>,
+    message: Option<&str>,
+) -> BackendErrorKind {
     if matches!(code, "40001" | "40P01") {
         return BackendErrorKind::Conflict;
     }
     // Inside the connection classes, but nothing a reconnect cures; see [`classify`].
-    if matches!(code, "08P01" | "08007" | "57014" | "57P04") {
+    if matches!(code, "57014" | "57P04") {
         return BackendErrorKind::Permanent;
+    }
+    // A session-ending `08P01` is a pooler closing the connection; any other is a malformed
+    // request. See [`classify`].
+    if code == "08P01" {
+        return match severity {
+            Some(PgSeverity::Fatal | PgSeverity::Panic) => BackendErrorKind::Connection,
+            _ => BackendErrorKind::Permanent,
+        };
     }
     // `idle_in_transaction_session_timeout`: the server ended a session that sat idle inside a
     // transaction. The transaction rolled back with it, so asking again on a new connection is
@@ -8414,9 +8440,9 @@ impl PostgresSystemDatabase {
 #[cfg(test)]
 mod tests {
     use super::{
-        AssertSqlSafe, NOW_MS_SQL, PollingConcurrency, PostgresSystemDatabase, Settings,
-        classify_sqlstate, is_transport_failure, latest_version_sql, split_database,
-        step_listing_query, timed_out_sweep_sql, with_retry,
+        AssertSqlSafe, NOW_MS_SQL, PgSeverity, PollingConcurrency, PostgresSystemDatabase,
+        RetryPolicy, Settings, classify_sqlstate, is_transport_failure, latest_version_sql,
+        split_database, step_listing_query, timed_out_sweep_sql, with_retry,
     };
     use crate::sysdb::types::{
         EncodedValue, NewWorkflow, Outcome, StepCaller, StepCodec, Timestamp,
@@ -8433,30 +8459,46 @@ mod tests {
     fn only_serialization_failures_and_deadlocks_are_conflicts() {
         for code in ["40001", "40P01"] {
             assert_eq!(
-                classify_sqlstate(code, None),
+                classify_sqlstate(code, Some(PgSeverity::Error), None),
                 BackendErrorKind::Conflict,
                 "{code}"
             );
         }
         for code in ["40000", "40002", "40003"] {
             assert_eq!(
-                classify_sqlstate(code, None),
+                classify_sqlstate(code, Some(PgSeverity::Error), None),
                 BackendErrorKind::Permanent,
                 "{code}"
             );
         }
     }
 
-    /// A malformed request, an unknown commit outcome, a cancelled statement and a dropped
-    /// database sit in connection classes, but asking again cannot help, so they are refused
-    /// rather than retried.
+    /// A cancelled statement and a dropped database sit in connection classes, but asking again
+    /// cannot help, so they are refused rather than retried.
     #[test]
     fn the_connection_class_exceptions_are_permanent() {
-        for code in ["08P01", "08007", "57014", "57P04"] {
+        for code in ["57014", "57P04"] {
             assert_eq!(
-                classify_sqlstate(code, None),
+                classify_sqlstate(code, Some(PgSeverity::Error), None),
                 BackendErrorKind::Permanent,
                 "{code}"
+            );
+        }
+    }
+
+    /// A protocol violation the server raises as an error is a malformed request; one that ends
+    /// the session is a pooler closing the connection, which reconnecting cures.
+    #[test]
+    fn a_protocol_violation_is_split_by_severity() {
+        assert_eq!(
+            classify_sqlstate("08P01", Some(PgSeverity::Error), None),
+            BackendErrorKind::Permanent
+        );
+        for severity in [PgSeverity::Fatal, PgSeverity::Panic] {
+            assert_eq!(
+                classify_sqlstate("08P01", Some(severity), Some("query_wait_timeout")),
+                BackendErrorKind::Connection,
+                "{severity:?}"
             );
         }
     }
@@ -8464,9 +8506,9 @@ mod tests {
     /// The prefix classes are unchanged by the exact-code rules.
     #[test]
     fn connection_classes_match_by_prefix() {
-        for code in ["08000", "08006", "53300", "57P01", "57P05"] {
+        for code in ["08000", "08006", "08007", "53300", "57P01", "57P05"] {
             assert_eq!(
-                classify_sqlstate(code, None),
+                classify_sqlstate(code, Some(PgSeverity::Error), None),
                 BackendErrorKind::Connection,
                 "{code}"
             );
@@ -8474,16 +8516,17 @@ mod tests {
         assert_eq!(
             classify_sqlstate(
                 "XXUUU",
+                Some(PgSeverity::Error),
                 Some("read tcp 10.0.0.1:26257->10.0.0.2:5432: i/o timeout")
             ),
             BackendErrorKind::Connection
         );
         assert_eq!(
-            classify_sqlstate("XX000", Some("internal error")),
+            classify_sqlstate("XX000", Some(PgSeverity::Error), Some("internal error")),
             BackendErrorKind::Permanent
         );
         assert_eq!(
-            classify_sqlstate("23505", None),
+            classify_sqlstate("23505", Some(PgSeverity::Error), None),
             BackendErrorKind::Permanent
         );
     }
@@ -8708,17 +8751,13 @@ mod tests {
 
         let outcome = crate::rt::timeout(
             std::time::Duration::from_secs(10),
-            with_retry(
-                &super::RetryPolicy::default(),
-                "malformed",
-                move || async move {
-                    let sum: i32 = sqlx::query_scalar("SELECT $1::INT4 + $2::INT4")
-                        .bind(1_i32)
-                        .fetch_one(pool)
-                        .await?;
-                    Ok(sum)
-                },
-            ),
+            with_retry(&RetryPolicy::default(), "malformed", move || async move {
+                let sum: i32 = sqlx::query_scalar("SELECT $1::INT4 + $2::INT4")
+                    .bind(1_i32)
+                    .fetch_one(pool)
+                    .await?;
+                Ok(sum)
+            }),
         )
         .await
         .expect("a malformed statement returns instead of being retried");
@@ -8747,7 +8786,7 @@ mod tests {
         let outcome = crate::rt::timeout(
             std::time::Duration::from_secs(10),
             with_retry(
-                &super::RetryPolicy::default(),
+                &RetryPolicy::default(),
                 "statement_timeout",
                 move || async move {
                     let mut tx = pool.begin().await?;
@@ -9233,7 +9272,7 @@ mod tests {
     #[test]
     fn an_idle_transaction_timeout_is_retried_as_a_lost_connection() {
         assert_eq!(
-            classify_sqlstate("25P03", None),
+            classify_sqlstate("25P03", Some(PgSeverity::Fatal), None),
             BackendErrorKind::Connection
         );
     }
