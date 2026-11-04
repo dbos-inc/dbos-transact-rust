@@ -148,7 +148,7 @@ where
 /// ```
 ///
 /// The same call in every respect but the options: see [`send`] for what it does, where it may
-/// stand, and what a step does to it. Recorded as `DBOS.send`, not `DBOS.send_bulk`, although it
+/// stand, and what a step does to it. Recorded as `DBOS.send`, not `DBOS.sendBulk`, although it
 /// takes the same [`SendMessage`] a batch does: the step name says which surface was reached for.
 pub fn send_with<T, E>(
     message: SendMessage<'_, T>,
@@ -179,7 +179,7 @@ where
 /// insert, so a failure halfway through delivers nothing rather than a prefix.
 ///
 /// The batch is checkpointed as **one** step, so a replay sends none of it again. The step is
-/// recorded as `DBOS.send_bulk` however long the batch is, a batch of exactly one included: the
+/// recorded as `DBOS.sendBulk` however long the batch is, a batch of exactly one included: the
 /// name says which API surface was reached for, not how many messages it carried. A workflow that
 /// swaps a [`send`] for a [`send_bulk`] between runs therefore flips names and is caught as a
 /// determinism error, while one whose message *count* merely changes is not, that being no change
@@ -196,7 +196,7 @@ where
 /// [`delete_all`](DBOS::delete_all), so `send_all` would have been the local rhyme. It is not the
 /// name because those four render a *pluralised noun* — the `workflows` the free forms below spell
 /// out — into a form that reads on a type where the noun is implicit. A batch send is not that: it
-/// has no noun to pluralise, and `sysdb` already records this call as `DBOS.send_bulk`. A method
+/// has no noun to pluralise, and `sysdb` already records this call as `DBOS.sendBulk`. A method
 /// named for one word that writes another is a seam for nothing.
 ///
 /// The management verbs' *free* forms do take the plural noun —
@@ -573,7 +573,7 @@ impl Connection {
     /// rather than a generic wrapper for the one caller that could have skipped it.
     ///
     /// A method apiece rather than one taking a slice, mirroring the trait: which one is called is
-    /// what chooses the recorded step name, so a batch of one records `DBOS.send_bulk` and this
+    /// what chooses the recorded step name, so a batch of one records `DBOS.sendBulk` and this
     /// records `DBOS.send`. On the connection because that is where the serializer lives — the
     /// free [`send`] reaches it through the ambient context's connection, [`DBOS::send`] through
     /// its executor's, and [`Client::send`](crate::Client::send) through the only one it has, the

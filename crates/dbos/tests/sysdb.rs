@@ -4430,11 +4430,11 @@ async fn set_event_publishes_a_value_and_its_history() {
     // The literal pins the library's recorded step name, so an accidental rename fails this test
     // instead of silently changing Rust workflow replay compatibility.
     let step = sys
-        .check_step("wf-publisher", 0, "DBOS.set_event")
+        .check_step("wf-publisher", 0, "DBOS.setEvent")
         .await
         .unwrap()
         .expect("setting an event is a step");
-    assert_eq!(step.step_name, "DBOS.set_event");
+    assert_eq!(step.step_name, "DBOS.setEvent");
 
     // Setting the same key again from a later step replaces the value and adds history.
     sys.set_event(
@@ -4727,7 +4727,7 @@ async fn a_read_records_the_publishers_own_payload() {
         .unwrap();
 
     let step = sys
-        .check_step("wf-reader", 0, "DBOS.get_event")
+        .check_step("wf-reader", 0, "DBOS.getEvent")
         .await
         .unwrap()
         .expect("reading an event inside a workflow is a step");
@@ -4937,7 +4937,7 @@ async fn a_read_adopts_a_rivals_answer_rather_than_failing() {
     sys.record_step(
         "wf-reader",
         0,
-        "DBOS.get_event",
+        "DBOS.getEvent",
         Outcome::Output(Some("\"rival\"")),
         Some(PORTABLE_JSON),
         None,
@@ -6965,7 +6965,7 @@ async fn a_fork_records_its_step_and_replays_from_it() {
             .iter()
             .map(|s| (s.step_id, s.step_name.as_str()))
             .collect::<Vec<_>>(),
-        [(0, "DBOS.fork_workflow")],
+        [(0, "DBOS.forkWorkflow")],
     );
 
     // The replay: the recorded ids come back, and no second fork is written.
@@ -7029,7 +7029,7 @@ async fn a_cancel_records_its_step_and_replays_from_it() {
             .iter()
             .map(|s| (s.step_id, s.step_name.as_str()))
             .collect::<Vec<_>>(),
-        [(0, "DBOS.cancel_workflow")],
+        [(0, "DBOS.cancelWorkflow")],
     );
 
     // Without the checkpoint this returns nothing: the row is already terminal.
@@ -8675,7 +8675,7 @@ async fn sending_no_messages_still_records_the_step() {
     assert_eq!(steps.len(), 1, "the step id must not be left unoccupied");
     assert_eq!(steps[0].step_id, 0);
     // A single send carries exactly one message, so an empty batch came from the bulk API.
-    assert_eq!(steps[0].step_name, "DBOS.send_bulk");
+    assert_eq!(steps[0].step_name, "DBOS.sendBulk");
 
     // And it replays: a second call finds the step and does not record a second one.
     sys.send_messages(&[], None, Some(("wf-empty", 0)), false, None)
@@ -8704,7 +8704,7 @@ async fn sending_no_messages_still_records_the_step() {
 
 /// A batch records the bulk step name, a single message the plain one.
 ///
-/// The size does not enter into it: a batch of one records `DBOS.send_bulk`, because the caller
+/// The size does not enter into it: a batch of one records `DBOS.sendBulk`, because the caller
 /// reached for the batch API.
 #[tokio::test]
 async fn the_recorded_step_name_follows_the_surface_not_the_size() {
@@ -8747,11 +8747,7 @@ async fn the_recorded_step_name_follows_the_surface_not_the_size() {
             .iter()
             .map(|s| (s.step_id, s.step_name.as_str()))
             .collect::<Vec<_>>(),
-        [
-            (0, "DBOS.send"),
-            (1, "DBOS.send_bulk"),
-            (2, "DBOS.send_bulk"),
-        ],
+        [(0, "DBOS.send"), (1, "DBOS.sendBulk"), (2, "DBOS.sendBulk")],
         "the name is the surface the caller reached for, and a batch of one is still a batch",
     );
 }
@@ -8825,7 +8821,7 @@ async fn a_replay_that_changed_its_send_surface_is_refused() {
         .await
         .unwrap();
 
-    // The replay sends two, which would record `DBOS.send_bulk` at the same step id.
+    // The replay sends two, which would record `DBOS.sendBulk` at the same step id.
     let result = sys
         .send_messages(
             &[to("wf-x"), to("wf-y")],
@@ -8843,7 +8839,7 @@ async fn a_replay_that_changed_its_send_surface_is_refused() {
             ..
         }) => {
             assert_eq!(step_id, 0);
-            assert_eq!(expected, "DBOS.send_bulk");
+            assert_eq!(expected, "DBOS.sendBulk");
             assert_eq!(recorded, "DBOS.send");
         }
         other => panic!("expected the changed batch to be caught, got {other:?}"),
@@ -9590,7 +9586,7 @@ async fn a_replayed_stream_write_does_not_append_again() {
         .await
         .unwrap();
     assert_eq!(steps.len(), 1);
-    assert_eq!(steps[0].step_name, "DBOS.write_stream");
+    assert_eq!(steps[0].step_name, "DBOS.writeStream");
 }
 
 /// A write from inside a step records no step of its own, so it appends every time.
@@ -9693,7 +9689,7 @@ async fn closing_a_stream_appends_the_sentinel() {
             .iter()
             .map(|s| s.step_name.as_str())
             .collect::<Vec<_>>(),
-        ["DBOS.write_stream", "DBOS.close_stream"],
+        ["DBOS.writeStream", "DBOS.closeStream"],
     );
 
     // And closing twice is a replay, not a second sentinel.
@@ -9748,7 +9744,7 @@ async fn the_sentinel_text_under_another_label_is_an_ordinary_write() {
             .iter()
             .map(|s| s.step_name.as_str())
             .collect::<Vec<_>>(),
-        ["DBOS.write_stream"],
+        ["DBOS.writeStream"],
     );
 }
 
@@ -13493,12 +13489,12 @@ async fn a_schedule_step_replays_rather_than_repeating() {
     .await
     .unwrap();
     let recorded = sys
-        .check_step("wf-caller", 0, "DBOS.create_schedule")
+        .check_step("wf-caller", 0, "DBOS.createSchedule")
         .await
         .unwrap()
         .unwrap();
     assert_eq!(
-        recorded.step_name, "DBOS.create_schedule",
+        recorded.step_name, "DBOS.createSchedule",
         "the write and its checkpoint committed together"
     );
     // A method returning nothing still records something: the JSON `null`, not a NULL column.
@@ -13686,18 +13682,18 @@ async fn pausing_and_resuming_are_distinct_steps() {
     .unwrap();
 
     assert_eq!(
-        sys.check_step("wf-caller", 0, "DBOS.pause_schedule")
+        sys.check_step("wf-caller", 0, "DBOS.pauseSchedule")
             .await
             .unwrap()
             .map(|s| s.step_name),
-        Some("DBOS.pause_schedule".to_owned())
+        Some("DBOS.pauseSchedule".to_owned())
     );
     assert_eq!(
-        sys.check_step("wf-caller", 1, "DBOS.resume_schedule")
+        sys.check_step("wf-caller", 1, "DBOS.resumeSchedule")
             .await
             .unwrap()
             .map(|s| s.step_name),
-        Some("DBOS.resume_schedule".to_owned())
+        Some("DBOS.resumeSchedule".to_owned())
     );
 }
 
@@ -13872,10 +13868,10 @@ async fn every_schedule_write_replays_from_its_checkpoint() {
     assert_eq!(
         names,
         [
-            "DBOS.upsert_schedule",
-            "DBOS.update_schedule",
-            "DBOS.pause_schedule",
-            "DBOS.delete_schedule",
+            "DBOS.upsertSchedule",
+            "DBOS.updateSchedule",
+            "DBOS.pauseSchedule",
+            "DBOS.deleteSchedule",
         ]
     );
     // All four return nothing, so each records the JSON `null` rather than a NULL column.
@@ -13915,7 +13911,7 @@ async fn a_refused_schedule_step_records_its_refusal() {
         Err(Error::AlreadyRegistered { .. })
     ));
     let step = sys
-        .check_step("wf-caller", 0, "DBOS.create_schedule")
+        .check_step("wf-caller", 0, "DBOS.createSchedule")
         .await
         .unwrap()
         .expect("the refusal is recorded");
@@ -14505,7 +14501,7 @@ async fn a_bounce_inside_a_workflow_is_a_step_and_replays() {
             .iter()
             .map(|s| s.step_name.as_str())
             .collect::<Vec<_>>(),
-        ["DBOS.debounce_delayed_workflow"],
+        ["DBOS.debounceDelayedWorkflow"],
     );
 
     // Move the delay out from under the replay: if it bounced again, this would be overwritten.

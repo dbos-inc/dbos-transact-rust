@@ -66,7 +66,7 @@
 //! take, and a function and its macro that do the same thing under two different names is a seam to
 //! learn for nothing.
 //!
-//! **The recorded step name follows the call**, `DBOS.select_workflow`: a step listing should
+//! **The recorded step name follows the call**, `DBOS.selectWorkflow`: a step listing should
 //! name the call the caller wrote. The all-wait records no step at all, so it needs no name.
 //!
 //! # Called from inside a workflow
@@ -427,10 +427,10 @@ macro_rules! select_workflow {
 /// **The results are what get recorded, and the awaits stay sequential.** The expansion is one
 /// [`join_workflows`](fn@join_workflows), which records nothing, and then
 /// [`result`](crate::WorkflowHandle::result) on each handle in source order — so the whole of what
-/// a replay reads back is the N `DBOS.get_result` rows. Sequential is not a concession here: the set is already settled by the
-/// time the first result is read, so every one of them is a row read that does not wait — and
-/// taking them in source order is what keeps each `DBOS.get_result` on the step id its replay
-/// expects.
+/// a replay reads back is the N `DBOS.getResult` rows. Sequential is not a concession here: the
+/// set is already settled by the time the first result is read, so every one of them is a row
+/// read that does not wait — and taking them in source order is what keeps each `DBOS.getResult`
+/// on the step id its replay expects.
 ///
 /// **The first failure ends it**, in source order, as `try_join!` does: the tuple holds values
 /// rather than results, so a failed child is the value of the whole call. Where each child's own

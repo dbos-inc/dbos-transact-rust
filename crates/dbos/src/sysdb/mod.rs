@@ -793,7 +793,7 @@ pub trait SystemDatabase: Send + Sync {
 
     /// Delivers many messages to workflows, in one transaction.
     ///
-    /// Records the step as `"DBOS.send_bulk"` however many messages it is given, one and none
+    /// Records the step as `"DBOS.sendBulk"` however many messages it is given, one and none
     /// included — see [`send_message`](Self::send_message) for why the name is the method rather
     /// than the count.
     ///

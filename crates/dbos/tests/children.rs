@@ -1339,21 +1339,9 @@ async fn child_starts_and_awaits_driven_out_of_build_order_keep_their_ids() {
             (0, "child", Some("drives-its-children-backwards-0")),
             (1, "child", Some("drives-its-children-backwards-1")),
             (2, "child", Some("drives-its-children-backwards-2")),
-            (
-                3,
-                "DBOS.get_result",
-                Some("drives-its-children-backwards-0")
-            ),
-            (
-                4,
-                "DBOS.get_result",
-                Some("drives-its-children-backwards-1")
-            ),
-            (
-                5,
-                "DBOS.get_result",
-                Some("drives-its-children-backwards-2")
-            ),
+            (3, "DBOS.getResult", Some("drives-its-children-backwards-0")),
+            (4, "DBOS.getResult", Some("drives-its-children-backwards-1")),
+            (5, "DBOS.getResult", Some("drives-its-children-backwards-2")),
         ],
         "the three starts hold the first three ids and the three awaits the next three, both in \
          the order they were written"
@@ -1438,11 +1426,11 @@ async fn runs_driven_out_of_build_order_keep_their_pairs_of_step_ids() {
         recorded,
         [
             (0, "child", Some("runs-its-children-backwards-0")),
-            (1, "DBOS.get_result", Some("runs-its-children-backwards-0")),
+            (1, "DBOS.getResult", Some("runs-its-children-backwards-0")),
             (2, "child", Some("runs-its-children-backwards-2")),
-            (3, "DBOS.get_result", Some("runs-its-children-backwards-2")),
+            (3, "DBOS.getResult", Some("runs-its-children-backwards-2")),
             (4, "child", Some("runs-its-children-backwards-4")),
-            (5, "DBOS.get_result", Some("runs-its-children-backwards-4")),
+            (5, "DBOS.getResult", Some("runs-its-children-backwards-4")),
         ],
         "each run's await sits immediately behind its own start"
     );
@@ -1656,7 +1644,7 @@ async fn a_workflow_started_outside_a_workflow_has_no_parent() {
 
 /// Awaiting a child is itself a step: the parent records what the child returned.
 ///
-/// It is recorded as `DBOS.get_result`. The row carries the child's own encoded output, not a
+/// It is recorded as `DBOS.getResult`. The row carries the child's own encoded output, not a
 /// re-encoding of it, and the child id beside it.
 #[tokio::test]
 async fn awaiting_a_child_is_recorded_as_a_step() {
@@ -1695,7 +1683,7 @@ async fn awaiting_a_child_is_recorded_as_a_step() {
         .expect("read failed");
     assert_eq!(steps.len(), 2, "one start, one await: {steps:?}");
     assert_eq!(steps[0].step_name, "child", "the start");
-    assert_eq!(steps[1].step_name, "DBOS.get_result", "the await");
+    assert_eq!(steps[1].step_name, "DBOS.getResult", "the await");
     assert_eq!(steps[1].output.as_deref(), Some("99"));
     assert_eq!(
         steps[1].child_workflow_id.as_deref(),
@@ -1876,7 +1864,7 @@ async fn a_cancelled_child_is_an_awaited_cancellation_in_the_parent() {
         .expect("read failed");
     let await_step = steps
         .iter()
-        .find(|step| step.step_name == "DBOS.get_result")
+        .find(|step| step.step_name == "DBOS.getResult")
         .expect("the await was not recorded");
     let recorded = await_step.error.as_deref().expect("no error recorded");
     assert!(
@@ -2528,7 +2516,7 @@ async fn awaiting_a_child_inside_a_step_is_covered_by_that_step() {
         "which carries the child's value"
     );
     assert!(
-        steps.iter().all(|step| step.step_name != "DBOS.get_result"),
+        steps.iter().all(|step| step.step_name != "DBOS.getResult"),
         "the await added no checkpoint of its own: {steps:?}"
     );
 
@@ -2782,8 +2770,8 @@ async fn a_select_step_races_a_step_against_a_childs_result() {
         [
             (0, "child", Some("raced-0")),
             // Id 1 is the losing step, built and dropped without a row.
-            (2, "DBOS.get_result", Some("raced-0")),
-            (3, "DBOS.select_step", None),
+            (2, "DBOS.getResult", Some("raced-0")),
+            (3, "DBOS.selectStep", None),
         ],
         "the await keeps its build-order id and the race records the winner behind it"
     );
