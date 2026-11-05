@@ -22,6 +22,14 @@ This library contains all you need to add durable workflows to your program: the
 Because it's just a library, you can incrementally add it to your projects.
 And because it's built on Postgres, it natively supports all the tooling you're familiar with (backups, GUIs, CLI tools) and works with any Postgres provider.
 
+## Writing workflows
+
+A workflow body must be deterministic: a recovery runs it again and replays what each durable call
+recorded, so it has to reach the same calls in the same order. Non-deterministic values belong in
+steps, and plain races, timeouts, spawns and completion-order streams over durable calls aren't
+supported in a workflow body. The crate docs list [what isn't supported and what to use
+instead](https://docs.rs/dbos/latest/dbos/#determinism-in-workflows), on every runtime.
+
 ## Try the starter app
 
 The [starter app](./demo-apps/dbos-rust-starter) is durable execution in one page: a three-step

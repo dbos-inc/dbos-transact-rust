@@ -408,7 +408,7 @@ impl Ctx {
     /// Runs `future` with `ctx` ambient.
     ///
     /// The context is restored on every poll and removed on every yield, so it is present for the
-    /// whole body including across `.await`. It does **not** cross a [`tokio::spawn`]: a spawned
+    /// whole body including across `.await`. It does **not** cross a spawn, on any runtime: a spawned
     /// task is a new task with its own empty task-local map. That is the correct default — the
     /// spawned work is not part of the durable workflow, and silently adopting the parent's step
     /// counter would let two tasks allocate the same step id — but it is surprising enough that
