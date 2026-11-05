@@ -49,8 +49,9 @@
 //! }
 //! ```
 //!
-//! Tutorials and a programming guide are at [docs.dbos.dev](https://docs.dbos.dev/). The
-//! [repository](https://github.com/dbos-inc/dbos-transact-rust) has runnable demo applications.
+//! The [programming guide](https://docs.dbos.dev/rust/programming-guide) is the place to start, with
+//! tutorials alongside it. The [repository](https://github.com/dbos-inc/dbos-transact-rust) has
+//! runnable demo applications.
 //!
 //! # Where to look
 //!
@@ -78,7 +79,9 @@
 //! A workflow body must be deterministic. A recovery runs it again from the start and replays what
 //! each durable call recorded, so it has to reach the same durable calls, in the same order, with
 //! the same inputs. Anything non-deterministic belongs in a [step](crate::step()), whose result is
-//! recorded, or has to be one of this crate's durable primitives.
+//! recorded, or has to be one of this crate's durable primitives. The
+//! [workflow tutorial](https://docs.dbos.dev/rust/tutorials/workflow-tutorial#determinism) covers
+//! the same ground with more examples.
 //!
 //! None of this applies **inside a step**: a step's body runs once per attempt and only its result
 //! is recorded, so it can use everything listed here. Nor does it apply outside a workflow.
