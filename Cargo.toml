@@ -11,8 +11,6 @@ members = [
     "crates/dbos-macros",
     "crates/test-support",
     "crates/test-macros",
-    "demo-apps/dbos-rust-starter",
-    "demo-apps/dbos-rust-widget-store",
     "xtask",
 ]
 
