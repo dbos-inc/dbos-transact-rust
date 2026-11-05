@@ -391,7 +391,7 @@ where
         .sysdb()
         .check_step(workflow_id, step_id, name)
         .await
-        .map_err(Error::SystemDatabase)?;
+        .map_err(Error::from_execution)?;
     if let Some(recorded) = recorded {
         tracing::debug!(
             step_id,
@@ -566,7 +566,7 @@ where
             ctx.owner_xid(),
         )
         .await
-        .map_err(Error::SystemDatabase)?;
+        .map_err(Error::from_execution)?;
     if failed {
         tracing::debug!(
             step_id,

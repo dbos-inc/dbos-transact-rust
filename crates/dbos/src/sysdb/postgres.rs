@@ -2513,8 +2513,10 @@ impl PostgresSystemDatabase {
 
     /// Refuses the write this transaction is about to make unless `owner` still owns its
     /// workflow, and locks the workflow's row until the transaction ends, so a hand-off (a cancel,
-    /// a resume, a recovery, a claim) can't land between this check and the write. A row with no
-    /// owner, another owner, or no row at all is a [`WorkflowConflict`](Error::WorkflowConflict).
+    /// a resume, a recovery, a claim) can't land between this check and the write. A cancelled row
+    /// is [`WorkflowCancelled`](Error::WorkflowCancelled), since a cancel clears the owner and the
+    /// execution should hear why. Any other row with no owner or another owner, or no row at all,
+    /// is a [`WorkflowConflict`](Error::WorkflowConflict).
     ///
     /// First in its transaction, before the work it guards: a refused check rolls the work back
     /// with it. `FOR NO KEY UPDATE` rather than `FOR UPDATE`, so inserts that reference the row
@@ -2533,18 +2535,24 @@ impl PostgresSystemDatabase {
         // The clock in the outer select, over the locking one: in a flat `SELECT … FOR NO KEY
         // UPDATE` PostgreSQL evaluates the select list in the scan, below the lock, so the reading
         // would predate any wait for the lock and fall behind the database's clock by that wait.
-        let current: Option<(Option<String>, i64)> = sqlx::query_as(AssertSqlSafe(format!(
-            "SELECT owner_xid, {CLOCK_MS_SQL} FROM ( \
-                 SELECT owner_xid FROM {workflow_table} \
+        let current: Option<(Option<String>, String, i64)> =
+            sqlx::query_as(AssertSqlSafe(format!(
+                "SELECT owner_xid, status, {CLOCK_MS_SQL} FROM ( \
+                 SELECT owner_xid, status FROM {workflow_table} \
                  WHERE workflow_uuid = $1 FOR NO KEY UPDATE \
              ) locked"
-        )))
-        .bind(owner.workflow_id)
-        .fetch_optional(&mut *conn)
-        .await?;
+            )))
+            .bind(owner.workflow_id)
+            .fetch_optional(&mut *conn)
+            .await?;
         match current {
-            Some((Some(owner_xid), db_now)) if owner_xid == owner.owner_xid => {
+            Some((Some(owner_xid), _, db_now)) if owner_xid == owner.owner_xid => {
                 Ok(DatabaseTime::read(db_now))
+            }
+            Some((_, status, _)) if status == WorkflowStatus::Cancelled.as_str() => {
+                Err(Error::WorkflowCancelled {
+                    workflow_id: owner.workflow_id.to_owned(),
+                })
             }
             _ => Err(Error::WorkflowConflict {
                 workflow_id: owner.workflow_id.to_owned(),

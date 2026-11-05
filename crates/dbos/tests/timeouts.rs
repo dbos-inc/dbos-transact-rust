@@ -237,15 +237,18 @@ async fn a_preemptible_step_stops_when_the_workflow_is_cancelled_elsewhere() {
     });
     let entered = Arc::new(tokio::sync::Notify::new());
     let dbos_entered = Arc::clone(&entered);
+    let seen_by_body = Arc::new(std::sync::Mutex::new(None::<bool>));
+    let body_seen = Arc::clone(&seen_by_body);
     let workflow = dbos
         .register_workflow("long_step", move |()| {
             let entered = Arc::clone(&dbos_entered);
+            let seen = Arc::clone(&body_seen);
             async move {
                 let options = StepOptions {
                     preemptible: true,
                     ..Default::default()
                 };
-                dbos::step_with("slow", options, || {
+                let outcome = dbos::step_with("slow", options, || {
                     let entered = Arc::clone(&entered);
                     async move {
                         entered.notify_one();
@@ -253,7 +256,10 @@ async fn a_preemptible_step_stops_when_the_workflow_is_cancelled_elsewhere() {
                         Ok::<u32, dbos::Error>(1)
                     }
                 })
-                .await
+                .await;
+                *seen.lock().unwrap() =
+                    Some(matches!(outcome, Err(Error::WorkflowCancelled { .. })));
+                outcome
             }
         })
         .unwrap();
@@ -284,6 +290,11 @@ async fn a_preemptible_step_stops_when_the_workflow_is_cancelled_elsewhere() {
     assert!(
         matches!(error, Error::WorkflowCancelled { .. }),
         "expected a cancellation, got {error:?}"
+    );
+    assert_eq!(
+        *seen_by_body.lock().unwrap(),
+        Some(true),
+        "the preempted step returns the top-level cancellation to the body"
     );
 
     // Nothing checkpointed: a preempted step was interrupted, not wrong, so a resume runs it again.

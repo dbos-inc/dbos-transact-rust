@@ -912,7 +912,7 @@ pub(crate) async fn init_or_join(
                     None => continue,
                 }
             }
-            Err(error) => return Err(Error::SystemDatabase(error)),
+            Err(error) => return Err(Error::from_execution(error)),
         }
     }
 }
@@ -1997,7 +1997,7 @@ impl Parent<'_> {
             .sysdb()
             .check_step(self.workflow_id(), self.step_id, step_name)
             .await
-            .map_err(Error::SystemDatabase)?
+            .map_err(Error::from_execution)?
         else {
             return Ok(None);
         };
@@ -2013,7 +2013,7 @@ impl Parent<'_> {
             };
             let value: serde_json::Value =
                 decode_step_value(&recorded, encoded, caller, step_name, "an error")
-                    .map_err(Error::SystemDatabase)?;
+                    .map_err(Error::from_execution)?;
             // Told apart by shape before the typed read, so a start error this build can't read
             // is reported as that, naming the step, rather than as a plain step's row.
             if is_recorded_start_error(&value) {
@@ -2053,8 +2053,8 @@ impl Parent<'_> {
     ///   returns it again on a replay.
     /// - **The record fails**: that failure is returned instead, and the position stays
     ///   unrecorded, since the record is one transaction. A position recorded already is
-    ///   [`StepNondeterminism`](crate::sysdb::Error::StepNondeterminism), and
-    ///   a parent no longer this execution's is
+    ///   [`StepNondeterminism`](crate::sysdb::Error::StepNondeterminism), a cancelled parent is
+    ///   [`Error::WorkflowCancelled`], and a parent no longer this execution's is
     ///   [`WorkflowConflict`](crate::sysdb::Error::WorkflowConflict). Database trouble leaves the
     ///   parent `PENDING` rather than ending it.
     /// - **The error can't be encoded**: a custom serializer can fail for its own reasons. The
@@ -2101,7 +2101,7 @@ impl Parent<'_> {
             .await
         {
             Ok(()) => Error::SystemDatabase(error),
-            Err(record_error) => Error::SystemDatabase(record_error),
+            Err(record_error) => Error::from_execution(record_error),
         }
     }
 
@@ -2141,7 +2141,7 @@ impl Parent<'_> {
                 self.owner_xid(),
             )
             .await
-            .map_err(Error::SystemDatabase)
+            .map_err(Error::from_execution)
     }
 }
 
@@ -2387,8 +2387,8 @@ async fn execute(
                 )
                 .await
         }
-        // A write was refused because the workflow was handed to another execution (cancelled,
-        // resumed, or recovered), so this one is superseded: the same position as
+        // A write was refused because the workflow was handed to another execution (resumed or
+        // recovered), so this one is superseded: the same position as
         // `OutcomeWrite::AlreadyFinished` below, one level down. It is a fact about ownership,
         // not a failure of the workflow, so the caller gets the outcome the owner records rather
         // than an error for a workflow that may well succeed.
@@ -2404,7 +2404,7 @@ async fn execute(
         // A control signal is not the workflow's outcome, so this execution writes nothing
         // terminal. Where that leaves the row depends on the signal — PENDING for a later executor
         // after a shutdown or a failed write, already CANCELLED when the signal is a cancellation
-        // raised elsewhere and observed by a preemptible step — so the line reports what this
+        // raised elsewhere and observed by a step or another durable call — so the line reports what this
         // execution did and does not claim a status it has not read. Warned rather than
         // debug-logged, because the caller may have dropped its future: this can be the only
         // evidence.

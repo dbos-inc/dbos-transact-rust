@@ -298,7 +298,7 @@ where
                     owner_xid,
                 )
                 .await
-                .map_err(Error::SystemDatabase)?;
+                .map_err(Error::from_execution)?;
             match found {
                 None => Ok(None),
                 Some(found) => decode_tagged(
@@ -601,7 +601,7 @@ impl Connection {
                 owner,
             )
             .await
-            .map_err(Error::SystemDatabase)
+            .map_err(Error::from_execution)
     }
 
     /// The batch write, the plural of [`send_encoded`](Self::send_encoded) and encoded for the
@@ -630,7 +630,7 @@ impl Connection {
                 owner,
             )
             .await
-            .map_err(Error::SystemDatabase)
+            .map_err(Error::from_execution)
     }
 }
 

@@ -109,7 +109,7 @@ where
                     owner_xid,
                 )
                 .await
-                .map_err(Error::SystemDatabase)?;
+                .map_err(Error::from_execution)?;
             Ok(())
         },
     )
@@ -342,7 +342,7 @@ impl Connection {
             .sysdb()
             .get_event(workflow_id, key, timeout, caller)
             .await
-            .map_err(Error::SystemDatabase)?
+            .map_err(Error::from_execution)?
         {
             None => Ok(None),
             Some(found) => decode_tagged(

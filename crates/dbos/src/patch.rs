@@ -115,9 +115,8 @@ use crate::sysdb::types::{Outcome, StepTiming, Timestamp, step_names};
 /// - [`Error::StepBuiltElsewhere`] when the call is polled anywhere but the workflow it was built
 ///   in — carried into a step body, onto a spawned task, or into another workflow — as for every
 ///   durable call.
-/// - Whatever reading or writing the system database fails with, as at any step. A workflow
-///   cancelled meanwhile arrives as [`Error::SystemDatabase`] holding the system database's
-///   `WorkflowCancelled`, a control signal like every cancellation.
+/// - [`Error::WorkflowCancelled`] when the workflow was cancelled meanwhile, as at any step.
+/// - Whatever else reading or writing the system database fails with, as at any step.
 ///
 /// # Position
 ///

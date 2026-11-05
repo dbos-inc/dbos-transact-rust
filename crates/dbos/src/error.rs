@@ -350,6 +350,10 @@ pub enum Error<E = EngineOnly> {
     },
 
     /// The workflow was cancelled.
+    ///
+    /// Inside a running workflow, this is what the call that notices the cancel returns: a step in
+    /// progress when its result can't be recorded, any durable call made after the cancel, and a
+    /// preemptible step at once. Return it with `?`, after any clean-up the workflow wants to do.
     #[error("the workflow {workflow_id} was cancelled")]
     WorkflowCancelled {
         /// The workflow that was cancelled.
@@ -565,6 +569,21 @@ impl<E> Error<E> {
         match error {
             crate::sysdb::Error::UnknownSerialization { name } => {
                 Error::UnknownSerialization { name }
+            }
+            other => Self::from_execution(other),
+        }
+    }
+
+    /// A system-database failure met by a workflow's own execution.
+    ///
+    /// Cancellation is [`WorkflowCancelled`](Self::WorkflowCancelled), so code in a workflow matches
+    /// one variant whichever call noticed the cancel, and can't mistake it for the
+    /// [`SystemDatabase`](Self::SystemDatabase) failures it would otherwise sit among. Everything
+    /// else stays [`SystemDatabase`](Self::SystemDatabase).
+    pub(crate) fn from_execution(error: crate::sysdb::Error) -> Self {
+        match error {
+            crate::sysdb::Error::WorkflowCancelled { workflow_id } => {
+                Error::WorkflowCancelled { workflow_id }
             }
             other => Error::SystemDatabase(other),
         }
@@ -979,6 +998,29 @@ mod tests {
             lifted.to_string(),
             "cannot run a workflow before DBOS is launched"
         );
+    }
+
+    #[test]
+    fn an_execution_sees_cancellation_at_the_top_level() {
+        let cancelled = crate::sysdb::Error::WorkflowCancelled {
+            workflow_id: "wf-1".to_owned(),
+        };
+        assert!(matches!(
+            Error::<CardDeclined>::from_execution(cancelled.clone()),
+            Error::WorkflowCancelled { workflow_id } if workflow_id == "wf-1"
+        ));
+        assert!(matches!(
+            Error::<CardDeclined>::from_sysdb(cancelled),
+            Error::WorkflowCancelled { workflow_id } if workflow_id == "wf-1"
+        ));
+
+        let conflict = crate::sysdb::Error::WorkflowConflict {
+            workflow_id: "wf-1".to_owned(),
+        };
+        assert!(matches!(
+            Error::<CardDeclined>::from_execution(conflict),
+            Error::SystemDatabase(crate::sysdb::Error::WorkflowConflict { .. })
+        ));
     }
 
     #[test]

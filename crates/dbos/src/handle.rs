@@ -344,7 +344,7 @@ impl ChildResultPlacement {
             .sysdb()
             .check_child_result(workflow_id, step_id)
             .await
-            .map_err(Error::SystemDatabase)?
+            .map_err(Error::from_execution)?
         else {
             return Ok(None);
         };
@@ -449,7 +449,7 @@ impl ChildResultPlacement {
                 owner_xid,
             )
             .await
-            .map_err(Error::SystemDatabase)
+            .map_err(Error::from_execution)
     }
 }
 

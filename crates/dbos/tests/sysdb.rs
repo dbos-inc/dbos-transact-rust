@@ -15415,6 +15415,48 @@ fn refused<T: std::fmt::Debug>(result: Result<T, Error>, workflow_id: &str) -> b
     matches!(result, Err(Error::WorkflowConflict { workflow_id: ref id }) if id == workflow_id)
 }
 
+/// **The owner check says why it refused.** A cancelled row answers `WorkflowCancelled`, whichever
+/// execution asks; once a resume has taken it out of `CANCELLED`, the same stale execution is told
+/// `WorkflowConflict`, because it has been superseded, and the write lands in neither case.
+#[tokio::test]
+async fn the_owner_check_tells_a_cancel_from_a_hand_off() {
+    let (sys, _db) = sysdb().await;
+    let id = "wf-why-refused";
+    sys.init_workflow(&workflow(id), None, WorkflowIdReusePolicy::ReturnExisting)
+        .await
+        .unwrap();
+    let stale = owner_token(&sys, id).await;
+    let write = async || {
+        sys.record_step(
+            id,
+            0,
+            "late",
+            Outcome::Output(Some("1")),
+            None,
+            None,
+            &stale,
+        )
+        .await
+    };
+
+    sys.cancel_workflows(&[id], false, None, None)
+        .await
+        .unwrap();
+    assert!(
+        matches!(write().await, Err(Error::WorkflowCancelled { workflow_id: ref w }) if w == id),
+        "a cancelled row"
+    );
+
+    sys.resume_workflows(&[id], None, None, None).await.unwrap();
+    assert!(refused(write().await, id), "a resumed row");
+
+    let steps = sys
+        .list_workflow_steps(id, false, None, None, None)
+        .await
+        .unwrap();
+    assert!(steps.is_empty(), "{steps:?}");
+}
+
 /// **Every write a workflow makes is refused once its execution no longer owns it**, and writes
 /// nothing: steps, child starts and their records, sends (from the workflow and from inside a
 /// step), a consume, events, stream writes and closes, sleeps, a checkpointed management call and
