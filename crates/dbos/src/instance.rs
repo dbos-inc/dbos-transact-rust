@@ -388,7 +388,9 @@ pub struct ShutdownOptions {
 ///     Ok(format!("Hello, {name}"))
 /// }
 ///
-/// let dbos = DBOS::new(Config::from_env("my-app"));
+/// let mut config = Config::from_env("my-app");
+/// config.app_version = Some("0.1.0".to_owned());
+/// let dbos = DBOS::new(config);
 /// let greet = dbos.register_workflow("greet", greet)?;
 /// dbos.launch().await?;
 ///

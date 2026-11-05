@@ -190,7 +190,7 @@ enum Repr {
 }
 
 impl JoinError {
-    /// Whether the task was aborted before it finished.
+    /// Whether the task was aborted, or dropped by its runtime, before it finished.
     pub fn is_cancelled(&self) -> bool {
         matches!(self.0, Repr::Cancelled)
     }

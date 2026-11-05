@@ -1716,11 +1716,11 @@ pub struct PendingWorkflow<'a, T, E = crate::EngineOnly>(PendingStep<'a, T, E>);
 /// Where the two differ, [`lift`](Self::lift) re-declares the channel before the await.
 ///
 /// ```no_run
-/// async fn parent(child: dbos::WorkflowRef<u32, u32>) -> dbos::Result<u32> {
-///     // Awaiting the start gives a handle; the child runs on its own from there.
-///     let handle = child.start(1).await?;
-///     handle.result().await
-/// }
+/// # async fn body(child: dbos::WorkflowRef<u32, u32>) -> dbos::Result<u32> {
+/// // In a workflow body. Awaiting the start gives a handle; the child runs on its own from there.
+/// let handle = child.start(1).await?;
+/// handle.result().await
+/// # }
 /// ```
 #[must_use = "a call that is not awaited never sets the workflow running, and has still spent the \
               step id it claimed; await it"]

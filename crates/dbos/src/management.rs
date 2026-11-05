@@ -672,6 +672,7 @@ pub fn fork_workflows<'a, R: 'a, E: 'a>(
 /// [`resume_workflow`] is.
 ///
 /// ```no_run
+/// // A workflow body, registered with `DBOS::register_workflow`.
 /// async fn run_again(workflow_id: String) -> dbos::Result<u32> {
 ///     dbos::rewind_workflow::<u32, dbos::EngineOnly>(&workflow_id)
 ///         .await?
@@ -716,6 +717,7 @@ pub fn rewind_workflow_with<'a, R: 'a, E: 'a>(
 /// channel.
 ///
 /// ```no_run
+/// // A workflow body, registered with `DBOS::register_workflow`.
 /// async fn clean_up(workflow_id: String) -> dbos::Result<()> {
 ///     dbos::delete_workflow(&workflow_id).await
 /// }

@@ -134,7 +134,9 @@ pub(crate) type Built<C> = Result<(C, StepPlacement), Error>;
 /// this type. The problem is that a race **decides** something and nothing records what it
 /// decided, so a replay that races again may see the other branch answer first and take a path the
 /// first execution never took. A `timeout` is that same race against a clock, and the clock is not
-/// replayed either. An all-wait decides nothing, which is why `join!` needs no help.
+/// replayed either. An all-wait decides nothing, which is why `join!` needs no help. A `try_join!`
+/// is an all-wait only until something fails: [determinism in
+/// workflows](crate#determinism-in-workflows) says when one is safe.
 ///
 /// Inside a workflow body, reach for these instead: race durable calls with
 /// [`select_step!`](crate::select_step), which records which branch won and replays only that one;

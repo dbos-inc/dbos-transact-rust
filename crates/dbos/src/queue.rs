@@ -50,6 +50,7 @@ pub(crate) const DEFAULT_POLLING_INTERVAL: Duration = Duration::from_secs(1);
 /// # async fn f(dbos: dbos::DBOS, task: dbos::WorkflowRef<u32, u32>) -> dbos::Result<()> {
 /// use dbos::{QueueConflict, QueueOptions, QueueRequest, StartOptions};
 ///
+/// // After `launch`, unlike `register_workflow`.
 /// dbos.register_queue("tasks", QueueOptions::default(), QueueConflict::UpdateIfLatestVersion)
 ///     .await?;
 ///
