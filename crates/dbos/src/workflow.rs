@@ -1114,7 +1114,7 @@ where
     ///   instance's system database, landing where the workflow that allocated it cannot see it.
     ///   `get_event` refuses the same combination for the same reason.
     fn place(&self, options: &StartOptions<'_>) -> Result<StartPlacement> {
-        let executor = self.dbos().executor(START_OPERATION)?;
+        let executor = self.executor(START_OPERATION)?;
         // Borrowed rather than moved, because `options` is read again by the run, and **validated
         // before anything is written and before the counter moves**: an enqueue no queue could
         // honour should cost a round trip, not a row and not a step id.

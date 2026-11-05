@@ -447,7 +447,7 @@ where
     ///
     /// The checks come first, so a refused debounce moves no step counter.
     fn place(&self, period: Duration) -> Result<(Arc<Executor>, StepPlacement, StepPlacement)> {
-        let executor = self.workflow.dbos().executor(DEBOUNCE_OPERATION)?;
+        let executor = self.workflow.executor(DEBOUNCE_OPERATION)?;
         // A debounce names no workflow id of its own here: one call's is `DebounceOptions`'.
         validate_start(
             Some(&self.queue_request()),

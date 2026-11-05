@@ -15,9 +15,10 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::error::{DurableError, EncodedError, EngineOnly, Failure};
+use crate::instance::ExecutorSlot;
 use crate::serialization::{PayloadEncoding, SerializationFormat, decode_input, encode};
 pub(crate) use crate::sysdb::types::QualifiedWorkflowName;
-use crate::{DBOS, Error, Result};
+use crate::{DBOS, Error, Executor, Result};
 
 /// A boxed future, spelled here rather than pulled from `futures` for one type alias.
 pub(crate) type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -182,8 +183,16 @@ impl Registry {
 /// This is what registration returns and what a call site holds. The registry stores only the
 /// erased form; the types live here, so a caller gets them checked once at registration rather
 /// than at every invocation by string.
+///
+/// A reference starts workflows while its instance is launched, whether or not a [`DBOS`] handle
+/// is still held beside it, and answers [`Error::NotLaunched`] before launch and after
+/// [`shutdown`](DBOS::shutdown). It does not keep the instance itself alive, which is what makes
+/// capturing one in a registered workflow — to start a child — safe.
 pub struct WorkflowRef<P, R, E = EngineOnly> {
-    dbos: DBOS,
+    /// The instance's executor slot rather than the instance, so a reference captured in a
+    /// registered closure — the way a workflow body starts a child — does not keep the instance
+    /// alive. See [`ExecutorSlot`].
+    executor: Arc<ExecutorSlot>,
     name: Arc<QualifiedWorkflowName>,
     /// How a start writes this workflow unless it chooses otherwise.
     serialization: SerializationFormat,
@@ -206,9 +215,10 @@ impl<P, R, E> WorkflowRef<P, R, E> {
         self.name.name()
     }
 
-    /// The instance this workflow is registered with.
-    pub(crate) fn dbos(&self) -> &DBOS {
-        &self.dbos
+    /// The executor that serves a start of this workflow, or [`Error::NotLaunched`] naming
+    /// `operation`.
+    pub(crate) fn executor(&self, operation: &'static str) -> Result<Arc<Executor>> {
+        self.executor.get(operation)
     }
 
     /// How a start writes this workflow when it does not choose.
@@ -222,7 +232,7 @@ impl<P, R, E> WorkflowRef<P, R, E> {
 impl<P, R, E> Clone for WorkflowRef<P, R, E> {
     fn clone(&self) -> Self {
         Self {
-            dbos: self.dbos.clone(),
+            executor: Arc::clone(&self.executor),
             name: Arc::clone(&self.name),
             serialization: self.serialization,
             types: PhantomData,
@@ -261,10 +271,21 @@ impl DBOS {
     /// [`cancel_workflow`](crate::cancel_workflow), [`fork_workflow`](crate::fork_workflow) and the
     /// rest of the management surface's free forms — all read the ambient context.
     ///
-    /// A [`WorkflowRef`] holds an instance too, so capturing one — to start a child workflow —
-    /// has the same effect. That is a known gap rather than a rule anyone can follow around:
-    /// until starting a child reads the ambient context the way a step does, such an application
-    /// leaks one instance, which for a process that launches once is a bounded cost.
+    /// **Capturing a [`WorkflowRef`] is fine**, and is how a workflow body starts a child:
+    ///
+    /// ```no_run
+    /// # use dbos::DBOS;
+    /// # fn example(dbos: &DBOS) -> dbos::Result<()> {
+    /// let task = dbos.register_workflow("task", |n: u32| async move { Ok::<_, dbos::Error>(n * 2) })?;
+    /// let parent = dbos.register_workflow("parent", move |n: u32| {
+    ///     let task = task.clone();
+    ///     async move { task.run(n).await }
+    /// })?;
+    /// # Ok(()) }
+    /// ```
+    ///
+    /// A reference holds the instance's executor rather than the instance, so it keeps nothing
+    /// alive past [`shutdown`](DBOS::shutdown).
     pub fn register_workflow<P, R, E, F, Fut>(
         &self,
         name: impl Into<QualifiedWorkflowName>,
@@ -362,7 +383,7 @@ impl DBOS {
         )?;
         tracing::debug!(workflow = %name, "registered a workflow");
         Ok(WorkflowRef {
-            dbos: self.clone(),
+            executor: self.executor_slot(),
             name: Arc::new(name),
             serialization: options.serialization,
             types: PhantomData,
