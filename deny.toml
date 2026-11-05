@@ -21,7 +21,12 @@ version = 2
 yanked = "deny"
 # No blanket ignores. An advisory we choose to accept gets its ID listed here with
 # a comment saying why and what would retire it — never a silent global exception.
-ignore = []
+ignore = [
+    # astral-tokio-tar is unmaintained, with no fixed version. Only testcontainers uses it, so it
+    # reaches the test harness and not the published crates. Remove this once a testcontainers
+    # release drops it: https://github.com/testcontainers/testcontainers-rs/pull/1006
+    { id = "RUSTSEC-2026-0440", reason = "test-only, through testcontainers; no fixed version" },
+]
 
 [licenses]
 version = 2
