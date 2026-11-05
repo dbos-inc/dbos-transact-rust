@@ -2538,9 +2538,9 @@ impl PostgresSystemDatabase {
         let current: Option<(Option<String>, String, i64)> =
             sqlx::query_as(AssertSqlSafe(format!(
                 "SELECT owner_xid, status, {CLOCK_MS_SQL} FROM ( \
-                 SELECT owner_xid, status FROM {workflow_table} \
-                 WHERE workflow_uuid = $1 FOR NO KEY UPDATE \
-             ) locked"
+                     SELECT owner_xid, status FROM {workflow_table} \
+                     WHERE workflow_uuid = $1 FOR NO KEY UPDATE \
+                 ) locked"
             )))
             .bind(owner.workflow_id)
             .fetch_optional(&mut *conn)
