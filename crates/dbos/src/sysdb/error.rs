@@ -95,8 +95,9 @@ pub enum Error {
     },
     /// The workflow has been cancelled, so its steps must not run.
     ///
-    /// Raised by the step-replay check rather than by cancellation itself: cancelling only sets
-    /// a status, and a workflow already in flight learns about it the next time it asks.
+    /// Raised by the step-replay check and the owner check rather than by cancellation itself:
+    /// cancelling only sets a status, and a workflow already in flight learns about it the next
+    /// time it asks.
     WorkflowCancelled {
         /// The cancelled workflow.
         workflow_id: String,
@@ -130,9 +131,10 @@ pub enum Error {
     /// This execution no longer owns its workflow, so it must stop and wait for the owner's
     /// outcome.
     ///
-    /// The workflow was handed to another execution (cancelled, resumed, or recovered) and the
-    /// write that found out rolled back. Every write a workflow makes from inside its execution
-    /// checks first.
+    /// The workflow was handed to another execution (resumed or recovered) and the write that found
+    /// out rolled back. Every write a workflow makes from inside its execution checks first. A
+    /// write refused because the workflow was cancelled is
+    /// [`WorkflowCancelled`](Self::WorkflowCancelled) instead.
     WorkflowConflict {
         /// The workflow this execution no longer owns.
         workflow_id: String,

@@ -16,7 +16,10 @@
 //!
 //! The price is paid inside this crate rather than by its users: the blanket impl is why
 //! [`Error::SystemDatabase`] cannot also be a `#[from]` — that pair *does* overlap, at
-//! `Error<sysdb::Error>` — so engine code names the variant, `.map_err(Error::SystemDatabase)?`.
+//! `Error<sysdb::Error>` — so engine code names the conversion: `.map_err(Error::from_execution)?`
+//! for a call a workflow's own execution makes, so a cancellation reaches it as
+//! [`Error::WorkflowCancelled`], and `.map_err(Error::SystemDatabase)?` for one that can't be
+//! cancelled.
 
 use crate::registry::QualifiedWorkflowName;
 use crate::serialization::{PayloadEncoding, decode_error, encode_error};
@@ -350,6 +353,11 @@ pub enum Error<E = EngineOnly> {
     },
 
     /// The workflow was cancelled.
+    ///
+    /// Inside a running workflow, this is what the call that notices the cancel returns: a step in
+    /// progress when its result can't be recorded, a later call that checkpoints, and a preemptible
+    /// step at once. [`join_workflows`](fn@crate::join_workflows) records nothing, so it doesn't notice
+    /// and goes on waiting. Return the error with `?`, after any clean-up the workflow wants to do.
     #[error("the workflow {workflow_id} was cancelled")]
     WorkflowCancelled {
         /// The workflow that was cancelled.
@@ -559,12 +567,27 @@ impl<E> Error<E> {
     /// An unknown tag on a checkpoint the system database read back through this process's
     /// serializer is [`UnknownSerialization`](Self::UnknownSerialization), exactly as it is on any
     /// other checkpoint, so a caller matching on it sees one variant and a workflow that hits it
-    /// fails the same way wherever the row was. Everything else stays
-    /// [`SystemDatabase`](Self::SystemDatabase).
+    /// fails the same way wherever the row was. Everything else goes through
+    /// [`from_execution`](Self::from_execution).
     pub(crate) fn from_sysdb(error: crate::sysdb::Error) -> Self {
         match error {
             crate::sysdb::Error::UnknownSerialization { name } => {
                 Error::UnknownSerialization { name }
+            }
+            other => Self::from_execution(other),
+        }
+    }
+
+    /// A system-database failure met by a workflow's own execution.
+    ///
+    /// Cancellation is [`WorkflowCancelled`](Self::WorkflowCancelled), so code in a workflow matches
+    /// one variant whichever call noticed the cancel, and can't mistake it for the
+    /// [`SystemDatabase`](Self::SystemDatabase) failures it would otherwise sit among. Everything
+    /// else stays [`SystemDatabase`](Self::SystemDatabase).
+    pub(crate) fn from_execution(error: crate::sysdb::Error) -> Self {
+        match error {
+            crate::sysdb::Error::WorkflowCancelled { workflow_id } => {
+                Error::WorkflowCancelled { workflow_id }
             }
             other => Error::SystemDatabase(other),
         }
@@ -574,7 +597,7 @@ impl<E> Error<E> {
     ///
     /// `refuse` builds the error from [`InvalidInput`](crate::sysdb::Error::InvalidInput)'s field
     /// and detail, which lets each surface name the field the way its own API spells it. Any other
-    /// error is not a refusal and goes through [`from_sysdb`](Self::from_sysdb) unchanged, so a
+    /// error is not a refusal and goes through [`from_sysdb`](Self::from_sysdb), so a
     /// backend or connection failure keeps its [`SystemDatabase`](Self::SystemDatabase) variant.
     ///
     /// For a surface that refuses an argument by asking the system database's own check rather
@@ -979,6 +1002,29 @@ mod tests {
             lifted.to_string(),
             "cannot run a workflow before DBOS is launched"
         );
+    }
+
+    #[test]
+    fn an_execution_sees_cancellation_at_the_top_level() {
+        let cancelled = crate::sysdb::Error::WorkflowCancelled {
+            workflow_id: "wf-1".to_owned(),
+        };
+        assert!(matches!(
+            Error::<CardDeclined>::from_execution(cancelled.clone()),
+            Error::WorkflowCancelled { workflow_id } if workflow_id == "wf-1"
+        ));
+        assert!(matches!(
+            Error::<CardDeclined>::from_sysdb(cancelled),
+            Error::WorkflowCancelled { workflow_id } if workflow_id == "wf-1"
+        ));
+
+        let conflict = crate::sysdb::Error::WorkflowConflict {
+            workflow_id: "wf-1".to_owned(),
+        };
+        assert!(matches!(
+            Error::<CardDeclined>::from_execution(conflict),
+            Error::SystemDatabase(crate::sysdb::Error::WorkflowConflict { .. })
+        ));
     }
 
     #[test]

@@ -850,7 +850,7 @@ impl StepPlacement {
         conn.sysdb()
             .check_step(workflow_id, step_id, step_name)
             .await
-            .map_err(Error::SystemDatabase)
+            .map_err(Error::from_execution)
     }
 
     /// Records what this call answered, so [`check`](Self::check) finds it.
@@ -893,7 +893,7 @@ impl StepPlacement {
                 owner_xid,
             )
             .await
-            .map_err(Error::SystemDatabase)
+            .map_err(Error::from_execution)
     }
 }
 

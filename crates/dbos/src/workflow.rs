@@ -912,7 +912,7 @@ pub(crate) async fn init_or_join(
                     None => continue,
                 }
             }
-            Err(error) => return Err(Error::SystemDatabase(error)),
+            Err(error) => return Err(Error::from_execution(error)),
         }
     }
 }
@@ -1997,7 +1997,7 @@ impl Parent<'_> {
             .sysdb()
             .check_step(self.workflow_id(), self.step_id, step_name)
             .await
-            .map_err(Error::SystemDatabase)?
+            .map_err(Error::from_execution)?
         else {
             return Ok(None);
         };
@@ -2053,8 +2053,8 @@ impl Parent<'_> {
     ///   returns it again on a replay.
     /// - **The record fails**: that failure is returned instead, and the position stays
     ///   unrecorded, since the record is one transaction. A position recorded already is
-    ///   [`StepNondeterminism`](crate::sysdb::Error::StepNondeterminism), and
-    ///   a parent no longer this execution's is
+    ///   [`StepNondeterminism`](crate::sysdb::Error::StepNondeterminism), a cancelled parent is
+    ///   [`Error::WorkflowCancelled`], and a parent no longer this execution's is
     ///   [`WorkflowConflict`](crate::sysdb::Error::WorkflowConflict). Database trouble leaves the
     ///   parent `PENDING` rather than ending it.
     /// - **The error can't be encoded**: a custom serializer can fail for its own reasons. The
@@ -2101,7 +2101,7 @@ impl Parent<'_> {
             .await
         {
             Ok(()) => Error::SystemDatabase(error),
-            Err(record_error) => Error::SystemDatabase(record_error),
+            Err(record_error) => Error::from_execution(record_error),
         }
     }
 
@@ -2141,7 +2141,7 @@ impl Parent<'_> {
                 self.owner_xid(),
             )
             .await
-            .map_err(Error::SystemDatabase)
+            .map_err(Error::from_execution)
     }
 }
 
@@ -2387,24 +2387,33 @@ async fn execute(
                 )
                 .await
         }
-        // A write was refused because the workflow was handed to another execution (cancelled,
-        // resumed, or recovered), so this one is superseded: the same position as
+        // A write was refused because the workflow was handed to another execution (resumed or
+        // recovered), so this one is superseded: the same position as
         // `OutcomeWrite::AlreadyFinished` below, one level down. It is a fact about ownership,
         // not a failure of the workflow, so the caller gets the outcome the owner records rather
         // than an error for a workflow that may well succeed.
-        Err(Failure::Control(Error::SystemDatabase(crate::sysdb::Error::WorkflowConflict {
-            workflow_id: conflicted,
-        }))) if conflicted == workflow_id => {
+        //
+        // **A cancel of this workflow takes the same path.** The body can outlive the call that
+        // noticed the cancel, and the workflow can be resumed meanwhile, so the error it returns
+        // may no longer be the workflow's outcome. Reading the row answers "cancelled" at once
+        // while it still is, and otherwise gives this caller what every other caller sees.
+        Err(Failure::Control(
+            Error::SystemDatabase(crate::sysdb::Error::WorkflowConflict {
+                workflow_id: stopped,
+            })
+            | Error::WorkflowCancelled {
+                workflow_id: stopped,
+            },
+        )) if stopped == workflow_id => {
             tracing::warn!(
                 workflow_id,
-                "the workflow is no longer owned by this execution; waiting for the owner's outcome"
+                "this execution was cancelled or superseded; reading the workflow's outcome"
             );
             return adopt_superseded(executor, workflow_id, slot).await;
         }
         // A control signal is not the workflow's outcome, so this execution writes nothing
         // terminal. Where that leaves the row depends on the signal — PENDING for a later executor
-        // after a shutdown or a failed write, already CANCELLED when the signal is a cancellation
-        // raised elsewhere and observed by a preemptible step — so the line reports what this
+        // after a shutdown or a failed write — so the line reports what this
         // execution did and does not claim a status it has not read. Warned rather than
         // debug-logged, because the caller may have dropped its future: this can be the only
         // evidence.

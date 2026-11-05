@@ -226,7 +226,7 @@ where
                     .await
             }
         }
-        .map_err(Error::SystemDatabase)
+        .map_err(Error::from_execution)
         .map_err(Error::lift)
     })
 }
@@ -861,7 +861,7 @@ impl ReadOf {
                 .await?;
                 Err(refused)
             }
-            awaited => awaited.map_err(Error::SystemDatabase),
+            awaited => awaited.map_err(Error::from_execution),
         }
     }
 
@@ -1022,5 +1022,5 @@ async fn record(
             owner_xid,
         )
         .await
-        .map_err(Error::SystemDatabase)
+        .map_err(Error::from_execution)
 }
