@@ -2514,9 +2514,9 @@ impl PostgresSystemDatabase {
     /// Refuses the write this transaction is about to make unless `owner` still owns its
     /// workflow, and locks the workflow's row until the transaction ends, so a hand-off (a cancel,
     /// a resume, a recovery, a claim) can't land between this check and the write. A cancelled row
-    /// is [`WorkflowCancelled`](Error::WorkflowCancelled), since a cancel clears the owner and the
-    /// execution should hear why. Any other row with no owner or another owner, or no row at all,
-    /// is a [`WorkflowConflict`](Error::WorkflowConflict).
+    /// is [`WorkflowCancelled`](Error::WorkflowCancelled), whichever execution asks. Any other row
+    /// with no owner or another owner, or no row at all, is a
+    /// [`WorkflowConflict`](Error::WorkflowConflict).
     ///
     /// First in its transaction, before the work it guards: a refused check rolls the work back
     /// with it. `FOR NO KEY UPDATE` rather than `FOR UPDATE`, so inserts that reference the row
@@ -2546,13 +2546,13 @@ impl PostgresSystemDatabase {
             .fetch_optional(&mut *conn)
             .await?;
         match current {
-            Some((Some(owner_xid), _, db_now)) if owner_xid == owner.owner_xid => {
-                Ok(DatabaseTime::read(db_now))
-            }
             Some((_, status, _)) if status == WorkflowStatus::Cancelled.as_str() => {
                 Err(Error::WorkflowCancelled {
                     workflow_id: owner.workflow_id.to_owned(),
                 })
+            }
+            Some((Some(owner_xid), _, db_now)) if owner_xid == owner.owner_xid => {
+                Ok(DatabaseTime::read(db_now))
             }
             _ => Err(Error::WorkflowConflict {
                 workflow_id: owner.workflow_id.to_owned(),

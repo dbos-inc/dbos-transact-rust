@@ -2013,7 +2013,7 @@ impl Parent<'_> {
             };
             let value: serde_json::Value =
                 decode_step_value(&recorded, encoded, caller, step_name, "an error")
-                    .map_err(Error::from_execution)?;
+                    .map_err(Error::SystemDatabase)?;
             // Told apart by shape before the typed read, so a start error this build can't read
             // is reported as that, naming the step, rather than as a plain step's row.
             if is_recorded_start_error(&value) {
@@ -2392,19 +2392,28 @@ async fn execute(
         // `OutcomeWrite::AlreadyFinished` below, one level down. It is a fact about ownership,
         // not a failure of the workflow, so the caller gets the outcome the owner records rather
         // than an error for a workflow that may well succeed.
-        Err(Failure::Control(Error::SystemDatabase(crate::sysdb::Error::WorkflowConflict {
-            workflow_id: conflicted,
-        }))) if conflicted == workflow_id => {
+        //
+        // **A cancel of this workflow takes the same path.** The body can outlive the call that
+        // noticed the cancel, and the workflow can be resumed meanwhile, so the error it returns
+        // may no longer be the workflow's outcome. Reading the row answers "cancelled" at once
+        // while it still is, and otherwise gives this caller what every other caller sees.
+        Err(Failure::Control(
+            Error::SystemDatabase(crate::sysdb::Error::WorkflowConflict {
+                workflow_id: stopped,
+            })
+            | Error::WorkflowCancelled {
+                workflow_id: stopped,
+            },
+        )) if stopped == workflow_id => {
             tracing::warn!(
                 workflow_id,
-                "the workflow is no longer owned by this execution; waiting for the owner's outcome"
+                "this execution was cancelled or superseded; reading the workflow's outcome"
             );
             return adopt_superseded(executor, workflow_id, slot).await;
         }
         // A control signal is not the workflow's outcome, so this execution writes nothing
         // terminal. Where that leaves the row depends on the signal — PENDING for a later executor
-        // after a shutdown or a failed write, already CANCELLED when the signal is a cancellation
-        // raised elsewhere and observed by a step or another durable call — so the line reports what this
+        // after a shutdown or a failed write — so the line reports what this
         // execution did and does not claim a status it has not read. Warned rather than
         // debug-logged, because the caller may have dropped its future: this can be the only
         // evidence.

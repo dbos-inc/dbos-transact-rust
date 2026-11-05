@@ -15420,7 +15420,7 @@ fn refused<T: std::fmt::Debug>(result: Result<T, Error>, workflow_id: &str) -> b
 /// `WorkflowConflict`, because it has been superseded, and the write lands in neither case.
 #[tokio::test]
 async fn the_owner_check_tells_a_cancel_from_a_hand_off() {
-    let (sys, _db) = sysdb().await;
+    let (sys, db) = sysdb().await;
     let id = "wf-why-refused";
     sys.init_workflow(&workflow(id), None, WorkflowIdReusePolicy::ReturnExisting)
         .await
@@ -15455,6 +15455,35 @@ async fn the_owner_check_tells_a_cancel_from_a_hand_off() {
         .await
         .unwrap();
     assert!(steps.is_empty(), "{steps:?}");
+
+    // A writer that cancels without clearing the owner: the status decides, not the token.
+    let id = "wf-cancelled-still-owned";
+    sys.init_workflow(&workflow(id), None, WorkflowIdReusePolicy::ReturnExisting)
+        .await
+        .unwrap();
+    let holder = owner_token(&sys, id).await;
+    sqlx::query(
+        r#"UPDATE "dbos"."workflow_status" SET status = 'CANCELLED' WHERE workflow_uuid = $1"#,
+    )
+    .bind(id)
+    .execute(&db.pool().await)
+    .await
+    .unwrap();
+    let write = sys
+        .record_step(
+            id,
+            0,
+            "late",
+            Outcome::Output(Some("1")),
+            None,
+            None,
+            &holder,
+        )
+        .await;
+    assert!(
+        matches!(write, Err(Error::WorkflowCancelled { workflow_id: ref w }) if w == id),
+        "{write:?}"
+    );
 }
 
 /// **Every write a workflow makes is refused once its execution no longer owns it**, and writes

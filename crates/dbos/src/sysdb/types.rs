@@ -2674,8 +2674,10 @@ pub(crate) fn decode_step_value<T: serde::de::DeserializeOwned>(
 ///
 /// A write that carries one lands only while the workflow's row still holds that token, checked
 /// in the write's own transaction before anything else and locking the row until it commits. Once
-/// the workflow has been handed to another execution (a cancel, a resume, a recovery), the write
-/// is refused with [`WorkflowConflict`](crate::sysdb::Error::WorkflowConflict) and rolls back.
+/// the workflow has been handed to another execution (a resume, a recovery), the write is refused
+/// with [`WorkflowConflict`](crate::sysdb::Error::WorkflowConflict) and rolls back. Once it has been
+/// cancelled, the write is refused with
+/// [`WorkflowCancelled`](crate::sysdb::Error::WorkflowCancelled) and rolls back.
 /// `None` where a method takes an `Option<WorkflowOwner>` is a caller that is not an execution, a
 /// client say, and is not checked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

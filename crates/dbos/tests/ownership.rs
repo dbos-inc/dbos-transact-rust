@@ -195,6 +195,69 @@ async fn a_cancel_then_resume_during_a_step_is_finished_by_the_new_owner() {
     a_hand_off_during_a_step_is_finished_by_the_new_owner(HandOff::CancelThenResume).await;
 }
 
+/// **A resume after the body has heard of the cancel.** The body outlives the call that told it,
+/// and by the time it returns that error the workflow has been resumed and finished by a new owner.
+/// The error is no longer the workflow's outcome, so the old execution's caller gets the owner's.
+#[tokio::test]
+async fn a_resume_after_the_body_hears_of_a_cancel_gives_the_owners_outcome() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("late-resume-app", &db));
+    let gate = Arc::new(Gate::default());
+    let refused = Arc::new(Notify::new());
+    let hold = Arc::new(Notify::new());
+    let workflow = dbos
+        .register_workflow("heard-of-the-cancel", {
+            let (gate, refused, hold) =
+                (Arc::clone(&gate), Arc::clone(&refused), Arc::clone(&hold));
+            move |()| {
+                let (gate, refused, hold) =
+                    (Arc::clone(&gate), Arc::clone(&refused), Arc::clone(&hold));
+                async move {
+                    let outcome = dbos::step("first", || {
+                        let gate = Arc::clone(&gate);
+                        async move { Ok::<_, Error>(gate.pass().await) }
+                    })
+                    .await;
+                    if outcome.is_err() {
+                        refused.notify_one();
+                        hold.notified().await;
+                    }
+                    outcome
+                }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let id = "heard-of-the-cancel-wf";
+    let stale = workflow
+        .start_with(
+            (),
+            StartOptions {
+                workflow_id: Some(id),
+                ..StartOptions::default()
+            },
+        )
+        .await
+        .expect("start failed");
+    gate.entered.notified().await;
+    dbos.cancel(id).await.expect("cancel failed");
+    gate.release.notify_one();
+    refused.notified().await;
+
+    dbos.resume::<u32, Error>(id).await.expect("resume failed");
+    wait_for_status(&db, id, WorkflowStatus::Success).await;
+
+    hold.notify_one();
+    let outcome = tokio::time::timeout(Duration::from_secs(10), stale.result())
+        .await
+        .expect("the old execution never ended")
+        .expect("the old execution's caller got an error the workflow didn't end with");
+    assert_eq!(outcome, 2, "the new owner's pass through the gate");
+
+    dbos.shutdown().await;
+}
+
 /// A call a workflow body made, and the error it returned.
 type NotedCall = (&'static str, Option<Error>);
 
@@ -225,6 +288,7 @@ async fn a_cancelled_workflow_sees_one_error_from_every_call() {
             move |()| {
                 let (gate, seen, child) = (Arc::clone(&gate), Arc::clone(&seen), child.clone());
                 async move {
+                    let started = child.start(()).await?;
                     note!(
                         seen,
                         "step in progress",
@@ -254,6 +318,18 @@ async fn a_cancelled_workflow_sees_one_error_from_every_call() {
                     note!(seen, "patch", dbos::patch("v2"));
                     note!(seen, "cancel_workflow", dbos::cancel_workflow("other"));
                     note!(seen, "start a child", child.start(()));
+                    note!(seen, "await a child", started.result());
+                    note!(
+                        seen,
+                        "read_stream_value",
+                        dbos::read_stream_value::<u32, _>("other", "key", 0, Default::default())
+                    );
+                    note!(seen, "select_workflow", dbos::select_workflow(&["other"]));
+                    let raced: Result<u32, Error> = dbos::select_step! {
+                        a = dbos::step("raced-a", || async { Ok::<u32, Error>(1) }) => a?,
+                        b = dbos::step("raced-b", || async { Ok::<u32, Error>(2) }) => b?
+                    };
+                    seen.lock().unwrap().push(("select_step!", raced.err()));
                     dbos::step("last", || async { Ok::<_, Error>(1) }).await
                 }
             }
@@ -286,7 +362,7 @@ async fn a_cancelled_workflow_sees_one_error_from_every_call() {
 
     {
         let seen = seen.lock().unwrap();
-        assert_eq!(seen.len(), 12, "the body reached every call: {seen:?}");
+        assert_eq!(seen.len(), 16, "the body reached every call: {seen:?}");
         for (call, error) in seen.iter() {
             assert!(
                 matches!(error, Some(Error::WorkflowCancelled { workflow_id }) if workflow_id == id),
@@ -299,8 +375,8 @@ async fn a_cancelled_workflow_sees_one_error_from_every_call() {
     assert_eq!(row.status, WorkflowStatus::Cancelled);
     assert_eq!(
         step_rows(&db, id).await,
-        0,
-        "nothing is recorded after a cancel"
+        1,
+        "only the child start from before the cancel is recorded"
     );
 
     dbos.shutdown().await;
