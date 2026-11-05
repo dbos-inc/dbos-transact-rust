@@ -502,7 +502,9 @@ const fn highest_version(sources: &[MigrationSource]) -> u32 {
 /// dialect trait proper arrives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dialect {
+    /// PostgreSQL.
     Postgres,
+    /// CockroachDB.
     Cockroach,
 }
 

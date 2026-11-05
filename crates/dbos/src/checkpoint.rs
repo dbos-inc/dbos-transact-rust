@@ -150,6 +150,17 @@ pub(crate) type Built<C> = Result<(C, StepPlacement), Error>;
 /// **`Unpin`, which is contract rather than accident**: the run is already boxed, so a combinator
 /// holding one of these as a branch can do so by `Pin::new(&mut _)` rather than pinning it a
 /// second time.
+///
+/// ```no_run
+/// # async fn one() -> dbos::Result<u32> { Ok(1) }
+/// # async fn two() -> dbos::Result<u32> { Ok(2) }
+/// async fn workflow(_: ()) -> dbos::Result<u32> {
+///     // Each call takes its step ID as it is built, so these two get the same IDs on a replay,
+///     // and `join!` then runs them concurrently.
+///     let (a, b) = tokio::join!(dbos::step("one", one), dbos::step("two", two));
+///     Ok(a? + b?)
+/// }
+/// ```
 #[must_use = "a durable call that is not awaited never runs, and if it claimed a step id that id \
               is spent; await it, or hand it to a combinator"]
 pub struct PendingStep<'a, T, E = crate::EngineOnly> {

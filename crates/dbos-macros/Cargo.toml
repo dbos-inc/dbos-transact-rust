@@ -13,6 +13,10 @@ keywords.workspace = true
 categories.workspace = true
 readme = "README.md"
 
+[package.metadata.docs.rs]
+# Nothing in the public API differs by platform.
+targets = ["x86_64-unknown-linux-gnu"]
+
 # A proc-macro crate is compiled for the *host* and loaded by the compiler, so nothing here
 # reaches a user's binary. What it does cost is build time: `syn` and `quote` are compiled before
 # `dbos` can be, which is the price the `macros` feature exists to let a build decline.

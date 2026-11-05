@@ -269,6 +269,21 @@ impl ClientConfig {
 /// shutdown: nothing waits for either task, and whatever the notifier had inside its coalescing
 /// window may go out after the drop returns or not at all. [`close`](Self::close) is how a client
 /// is put away deliberately, and is what a process that connects repeatedly wants.
+///
+/// ```no_run
+/// # async fn f() -> dbos::Result<()> {
+/// use dbos::{Client, ClientConfig, WorkflowHandle};
+///
+/// let client = Client::connect(ClientConfig::from_env()).await?;
+///
+/// // The type parameter says what the workflow returns; nothing here can check it.
+/// let handle: WorkflowHandle<String> = client.enqueue("process", "tasks", 42).await?;
+/// println!("{}", handle.result().await?);
+///
+/// client.close().await;
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Clone, Debug)]
 pub struct Client(Arc<Connection>);
 

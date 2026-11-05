@@ -1,13 +1,77 @@
-//! DBOS Transact for Rust — lightweight durable workflows on Postgres.
+//! DBOS Transact for Rust: lightweight durable workflows on Postgres.
 //!
-//! This crate is [DBOS Transact](https://docs.dbos.dev/) for Rust. It shares one Postgres system
-//! database schema with the other DBOS Transact SDKs, so a Rust application can run alongside
-//! applications written in any of their languages.
+//! DBOS checkpoints each step of a workflow in a Postgres database. When a process stops, for
+//! whatever reason, its workflows recover from those checkpoints and continue from the last
+//! completed step. It is only a library: there is no separate service or orchestrator, and Postgres
+//! is the only other thing it needs. Its system database has the same schema as the other
+//! [DBOS Transact](https://docs.dbos.dev/) SDKs', so a Rust application can run alongside
+//! applications written in their languages.
 //!
-//! # Status
+//! # Getting started
 //!
-//! Under construction. The system database layer, the lifecycle, registration, workflows,
-//! steps, events, messaging, recovery, queues, schedules and the client are here.
+//! A workflow is an `async fn` that takes one input and returns a [`Result`], and a
+//! [step](crate::step()) is a function whose result the workflow checkpoints. Set
+//! `DBOS_SYSTEM_DATABASE_URL` to a Postgres connection string (the database is created if it doesn't
+//! exist), then:
+//!
+//! ```no_run
+//! use dbos::{Config, DBOS};
+//!
+//! async fn workflow(_: ()) -> dbos::Result<String> {
+//!     dbos::step("step_one", step_one).await?;
+//!     dbos::step("step_two", step_two).await?;
+//!     Ok("success".to_owned())
+//! }
+//!
+//! async fn step_one() -> dbos::Result<()> {
+//!     println!("Step one completed");
+//!     Ok(())
+//! }
+//!
+//! async fn step_two() -> dbos::Result<()> {
+//!     println!("Step two completed");
+//!     Ok(())
+//! }
+//!
+//! #[tokio::main]
+//! async fn main() -> dbos::Result<()> {
+//!     let dbos = DBOS::new(Config::from_env("dbos-starter"));
+//!
+//!     // Register workflows before launching, so that recovery can find them.
+//!     let workflow = dbos.register_workflow("workflow", workflow)?;
+//!     dbos.launch().await?;
+//!
+//!     let handle = workflow.start(()).await?;
+//!     println!("Workflow result: {}", handle.result().await?);
+//!
+//!     dbos.shutdown().await;
+//!     Ok(())
+//! }
+//! ```
+//!
+//! Tutorials and a programming guide are at [docs.dbos.dev](https://docs.dbos.dev/). The
+//! [repository](https://github.com/dbos-inc/dbos-transact-rust) has runnable demo applications.
+//!
+//! # Where to look
+//!
+//! Everything is at the crate root, apart from the system database layer.
+//!
+//! | To... | Use |
+//! |---|---|
+//! | Configure and run an application | [`Config`], [`DBOS`] |
+//! | Define and start workflows | [`DBOS::register_workflow`], [`WorkflowRef`], [`StartOptions`], [`WorkflowHandle`] |
+//! | Checkpoint work | [`step`](crate::step()), [`step_with`], [`StepOptions`], [`PendingStep`] |
+//! | Race or wait for durable calls | [`select_step!`], [`select_workflow`](fn@crate::select_workflow), [`join_workflows`](fn@crate::join_workflows) |
+//! | Wait and communicate | [`sleep`](crate::sleep()), [`send`](crate::send()), [`recv`](crate::recv()), [`set_event`](crate::set_event()), [`get_event`](crate::get_event()) |
+//! | Stream values from a workflow | [`write_stream`], [`close_stream`], [`read_stream`] |
+//! | Limit concurrency and rate | [`DBOS::register_queue`], [`QueueOptions`], [`QueueRequest`], [`Debouncer`] |
+//! | Run workflows on a schedule | [`Schedule`], [`ScheduleSpec`] |
+//! | Manage workflows | [`list_workflows`](crate::list_workflows()), [`cancel_workflow`], [`resume_workflow`], [`fork_workflow`], [`rewind_workflow`], [`delete_workflow`] |
+//! | Change a workflow's code | [`patch`](crate::patch()), [`deprecate_patch`](crate::deprecate_patch()) |
+//! | Choose how values are stored | [`SerializationFormat`], [`CustomSerializer`] |
+//! | Reach an application from outside it | [`Client`] |
+//! | Handle failures | [`Error`], [`DurableError`] |
+//! | Use the system database directly | [`sysdb`] |
 //!
 //! # Determinism in workflows
 //!
@@ -141,18 +205,24 @@
 //!
 //! # Cargo features
 //!
-//! - `engine` *(default)* — the durable execution engine: registry, contexts, workflows,
-//!   steps, queues, messaging, and the client. Turning it off leaves the system database
-//!   layer, which is the surface a future FFI host would consume.
-//! - `macros` *(default)* — [`select_step!`], the durable race, which is a procedural macro and so
-//!   costs `syn` and `quote` at build time. Implies `engine`, because the expansion is engine
-//!   code; nothing it generates reaches the binary.
-//! - `runtime-tokio` *(default)*, `runtime-smol`, `runtime-async-global-executor` — the async
-//!   runtime the crate spawns its background tasks and sets its timers on, which it needs one of.
-//!   Several may be enabled: tokio is used when the caller is in a tokio runtime, and otherwise
-//!   `async-global-executor`, then smol.
+//! | Feature | Default | What it adds |
+//! |---|---|---|
+//! | `engine` | yes | The durable execution engine: workflows, steps, queues, messaging and the client. Without it, what remains is the system database layer. |
+//! | `macros` | yes | [`select_step!`], the durable race. A procedural macro, so it adds `syn` and `quote` to the build; nothing they generate reaches the binary. Implies `engine`. |
+//! | `runtime-tokio` | yes | Run on tokio. |
+//! | `runtime-smol` | no | Run on smol. |
+//! | `runtime-async-global-executor` | no | Run on async-global-executor. |
+//!
+//! The crate needs at least one runtime feature, for spawning its background tasks and setting its
+//! timers. Several may be enabled: tokio is used when the caller is in a tokio runtime, and otherwise
+//! async-global-executor, then smol.
 
 #![forbid(unsafe_code)]
+#![warn(missing_docs, rustdoc::missing_crate_level_docs)]
+// What docs.rs builds with (see `[package.metadata.docs.rs]`): each feature-gated item shows a badge
+// naming its feature. Not `engine`, which nearly every item needs and which is on by default.
+#![cfg_attr(docsrs, feature(doc_cfg))]
+#![cfg_attr(docsrs, doc(auto_cfg(hide(feature, values("engine")))))]
 // Spawning and timers go through `rt`, which picks the runtime; `clippy.toml` names what that
 // rules out everywhere else. Denied here rather than left at clippy's default so the rule holds
 // for this crate's own code, and not for the integration tests under `tests/` that run on tokio

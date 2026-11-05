@@ -14,6 +14,13 @@ categories.workspace = true
 # crates.io only auto-detects a README in the package directory; the workspace one is the crate's.
 readme = "../../README.md"
 
+[package.metadata.docs.rs]
+# The runtime features are additive, so one build documents all of them.
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+# Nothing in the public API differs by platform.
+targets = ["x86_64-unknown-linux-gnu"]
+
 [features]
 default = ["engine", "macros", "runtime-tokio"]
 # Gates the durable execution engine: the lifecycle, registry, contexts, workflows, steps,
