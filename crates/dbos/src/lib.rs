@@ -1,13 +1,203 @@
-//! DBOS Transact for Rust — lightweight durable workflows on Postgres.
+//! DBOS Transact for Rust: lightweight durable workflows on Postgres.
 //!
-//! This crate is [DBOS Transact](https://docs.dbos.dev/) for Rust. It shares one Postgres system
-//! database schema with the other DBOS Transact SDKs, so a Rust application can run alongside
-//! applications written in any of their languages.
+//! DBOS checkpoints each step of a workflow in a Postgres database. When a process stops, for
+//! whatever reason, its workflows recover from those checkpoints and continue from the last
+//! completed step. It is only a library: there is no separate service or orchestrator, and Postgres
+//! is the only other thing it needs. Its system database has the same schema as the other
+//! [DBOS Transact](https://docs.dbos.dev/) SDKs', so a Rust application can run alongside
+//! applications written in their languages.
 //!
-//! # Status
+//! # Getting started
 //!
-//! Under construction. The system database layer, the lifecycle, registration, workflows,
-//! steps, events, messaging, recovery, queues, schedules and the client are here.
+//! A workflow is an `async fn` that takes one input and returns a [`Result`], and a
+//! [step](crate::step()) is a function whose result the workflow checkpoints. Set
+//! `DBOS_SYSTEM_DATABASE_URL` to a Postgres connection string (the database is created if it
+//! doesn't exist), then:
+//!
+//! ```no_run
+//! use dbos::{Config, DBOS};
+//!
+//! async fn workflow(_: ()) -> dbos::Result<String> {
+//!     dbos::step("step_one", step_one).await?;
+//!     dbos::step("step_two", step_two).await?;
+//!     Ok("success".to_owned())
+//! }
+//!
+//! async fn step_one() -> dbos::Result<()> {
+//!     println!("Step one completed");
+//!     Ok(())
+//! }
+//!
+//! async fn step_two() -> dbos::Result<()> {
+//!     println!("Step two completed");
+//!     Ok(())
+//! }
+//!
+//! #[tokio::main]
+//! async fn main() -> dbos::Result<()> {
+//!     let mut config = Config::from_env("dbos-starter");
+//!     config.app_version = Some("0.1.0".to_owned());
+//!     let dbos = DBOS::new(config);
+//!
+//!     // Register workflows before launching, so that recovery can find them.
+//!     let workflow = dbos.register_workflow("workflow", workflow)?;
+//!     dbos.launch().await?;
+//!
+//!     let handle = workflow.start(()).await?;
+//!     println!("Workflow result: {}", handle.result().await?);
+//!
+//!     dbos.shutdown().await;
+//!     Ok(())
+//! }
+//! ```
+//!
+//! The [programming guide](https://docs.dbos.dev/rust/programming-guide) is the place to start,
+//! with tutorials alongside it. There are also runnable
+//! [demo applications](https://github.com/dbos-inc/dbos-demo-apps/tree/main/rust).
+//!
+//! # Where to look
+//!
+//! Everything is at the crate root, apart from the system database layer in [`sysdb`], whose types
+//! some calls take and return. Free functions such as [`send`](crate::send()) and
+//! [`cancel_workflow`] are for workflow bodies, and fail with [`Error::NotInWorkflow`] elsewhere.
+//! Outside a workflow, call the same operation on [`DBOS`] or on a [`Client`].
+//!
+//! | To... | Use |
+//! |---|---|
+//! | Configure and run an application | [`Config`], [`DBOS`] |
+//! | Define and start workflows | [`DBOS::register_workflow`], [`WorkflowRef`], [`StartOptions`], [`WorkflowHandle`] |
+//! | Checkpoint work | [`step`](crate::step()), [`step_with`], [`StepOptions`], [`PendingStep`] |
+//! | Race or wait for durable calls | [`select_step!`], [`select_workflow`](fn@crate::select_workflow), [`join_workflows`](fn@crate::join_workflows) |
+//! | Wait and communicate | [`sleep`](crate::sleep()), [`send`](crate::send()), [`recv`](crate::recv()), [`set_event`](crate::set_event()), [`get_event`](crate::get_event()) |
+//! | Stream values from a workflow | [`write_stream`], [`close_stream`], [`read_stream`] |
+//! | Limit concurrency and rate | [`DBOS::register_queue`], [`QueueOptions`], [`QueueRequest`], [`Debouncer`] |
+//! | Run workflows on a schedule | [`Schedule`], [`ScheduleSpec`] |
+//! | Manage workflows | [`DBOS::list_workflows`], [`DBOS::cancel`], [`DBOS::resume`], [`DBOS::fork`], [`DBOS::rewind`], [`DBOS::delete`]; from a workflow body, [`list_workflows`](crate::list_workflows()), [`cancel_workflow`], [`resume_workflow`], [`fork_workflow`], [`rewind_workflow`], [`delete_workflow`] |
+//! | Change a workflow's code | [`patch`](crate::patch()), [`deprecate_patch`](crate::deprecate_patch()) |
+//! | Choose how values are stored | [`SerializationFormat`], [`CustomSerializer`] |
+//! | Reach an application from outside it | [`Client`] |
+//! | Handle failures | [`Error`], [`DurableError`] |
+//! | Use the system database directly | [`sysdb`] |
+//!
+//! # Determinism in workflows
+//!
+//! A workflow body must be deterministic. A recovery runs it again from the start and replays what
+//! each durable call recorded, so it has to reach the same durable calls, in the same order, with
+//! the same inputs. Anything non-deterministic belongs in a [step](crate::step()), whose result is
+//! recorded, or has to be one of this crate's durable primitives. The
+//! [workflow tutorial](https://docs.dbos.dev/rust/tutorials/workflow-tutorial#determinism) covers
+//! the same ground with more examples.
+//!
+//! None of this applies **inside a step**: a step's body runs once per attempt and only its result
+//! is recorded, so plain races, timeouts, sleeps and spawns are all fine there. A durable call
+//! still has to be awaited where it was built, though, so one spawned from a step body fails. Nor
+//! does any of this apply outside a workflow.
+//!
+//! ## Non-deterministic values
+//!
+//! The clock (`SystemTime::now`, `Instant::now`, `chrono::Utc::now`), random numbers (`rand`,
+//! `Uuid::new_v4`), environment and file reads, network calls and any other I/O all go in a step,
+//! so the value is recorded and replayed:
+//!
+//! ```no_run
+//! # fn rand_bool() -> bool { true }
+//! # async fn charge() -> dbos::Result<String> { Ok(String::new()) }
+//! # async fn refund() -> dbos::Result<String> { Ok(String::new()) }
+//! async fn workflow(_: ()) -> dbos::Result<String> {
+//!     // Not `if rand_bool()`: a recovery could draw the other value and take the other branch.
+//!     let choice = dbos::step("choose", || async { Ok(rand_bool()) }).await?;
+//!     if choice {
+//!         dbos::step("charge", charge).await
+//!     } else {
+//!         dbos::step("refund", refund).await
+//!     }
+//! }
+//! ```
+//!
+//! Branching on such a value outside a step is the commonest way a recovery diverges. When a
+//! recovery reaches a different step than the one recorded at that position, the call fails with
+//! [`Error::SystemDatabase`] holding [`sysdb::Error::UnexpectedStep`]. That isn't recorded as the
+//! workflow's outcome: the workflow stays `PENDING`, and recovery tries it again until it is
+//! parked.
+//!
+//! **Most divergence reports nothing**, so don't rely on that error. A recovery compares step names
+//! and not inputs, and only at positions that have a record. If `charge` above were chosen outside
+//! a step and the process stopped before its result was recorded, a recovery that chose differently
+//! would run `refund` as well, with no error, and both would have happened.
+//!
+//! ## Concurrency that makes a choice nothing records
+//!
+//! The following are **not supported inside a workflow body**, on any runtime. What matters is the
+//! behaviour rather than the crate it comes from, so each form is listed under the runtime that
+//! provides it.
+//!
+//! - **Races over durable calls.** The winner isn't recorded, so a recovery can take another
+//!   branch. Use [`select_step!`] instead.
+//!   - tokio: `tokio::select!`
+//!   - `futures`: `futures::select!`, `select_biased!`, `futures::future::select`, `try_select`,
+//!     `select_all` and `select_ok`, and `futures::stream::select` and `select_all`
+//!   - smol and `futures-lite`: `future::or`, `future::race`, `stream::or` and `stream::race`, and
+//!     `FutureExt::or` and `FutureExt::race` (`smol::future` and `smol::stream` re-export
+//!     `futures_lite::future` and `futures_lite::stream`)
+//! - **Timeouts around durable calls.** A timeout is a race against a timer. Use [`select_step!`]
+//!   with a durable [`sleep`](crate::sleep()), or the call's own timeout option where it has one.
+//!   - tokio: `tokio::time::timeout` and `timeout_at`
+//!   - smol and async-global-executor: an `async_io::Timer` (also `smol::Timer`) raced with `or` or
+//!     `race`, and timeout crates built on it
+//! - **Non-durable sleeps.** `tokio::time::sleep`, `sleep_until` or `interval`, or a
+//!   `smol::Timer::after` or `async_io::Timer::at`, used as a delay isn't recorded, so it runs
+//!   again in full on every recovery. Use [`sleep`](crate::sleep()).
+//! - **Completion-order streams over durable calls.** The order concurrent calls finish in comes
+//!   from their latency, which isn't recorded. On a recovery they come out in an order unrelated to
+//!   the first run, so steps a loop runs for each completion can be handed each other's recorded
+//!   results, and nothing reports an error. There is no durable replacement yet: run such a fan-out
+//!   as child workflows on a queue, or sequentially.
+//!   - `futures::stream::FuturesUnordered`, `StreamExt::buffer_unordered` and
+//!     `StreamExt::for_each_concurrent`
+//!   - any other combinator that yields results in completion order, including `futures-lite`'s
+//! - **Spawning a durable call.** The running workflow is found through a task-local, which a
+//!   spawned task doesn't inherit on any runtime. What happens then depends on the call and on
+//!   where it was built, and the commonest cases are silent:
+//!   - Built inside the spawned task, a step or a [`sleep`](crate::sleep()) runs as a plain call
+//!     and records nothing, and so do [`WorkflowHandle::result`] and the methods on [`DBOS`].
+//!   - Built inside the spawned task, [`WorkflowRef::start`] and [`WorkflowRef::run`] start a new
+//!     top-level workflow with no parent, so each recovery that repeats the spawn starts another.
+//!   - Built inside the spawned task, [`send`](crate::send()), [`recv`](crate::recv()),
+//!     [`set_event`](crate::set_event()), [`get_event`](crate::get_event()) and the management
+//!     functions fail with [`Error::NotInWorkflow`].
+//!   - Built in the workflow and awaited in the spawned task, any of them fails with
+//!     [`Error::StepBuiltElsewhere`].
+//!
+//!   The ways to spawn include:
+//!   - tokio: `tokio::spawn`, `tokio::task::spawn_blocking`, `spawn_local`, `LocalSet` and
+//!     `JoinSet`
+//!   - smol: `smol::spawn`, `smol::unblock` and `Executor::spawn`
+//!   - async-global-executor: `async_global_executor::spawn`, `spawn_local` and `spawn_blocking`
+//!   - `std::thread::spawn`
+//!
+//! These are supported in a workflow body:
+//!
+//! - `tokio::join!`, `futures::join!`, `futures::future::join_all` and
+//!   `futures_lite::future::zip`, on every runtime, when each element is one durable call. Each
+//!   waits for all of its elements and returns results in input order, and each call took its step
+//!   ID when it was built, which is what [`PendingStep`] explains.
+//!   - **An `async` block isn't one durable call.** The calls in it are built when it is polled, so
+//!     several such blocks take IDs in the order they happen to run, which a recovery doesn't
+//!     reproduce. Work needing several calls in one branch is a child workflow or a single step.
+//!   - **Some calls don't belong in a join.** [`patch`](crate::patch()) and
+//!     [`deprecate_patch`](crate::deprecate_patch()) claim their positions when awaited, and
+//!     [`Debouncer::debounce`] can claim more when awaited: await each of those on its own.
+//! - `tokio::try_join!`, `futures::try_join!`, `futures::future::try_join_all` and
+//!   `futures_lite::future::try_zip`, under the same rules, **only when the error goes straight out
+//!   of the workflow**. These stop at the first failure and drop the rest, which makes them a race
+//!   on the error path: nothing records which error came back, so code that branches on it can
+//!   take a different path on a recovery. To handle a failure, use an all-wait and inspect the
+//!   results.
+//! - [`select_step!`], [`select_workflow`](fn@crate::select_workflow) and
+//!   [`join_workflows`](fn@crate::join_workflows), and the
+//!   [`select_workflow!`](macro@crate::select_workflow) and
+//!   [`join_workflows!`](macro@crate::join_workflows) macros.
+//! - [`sleep`](crate::sleep()), for durable delays.
 //!
 //! # Changing a workflow's code
 //!
@@ -47,22 +237,29 @@
 //! Old and new code share executions only if they run under one application version, so the
 //! deployments that patch keep [`Config::app_version`] the same. The other way to change a
 //! workflow's code is a new version per deployment, with the old version's executors kept running
-//! until its executions finish; that needs no patch. See [`patch`](crate::patch()#application-version).
+//! until its executions finish; that needs no patch. See
+//! [`patch`](crate::patch()#application-version).
 //!
 //! # Cargo features
 //!
-//! - `engine` *(default)* — the durable execution engine: registry, contexts, workflows,
-//!   steps, queues, messaging, and the client. Turning it off leaves the system database
-//!   layer, which is the surface a future FFI host would consume.
-//! - `macros` *(default)* — [`select_step!`], the durable race, which is a procedural macro and so
-//!   costs `syn` and `quote` at build time. Implies `engine`, because the expansion is engine
-//!   code; nothing it generates reaches the binary.
-//! - `runtime-tokio` *(default)*, `runtime-smol`, `runtime-async-global-executor` — the async
-//!   runtime the crate spawns its background tasks and sets its timers on, which it needs one of.
-//!   Several may be enabled: tokio is used when the caller is in a tokio runtime, and otherwise
-//!   `async-global-executor`, then smol.
+//! | Feature | Default | What it adds |
+//! |---|---|---|
+//! | `engine` | yes | The durable execution engine: workflows, steps, queues, messaging and the client. Without it, what remains is the system database layer. |
+//! | `macros` | yes | [`select_step!`], the durable race. A procedural macro, so it adds `syn` and `quote` to the build, though neither ends up in the binary. Implies `engine`. |
+//! | `runtime-tokio` | yes | Run on tokio. |
+//! | `runtime-smol` | no | Run on smol. |
+//! | `runtime-async-global-executor` | no | Run on async-global-executor. |
+//!
+//! The crate needs at least one runtime feature, for spawning its background tasks and setting its
+//! timers. Several may be enabled: tokio is used when the caller is in a tokio runtime, and
+//! otherwise async-global-executor, then smol.
 
 #![forbid(unsafe_code)]
+#![warn(missing_docs, rustdoc::missing_crate_level_docs)]
+// What docs.rs builds with (see `[package.metadata.docs.rs]`): each feature-gated item shows a
+// badge naming its feature. Not `engine`, which nearly every item needs and which is on by default.
+#![cfg_attr(docsrs, feature(doc_cfg))]
+#![cfg_attr(docsrs, doc(auto_cfg(hide(feature, values("engine")))))]
 // Spawning and timers go through `rt`, which picks the runtime; `clippy.toml` names what that
 // rules out everywhere else. Denied here rather than left at clippy's default so the rule holds
 // for this crate's own code, and not for the integration tests under `tests/` that run on tokio
@@ -218,12 +415,13 @@ pub use wait::{join_workflows, select_workflow};
 
 /// Races these durable calls and runs the arm belonging to the one that finishes first.
 ///
-/// The durable race, and the reason a plain `tokio::select!` over steps is a trap rather than a
-/// shortcut. Since a step takes its id when it is *built*, a `select!` over steps allocates ids
-/// deterministically and so looks fixed — and it is still not durable, because nothing records
-/// which branch won and a replay is free to choose again, taking a path the first execution never
-/// took. This records the winning position, and a replay polls only that branch, which then
-/// replays from its own checkpoint without running.
+/// The durable race, and the reason a plain race over steps (`tokio::select!`, `smol::future::race`
+/// and the like) is a trap rather than a shortcut. Since a step takes its id when it is *built*, a
+/// plain race over steps allocates ids deterministically and so looks fixed — and it is still not
+/// durable, because nothing records which branch won and a replay is free to choose again, taking a
+/// path the first execution never took. This records the winning position, and a replay polls only
+/// that branch, which then replays from its own checkpoint without running. See
+/// [determinism in workflows](crate#determinism-in-workflows) for the forms a plain race takes.
 ///
 /// ```no_run
 /// # async fn charge(cents: u32) -> dbos::Result<u32> { Ok(cents) }

@@ -3146,6 +3146,7 @@ pub mod step_names {
     /// it. Inferring it from the batch size would record a one-message bulk send as `DBOS.send`,
     /// which is not the call the caller made.
     pub const SEND: &str = "DBOS.send";
+    /// What `send_messages` records.
     pub const SEND_BULK: &str = "DBOS.sendBulk";
 
     /// The step names a stream write records, chosen by whether the value is the closing sentinel.
@@ -3153,6 +3154,7 @@ pub mod step_names {
     /// Deriving rather than passing means a close is always recorded as a close, whichever entry
     /// point reached it.
     pub const WRITE_STREAM: &str = "DBOS.writeStream";
+    /// What a write of the closing sentinel records.
     pub const CLOSE_STREAM: &str = "DBOS.closeStream";
 
     /// The step names a workflow's stream read records, one step per value it delivers: the
@@ -3162,6 +3164,7 @@ pub mod step_names {
     /// one to the other is caught on replay as `UnexpectedStep` rather than handed a value the
     /// other read recorded.
     pub const READ_STREAM: &str = "DBOS.readStream";
+    /// What the read of a single value records.
     pub const READ_STREAM_VALUE: &str = "DBOS.readStreamValue";
 
     /// The step name `set_event` records, which a replay compares against.
@@ -3228,13 +3231,21 @@ pub mod step_names {
     /// [`fork_from`](crate::sysdb::SystemDatabase::fork_from) resolves all four
     /// [`ForkPoint`](super::ForkPoint)s through one method.
     pub const CANCEL_WORKFLOW: &str = "DBOS.cancelWorkflow";
+    /// What resuming a workflow records.
     pub const RESUME_WORKFLOW: &str = "DBOS.resumeWorkflow";
+    /// What deleting a workflow records.
     pub const DELETE_WORKFLOW: &str = "DBOS.deleteWorkflow";
+    /// What forking a workflow records.
     pub const FORK_WORKFLOW: &str = "DBOS.forkWorkflow";
+    /// What rewinding a workflow records.
     pub const REWIND_WORKFLOW: &str = "DBOS.rewindWorkflow";
+    /// What changing a workflow's delay records.
     pub const SET_WORKFLOW_DELAY: &str = "DBOS.setWorkflowDelay";
+    /// What updating a workflow's attributes records.
     pub const UPDATE_WORKFLOW_ATTRIBUTES: &str = "DBOS.updateWorkflowAttributes";
+    /// What listing workflows records.
     pub const LIST_WORKFLOWS: &str = "DBOS.listWorkflows";
+    /// What listing a workflow's steps records.
     pub const LIST_WORKFLOW_STEPS: &str = "DBOS.listWorkflowSteps";
 
     /// The step names the schedule methods record, which a replay compares against.
@@ -3242,12 +3253,19 @@ pub mod step_names {
     /// Pausing and resuming reach one method but record two names: the name follows the status
     /// being set rather than the method being called.
     pub const CREATE_SCHEDULE: &str = "DBOS.createSchedule";
+    /// What creating or replacing a schedule records.
     pub const UPSERT_SCHEDULE: &str = "DBOS.upsertSchedule";
+    /// What reading a schedule records.
     pub const GET_SCHEDULE: &str = "DBOS.getSchedule";
+    /// What listing schedules records.
     pub const LIST_SCHEDULES: &str = "DBOS.listSchedules";
+    /// What updating a schedule records.
     pub const UPDATE_SCHEDULE: &str = "DBOS.updateSchedule";
+    /// What pausing a schedule records.
     pub const PAUSE_SCHEDULE: &str = "DBOS.pauseSchedule";
+    /// What resuming a schedule records.
     pub const RESUME_SCHEDULE: &str = "DBOS.resumeSchedule";
+    /// What deleting a schedule records.
     pub const DELETE_SCHEDULE: &str = "DBOS.deleteSchedule";
 }
 

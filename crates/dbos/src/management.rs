@@ -670,6 +670,16 @@ pub fn fork_workflows<'a, R: 'a, E: 'a>(
 ///
 /// [`Error::NotInWorkflow`] outside a workflow; plain inside a step. A [`PendingStart`], as
 /// [`resume_workflow`] is.
+///
+/// ```no_run
+/// // A workflow body, registered with `DBOS::register_workflow`.
+/// async fn run_again(workflow_id: String) -> dbos::Result<u32> {
+///     dbos::rewind_workflow::<u32, dbos::EngineOnly>(&workflow_id)
+///         .await?
+///         .result()
+///         .await
+/// }
+/// ```
 pub fn rewind_workflow<'a, R: 'a, E: 'a>(workflow_id: &'a str) -> PendingStart<'a, R, E> {
     PendingStart::from_step(pending_rewind(
         StepPlacement::ambient_connection("rewind_workflow"),
@@ -705,6 +715,13 @@ pub fn rewind_workflow_with<'a, R: 'a, E: 'a>(
 ///
 /// [`Error::NotInWorkflow`] outside a workflow; plain inside a step. The error is the workflow's
 /// channel.
+///
+/// ```no_run
+/// // A workflow body, registered with `DBOS::register_workflow`.
+/// async fn clean_up(workflow_id: String) -> dbos::Result<()> {
+///     dbos::delete_workflow(&workflow_id).await
+/// }
+/// ```
 pub fn delete_workflow<'a, E: DurableError + 'a>(workflow_id: &'a str) -> PendingStep<'a, (), E> {
     pending_delete(
         StepPlacement::ambient_connection("delete_workflow"),

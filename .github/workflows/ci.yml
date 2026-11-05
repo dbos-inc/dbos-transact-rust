@@ -72,6 +72,23 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo doc --no-deps --all-features
 
+  docs-rs:
+    name: Documentation as docs.rs builds it
+    runs-on: ubuntu-latest
+    # On nightly, as docs.rs is, because the feature badges need it. A dated one, so that a new
+    # nightly lint can't fail an unrelated pull request; bump it before a release, because docs.rs
+    # builds on the latest. Keep the features in step with `[package.metadata.docs.rs]` in
+    # `crates/dbos/Cargo.toml`.
+    env:
+      RUSTDOCFLAGS: --cfg docsrs -D warnings
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-11-05
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo +nightly-2026-11-05 doc --no-deps -p dbos -p dbos-macros --all-features
+
   core-only:
     name: Core-only build
     runs-on: ubuntu-latest

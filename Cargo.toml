@@ -30,7 +30,7 @@ license = "MIT"
 authors = ["DBOS, Inc."]
 repository = "https://github.com/dbos-inc/dbos-transact-rust"
 homepage = "https://dbos.dev"
-documentation = "https://docs.dbos.dev"
+documentation = "https://docs.rs/dbos"
 keywords = ["durable-execution", "workflow", "postgres", "orchestration", "queue"]
 categories = ["asynchronous", "database"]
 

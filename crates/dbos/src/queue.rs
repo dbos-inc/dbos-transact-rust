@@ -45,6 +45,24 @@ pub(crate) const DEFAULT_POLLING_INTERVAL: Duration = Duration::from_secs(1);
 /// **Its own fields rather than a wrapped [`QueueRecord`]**, because derived equality over a
 /// wrapped row would compare [`application_name`](QueueRecord::application_name), which this type
 /// does not report, so two queues identical through every accessor here could still differ.
+///
+/// ```no_run
+/// # async fn f(dbos: dbos::DBOS, task: dbos::WorkflowRef<u32, u32>) -> dbos::Result<()> {
+/// use dbos::{QueueConflict, QueueOptions, QueueRequest, StartOptions};
+///
+/// // After `launch`, unlike `register_workflow`.
+/// dbos.register_queue("tasks", QueueOptions::default(), QueueConflict::UpdateIfLatestVersion)
+///     .await?;
+///
+/// let options = StartOptions {
+///     queue: Some(QueueRequest::new("tasks")),
+///     ..StartOptions::default()
+/// };
+/// let handle = task.start_with(1, options).await?;
+/// # let _ = handle;
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Queue {
     name: String,
