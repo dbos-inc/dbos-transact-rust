@@ -52,8 +52,8 @@
 //! ```
 //!
 //! The [programming guide](https://docs.dbos.dev/rust/programming-guide) is the place to start,
-//! with tutorials alongside it. The [repository](https://github.com/dbos-inc/dbos-transact-rust)
-//! has runnable demo applications.
+//! with tutorials alongside it. There are also runnable
+//! [demo applications](https://github.com/dbos-inc/dbos-demo-apps/tree/main/rust).
 //!
 //! # Where to look
 //!
