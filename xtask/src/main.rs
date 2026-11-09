@@ -11,9 +11,12 @@
 //!     cargo xtask patch              # 0.5.0 -> 0.5.1 (0.5.1 -> 0.5.2, ...)
 //!
 //! `cargo release` (configured in `release.toml`) bumps the workspace version and the `=` pin on
-//! `dbos-macros`, commits, tags `vX.Y.Z`, publishes `dbos-macros` then `dbos`, and pushes. This
-//! drives its per-step subcommands rather than the all-in-one `cargo release <level>`, for the
-//! reason spelled out on [`execute_release`].
+//! `dbos-macros`, commits and tags `vX.Y.Z`, and this pushes the commit and the tag together. The
+//! tag starts the `Release` workflow (`.github/workflows/release.yml`), which publishes
+//! `dbos-macros` then `dbos` to crates.io. Nothing here publishes: the one step that can't be undone
+//! runs in CI, after the push it depends on has already succeeded. This drives cargo-release's
+//! per-step subcommands rather than the all-in-one `cargo release <level>`, for the reason spelled
+//! out on [`execute_release`].
 //!
 //! A final release from `main` does two more things. It cuts `release/vX.Y` at the release commit,
 //! which is the branch any later patch to that line is built on, and it moves `main` to
@@ -24,7 +27,8 @@
 //! moves it on. A `patch` does neither either — a release branch carries plain released versions
 //! with no `-dev` suffix, so the next `patch` bumps straight off the last one.
 //!
-//! Requires `cargo install cargo-release` and a `cargo login` as a crates.io owner of both crates.
+//! Requires `cargo install cargo-release`, and the repository's admin role: `main` only takes
+//! pull requests, and admins are the only ones its ruleset lets push the version commits.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
@@ -67,28 +71,32 @@ fn run(args: &[String]) -> Result<()> {
     if dry_run {
         dry_run_release(&root, level, &branch, &released)
     } else {
-        execute_release(&root, level, &released)
+        execute_release(&root, level, &branch, &released)
     }
 }
 
-/// The release itself, in the order `cargo release <level>` would run it.
+/// The release itself: bump, commit, tag, and push the commit and the tag together.
 ///
-/// The version bump is applied and committed *before* `publish`, rather than left to the
-/// all-in-one command, and that split is the whole reason these are separate steps. cargo-release
-/// checks every dependency requirement against the manifests as they are **on disk**, never
-/// against the versions it is planning — so with the bump unapplied it reads `dbos`'s pin as
-/// `=<version>-dev`, finds that no package it is about to publish satisfies it and that no such
-/// version was ever published, and aborts. Bumping first leaves the pin naming the `dbos-macros`
-/// version that is about to go up, which is what the check is actually asking about.
-fn execute_release(root: &Path, level: Level, released: &str) -> Result<()> {
+/// The version bump is applied and committed as its own step, rather than left to the all-in-one
+/// command. cargo-release checks every dependency requirement against the manifests as they are
+/// **on disk**, never against the versions it is planning — so with the bump unapplied it reads
+/// `dbos`'s pin as `=<version>-dev`, finds that no package it is about to release satisfies it and
+/// that no such version was ever published, and aborts. Bumping first leaves the pin naming the
+/// `dbos-macros` version that is about to go up, which is what the check is actually asking about.
+///
+/// The push is the last thing done here, and the publish follows it in CI. So if `main` refuses
+/// the push, nothing has been published, and the local commit and tag are all there is to undo.
+fn execute_release(root: &Path, level: Level, branch: &str, released: &str) -> Result<()> {
     cargo_release(root, &["version", level.as_str()], Mode::Execute)?;
     cargo_release(root, &["commit"], Mode::Execute)?;
-    // Only knowable once the bump is on disk, and worth knowing before the publish: cargo-release
-    // tags after publishing, so a name already taken would otherwise fail an irreversible release.
-    ensure_tag_free(root, &tag_name(root)?)?;
-    cargo_release(root, &["publish"], Mode::Execute)?;
+    let tag = tag_name(root)?;
+    ensure_tag_free(root, &tag)?;
     cargo_release(root, &["tag"], Mode::Execute)?;
-    cargo_release(root, &["push"], Mode::Execute)?;
+    push_release(root, branch, &tag, Mode::Execute)?;
+    println!(
+        "Pushed {tag}. The Release workflow publishes it to crates.io: \
+         https://github.com/dbos-inc/dbos-transact-rust/actions/workflows/release.yml"
+    );
 
     // Only a final release from main opens a new minor line and retargets main.
     if level != Level::Release {
@@ -101,10 +109,11 @@ fn execute_release(root: &Path, level: Level, released: &str) -> Result<()> {
 ///
 /// cargo-release's own dry run leaves the manifests alone, so on this workspace it reports the
 /// unsatisfiable `-dev` pin described on [`execute_release`] and packages crates still carrying
-/// the `-dev` version — it never sees the artifacts a release would actually upload. The tag is
-/// cut for a similar reason: `cargo release push` refuses to run without it, and a tag name
-/// already taken is exactly what a dry run exists to find. Only the two steps that leave this
-/// machine, the publish and the push, are simulated.
+/// the `-dev` version — it never sees the artifacts a release would actually upload. On the bumped
+/// scratch commit, `cargo publish --dry-run` packages and verifies both crates exactly as the
+/// `Release` workflow will publish them. The tag is cut because a tag name already taken is exactly
+/// what a dry run exists to find. Only the push, the one step that leaves this machine, is
+/// simulated.
 ///
 /// All of it happens on a detached HEAD, so the release branch itself never moves. An interrupted
 /// dry run therefore cannot leave a release commit sitting on a branch for someone to push by
@@ -129,9 +138,20 @@ fn dry_run_release(root: &Path, level: Level, branch: &str, released: &str) -> R
     ensure_tag_free(root, &tag)?;
     scratch.tag = Some(tag);
 
-    cargo_release(root, &["publish"], Mode::DryRun)?;
     cargo_release(root, &["tag"], Mode::Scratch)?;
-    cargo_release(root, &["push"], Mode::DryRun)?;
+    // What the Release workflow will run, short of the upload. One command, so cargo verifies
+    // `dbos` against the `dbos-macros` it has just packaged rather than looking for it on the index.
+    sh(
+        root,
+        "cargo",
+        &["publish", "--dry-run", "-p", "dbos-macros", "-p", "dbos"],
+    )?;
+    push_release(
+        root,
+        branch,
+        scratch.tag.as_deref().unwrap_or_default(),
+        Mode::DryRun,
+    )?;
 
     if level != Level::Release {
         return Ok(());
@@ -216,6 +236,25 @@ fn post_release(root: &Path, released: &str, mode: Mode) -> Result<()> {
     cargo_release(root, &["version", &next], mode)?;
     cargo_release(root, &["commit"], mode)?;
     git(root, &["push", "origin", "main"], mode)
+}
+
+/// Push the release commit and its tag in one atomic push.
+///
+/// Atomic, because the tag is what publishes: if `main` refused the commit while the tag went
+/// through, the Release workflow would publish a commit that isn't on any branch. `cargo release
+/// push` pushes the two separately, which is why this doesn't use it.
+fn push_release(root: &Path, branch: &str, tag: &str, mode: Mode) -> Result<()> {
+    git(
+        root,
+        &[
+            "push",
+            "--atomic",
+            "origin",
+            &format!("HEAD:refs/heads/{branch}"),
+            tag,
+        ],
+        mode,
+    )
 }
 
 /// `cargo release` enforces the branch too, via `allow-branch` — but it cannot know that `rc` and

@@ -1,0 +1,103 @@
+name: Release
+
+# Publishes `dbos-macros` and `dbos` to crates.io when `cargo xtask` pushes a `v*` tag. The xtask
+# bumps, commits, tags and pushes; this workflow does the one step that can't be undone, after the
+# tag and its commit are already on GitHub. See "Creating a release" in DEVELOPING.md.
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+# One release at a time, and never cancelled part-way: a publish that stopped between the two
+# crates would leave `dbos-macros` on the index without the `dbos` that pins it.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify the tag
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Whole history, so the branch check below can see where the tagged commit is.
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - id: version
+        name: The tag names the version in the manifests
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          version="$(cargo pkgid -p dbos | sed 's/.*[#@]//')"
+          if [ "$tag" != "v$version" ]; then
+            echo "::error::tag $tag doesn't match the manifests' version $version"
+            exit 1
+          fi
+          case "$version" in
+            *-dev*) echo "::error::$version is a -dev version, which is never published"; exit 1 ;;
+          esac
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: The tagged commit is on main or a release branch
+        # Both are protected, so a tag elsewhere would publish code nobody reviewed.
+        run: |
+          for branch in $(git for-each-ref --format='%(refname:strip=3)' \
+              'refs/remotes/origin/main' 'refs/remotes/origin/release/v*'); do
+            if git merge-base --is-ancestor "$GITHUB_SHA" "origin/$branch"; then
+              echo "$GITHUB_REF_NAME is on $branch"
+              exit 0
+            fi
+          done
+          echo "::error::$GITHUB_REF_NAME ($GITHUB_SHA) is on neither main nor a release/v* branch"
+          exit 1
+
+  docs-rs:
+    name: Documentation as docs.rs will build it
+    runs-on: ubuntu-latest
+    # On the latest nightly rather than CI's dated one, because that is what docs.rs builds the
+    # published crate with. A failure here stops the release before anything is uploaded.
+    env:
+      RUSTDOCFLAGS: --cfg docsrs -D warnings
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: cargo +nightly doc --no-deps -p dbos -p dbos-macros --all-features
+
+  publish:
+    name: Publish to crates.io
+    needs: [verify, docs-rs]
+    runs-on: ubuntu-latest
+    permissions:
+      # crates.io Trusted Publishing exchanges this workflow's OIDC token for a short-lived
+      # publish token, so no crates.io token is stored anywhere.
+      id-token: write
+      # To draft the GitHub release.
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+      - name: Publish dbos-macros, then dbos
+        # One command, so cargo publishes in dependency order and waits for `dbos-macros` to reach
+        # the index before verifying `dbos`, whose `=` pin requires it.
+        run: cargo publish -p dbos-macros -p dbos
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+      - name: Draft the GitHub release
+        # A draft, because the release notes are written by hand. Publish it once they're in.
+        run: |
+          prerelease=""
+          case "$VERSION" in *-*) prerelease="--prerelease" ;; esac
+          gh release create "$GITHUB_REF_NAME" --draft --verify-tag $prerelease \
+            --title "$VERSION" --notes "Release notes to follow."
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.verify.outputs.version }}

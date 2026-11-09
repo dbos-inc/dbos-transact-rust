@@ -185,62 +185,80 @@ makes release candidates safe to publish.
 
 ### Prerequisites
 
-Releases are cut by a person from a clean `main`, using their own crates.io credentials:
+Releases are cut by a person from a clean `main`, and published by CI:
 
 ```bash
 cargo install cargo-release
-cargo login   # a crates.io token with the publish scope
 ```
+
+You need the repository's **admin** role. `main` only accepts pull requests, and admins are the
+only ones its ruleset lets push the release's version commits. You don't need a crates.io token:
+the `Release` workflow publishes with [Trusted Publishing](#publishing-from-ci).
 
 ### Creating a release
 
 From a clean `main`:
 
 ```bash
-cargo xtask release --dry-run   # print every step, publish nothing
+cargo xtask release --dry-run   # print every step, push nothing
 cargo xtask release             # 0.5.0-dev -> 0.5.0, then main -> 0.6.0-dev
 ```
 
 It does all of this, in order. There are no manual git steps:
 
 1. Bumps the workspace version and the exact-version pin, from `0.5.0-dev` to `0.5.0`.
-2. Commits that as `Version 0.5.0`.
-3. Publishes `dbos-macros`, waits for it to appear on the index, then publishes `dbos`.
-4. Tags the release commit `v0.5.0`.
-5. Pushes `main` and the tag.
-6. **Creates the branch `release/v0.5`** at the release commit and pushes it. Patches to the
+2. Commits that as `Version 0.5.0`, and tags it `v0.5.0`.
+3. Pushes the commit to `main` and the tag, in one atomic push.
+4. **Creates the branch `release/v0.5`** at the release commit and pushes it. Patches to the
    `0.5` line are cut from there, so the branch is made now rather than when it is first needed.
-7. Commits `main` at `0.6.0-dev` and pushes again.
+5. Commits `main` at `0.6.0-dev` and pushes again.
 
-Steps 6 and 7 run only for a final release. An `rc` stops after step 5, and so does a `patch` on
+Steps 4 and 5 run only for a final release. An `rc` stops after step 3, and so does a `patch` on
 a release branch.
 
-Those are cargo-release's per-step subcommands — `version`, `commit`, `publish`, `tag`, `push` —
-rather than the all-in-one `cargo release <level>`, and the reason is step 1. cargo-release
-checks dependency requirements against the manifests as they are **on disk**, never against the
-versions it is planning, so with the bump unapplied it reads `dbos`'s pin as `=0.5.0-dev`, finds
-that nothing it is about to publish satisfies it and that no such version was ever published, and
-aborts with `dbos 0.5.0 depends on unpublished workspace package dbos-macros 0.5.0`. Bumping and
-committing first leaves the pin naming the `dbos-macros` version that is about to go up, which is
-what the check is actually asking about.
+The tag starts the [`Release` workflow](.github/workflows/release.yml), which publishes. It:
+
+1. Checks that the tag names the version in the manifests, and that the tagged commit is on
+   `main` or a `release/v*` branch.
+2. Builds the docs the way docs.rs will, on the latest nightly.
+3. Publishes `dbos-macros`, waits for it to reach the index, then publishes `dbos`.
+4. Drafts a GitHub release for the tag.
+
+Watch it in the Actions tab. If it fails before the publish step, nothing was uploaded: fix the
+problem on `main`, and release again with the next version.
+
+The xtask drives cargo-release's per-step subcommands — `version`, `commit`, `tag` — rather than
+the all-in-one `cargo release <level>`, and the reason is step 1. cargo-release checks dependency
+requirements against the manifests as they are **on disk**, never against the versions it is
+planning, so with the bump unapplied it reads `dbos`'s pin as `=0.5.0-dev`, finds that nothing it
+is about to release satisfies it and that no such version was ever published, and aborts with
+`dbos 0.5.0 depends on unpublished workspace package dbos-macros 0.5.0`. Bumping and committing
+first leaves the pin naming the `dbos-macros` version that is about to go up, which is what the
+check is actually asking about.
+
+It pushes the commit and the tag atomically, not with `cargo release push`, because the tag is
+what publishes. If `main` refused the commit while the tag went through, the workflow would
+publish a commit that isn't on any branch. And it pushes before anything is published, so a
+refused push costs nothing: delete the local tag (`git tag -d v0.5.0`) and reset `main` to
+`origin/main`.
 
 The publish order is not optional: `dbos` requires `=<version>` of `dbos-macros` to already be on
-the index, so publishing them the other way round fails verification.
+the index, so publishing them the other way round fails verification. The workflow publishes both
+in one `cargo publish -p dbos-macros -p dbos`, which orders them and waits for the index.
 [cargo-release](https://github.com/crate-ci/cargo-release), configured in
-[`release.toml`](./release.toml), handles the ordering and the index wait. It also refuses to
-release from a dirty tree, or from any branch but `main` and `release/v*`.
+[`release.toml`](./release.toml), refuses to release from a dirty tree, or from any branch but
+`main` and `release/v*`.
 
 **Run the dry run first.** A crates.io publish is permanent. A version can be yanked, which stops
 new resolutions from selecting it, but it cannot be deleted or replaced.
 
-The dry run does the local half for real — steps 1, 2 and 4, the bump, its commit and the tag —
-and undoes all of it before returning. Only the two steps that leave your machine, the publish and
-the push, are simulated. It works that way for the same reason step 1 does: a dry run that left
-the manifests alone would report the unsatisfiable `-dev` pin and package crates still carrying
-the `-dev` version, so it would never once look at the artifacts a release would upload. The tag
-is cut for a similar reason: `cargo release push` refuses to run without it, and a tag name
-already taken is exactly what a dry run is for — a real release only reaches its tag step after
-the publish, which cannot be taken back.
+The dry run does the local half for real — the bump, its commit and the tag — and undoes all of it
+before returning. On that bumped commit it runs `cargo publish --dry-run -p dbos-macros -p dbos`,
+which packages and verifies both crates exactly as the workflow will publish them. Only the push is
+simulated. It works that way because a dry run that left the manifests alone would report the
+unsatisfiable `-dev` pin and package crates still carrying the `-dev` version, so it would never
+once look at the artifacts a release would upload. The tag is cut because a tag name already taken
+is exactly what a dry run is for.
 
 All of that happens on a **detached HEAD**, so `main` itself never moves. An interrupted dry run
 cannot leave a release commit sitting on a branch for someone to push later; the most it leaves is
@@ -321,15 +339,38 @@ Older lines stay patchable indefinitely, since each has its own branch. Patching
 
 ### Publishing from CI
 
-Releases are triggered by a person today. Moving to tag-triggered publishing is a small change:
-set `publish = false` in [`release.toml`](./release.toml) so the command only versions, tags, and
-pushes, then add a workflow on `v*` tags that runs `cargo publish --workspace`. crates.io
-supports Trusted Publishing for GitHub Actions, which issues a short-lived token and avoids
-storing a long-lived secret. It is configured per crate on the crate's settings page by a user
-owner.
+The [`Release` workflow](.github/workflows/release.yml) runs on every `v*` tag. It authenticates
+to crates.io with [Trusted Publishing](https://crates.io/docs/trusted-publishing): GitHub issues
+the workflow a short-lived OIDC token, and crates.io exchanges it for a publish token, so no
+crates.io token is stored in the repository or on anyone's machine.
+
+That needs a one-time setup on crates.io, by a user who owns the crate. For **each** of `dbos` and
+`dbos-macros`, open the crate's Settings, add a trusted publisher for GitHub, and enter:
+
+- Repository owner: `dbos-inc`
+- Repository name: `dbos-transact-rust`
+- Workflow filename: `release.yml`
+- Environment: leave empty
+
+Until that is done, the workflow's publish step fails with an authentication error, and nothing is
+published. To publish by hand instead, from the tagged commit:
+
+```bash
+git checkout v0.5.0
+cargo publish -p dbos-macros -p dbos   # needs `cargo login` as an owner of both crates
+```
 
 ### After a release
 
-Check the crates.io page for the README and metadata, and that
-[docs.rs](https://docs.rs/dbos) built cleanly. docs.rs builds with default features, which for
-this crate is everything, so a green `cargo doc --all-features` locally is a good predictor.
+1. **Watch the `Release` workflow** in the Actions tab until it finishes.
+2. **Publish the GitHub release.** The workflow leaves a draft for the tag, marked as a
+   pre-release for an `rc`: write the release notes into it and publish it.
+3. **Check crates.io and docs.rs.** The crate pages should show the README and metadata. docs.rs
+   builds each published version on its own, usually within minutes; check that
+   [docs.rs/dbos](https://docs.rs/dbos) shows the new version and its feature badges, and that its
+   build log is clean. It builds with the features in `[package.metadata.docs.rs]`, which is what
+   the workflow's nightly docs build checked.
+4. **Close the GitHub milestone** for the version, and open one for the next.
+5. **Update what depends on the release**: the demo apps in
+   [dbos-demo-apps](https://github.com/dbos-inc/dbos-demo-apps) depend on the published crate, so
+   move them to the new version.
