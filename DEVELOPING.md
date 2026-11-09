@@ -191,9 +191,11 @@ Releases are cut by a person from a clean `main`, and published by CI:
 cargo install cargo-release
 ```
 
-You need the repository's **admin** role. `main` only accepts pull requests, and admins are the
-only ones its ruleset lets push the release's version commits. You don't need a crates.io token:
-the `Release` workflow publishes with [Trusted Publishing](#publishing-from-ci).
+You need the repository's **admin** role, for two reasons. `main` and the `release/v*` branches
+only accept pull requests, and admins are the only ones their ruleset lets push a release's version
+commits. And the "Release tags" ruleset lets only admins create, move or delete a `v*` tag, since
+pushing one is what publishes. You don't need a crates.io token: the `Release` workflow publishes
+with [Trusted Publishing](#publishing-from-ci).
 
 ### Creating a release
 
@@ -326,6 +328,9 @@ git switch release/v0.5
 git cherry-pick <sha>          # the fix, already reviewed and merged to main
 cargo xtask patch       # 0.5.0 -> 0.5.1, then 0.5.1 -> 0.5.2, ...
 ```
+
+Pushing the cherry-pick and running `cargo xtask patch` both push straight to the release branch,
+which needs the admin role, as a release from `main` does.
 
 Fix on `main` first, then cherry-pick onto the release branch. A fix that lands only on the
 release branch is a fix that comes back as a regression in the next minor.
