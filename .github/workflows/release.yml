@@ -73,9 +73,24 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
       - run: cargo +nightly doc --no-deps -p dbos -p dbos-macros --all-features
 
+  package:
+    name: Package and verify both crates
+    runs-on: ubuntu-latest
+    # Verifying builds the crates, which runs their dependencies' build scripts and proc macros. So
+    # it runs here, in a job that can't request an OIDC token, rather than in the publish job, where
+    # any step could request one and trade it for a crates.io publish token.
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      # One command, so `dbos` is verified against the `dbos-macros` just packaged rather than
+      # looked for on the index.
+      - run: cargo publish --dry-run -p dbos-macros -p dbos
+
   publish:
     name: Publish to crates.io
-    needs: [verify, docs-rs]
+    needs: [verify, docs-rs, package]
     runs-on: ubuntu-latest
     # The environment is what limits publishing to release tags. crates.io's trusted publisher for
     # each crate names it, and its deployment policy admits only `v*` tags, which only admins can
@@ -83,22 +98,19 @@ jobs:
     environment: crates-io
     permissions:
       # crates.io Trusted Publishing exchanges this workflow's OIDC token for a short-lived
-      # publish token, so no crates.io token is stored anywhere.
+      # publish token, so no crates.io token is stored anywhere. Every step of this job can request
+      # that token, so nothing here compiles: the crates were verified in `package`, and
+      # `--no-verify` below only packages their sources.
       id-token: write
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
-      - name: Package and verify both crates
-        # Verifying builds the crates, which runs their dependencies' build scripts and proc
-        # macros, so it runs before the publish token exists. One command, so `dbos` is verified
-        # against the `dbos-macros` just packaged rather than looked for on the index.
-        run: cargo publish --dry-run -p dbos-macros -p dbos
       - uses: rust-lang/crates-io-auth-action@v1
         id: auth
       - name: Publish dbos-macros, then dbos
-        # Verified above. One command, so cargo publishes in dependency order and waits for
+        # Verified in `package`. One command, so cargo publishes in dependency order and waits for
         # `dbos-macros` to reach the index before uploading `dbos`, whose `=` pin requires it.
         run: cargo publish --no-verify -p dbos-macros -p dbos
         env:

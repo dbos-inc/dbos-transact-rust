@@ -263,8 +263,9 @@ released from (`main`, or the release branch for a `patch`) to its `origin` coun
 
 The publish order is not optional: `dbos` requires `=<version>` of `dbos-macros` to already be on
 the index, so publishing them the other way round fails verification. The workflow verifies both
-with `cargo publish --dry-run -p dbos-macros -p dbos`, before it holds a publish token, then
-uploads them in one `cargo publish --no-verify -p dbos-macros -p dbos`, which orders them and
+with `cargo publish --dry-run -p dbos-macros -p dbos` in a job that can't obtain a publish token,
+since verifying runs dependencies' build scripts and proc macros. The publish job compiles nothing:
+it uploads them in one `cargo publish --no-verify -p dbos-macros -p dbos`, which orders them and
 waits for the index.
 [cargo-release](https://github.com/crate-ci/cargo-release), configured in
 [`release.toml`](./release.toml), refuses to release from a dirty tree, or from any branch but
