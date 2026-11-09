@@ -9,7 +9,7 @@
 
 > [!WARNING]
 > **Pre-production release.** DBOS Transact for Rust 0.6 is a pre-production release, and isn't
-> yet supported for production use. Expect breaking API changes between releases.
+> yet supported for production use. Its API may still change in breaking ways between releases.
 
 ## What is DBOS?
 
