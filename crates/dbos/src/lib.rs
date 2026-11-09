@@ -1,8 +1,7 @@
 //! DBOS Transact for Rust: lightweight durable workflows on Postgres.
 //!
-//! **Pre-production release.** DBOS Transact for Rust isn't production-ready yet: 0.6 is a
-//! pre-production release. Use it to evaluate DBOS and to build with it, but don't run it in
-//! production, and expect breaking API changes between releases.
+//! **Pre-production release.** DBOS Transact for Rust 0.6 is a pre-production release, and isn't
+//! yet supported for production use. Expect breaking API changes between releases.
 //!
 //! DBOS checkpoints each step of a workflow in a Postgres database. When a process stops, for
 //! whatever reason, its workflows recover from those checkpoints and continue from the last
