@@ -379,6 +379,28 @@ pub struct ShutdownOptions {
 /// why this is an instance whose state changes rather than a builder that becomes a handle. A
 /// type-state would make "not launched" a compile error and would also make relaunching
 /// inexpressible.
+///
+/// ```no_run
+/// # async fn f() -> dbos::Result<()> {
+/// use dbos::{Config, DBOS};
+///
+/// async fn greet(name: String) -> dbos::Result<String> {
+///     Ok(format!("Hello, {name}"))
+/// }
+///
+/// let mut config = Config::from_env("my-app");
+/// config.app_version = Some("0.1.0".to_owned());
+/// let dbos = DBOS::new(config);
+/// let greet = dbos.register_workflow("greet", greet)?;
+/// dbos.launch().await?;
+///
+/// let greeting = greet.start("world".to_owned()).await?.result().await?;
+///
+/// dbos.shutdown().await;
+/// # let _ = greeting;
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Clone)]
 pub struct DBOS(Arc<Inner>);
 

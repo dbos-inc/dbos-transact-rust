@@ -48,9 +48,10 @@
 //!
 //! # Racing, and what a workflow body may not use
 //!
-//! `tokio::join!` over durable calls is ordinary code; `tokio::select!` and `tokio::time::timeout`
-//! are not, because a race *decides* something and nothing records what it decided. [`PendingStep`]
-//! sets out the rule and what to reach for instead.
+//! A `join!` over durable calls is ordinary code; a race or a timeout around them is not, on any
+//! runtime, because a race *decides* something and nothing records what it decided. [`PendingStep`]
+//! sets out the rule and what to reach for instead, and
+//! [determinism in workflows](crate#determinism-in-workflows) lists each runtime's forms.
 //!
 //! Two kinds of call are kept out of a durable race by their own types:
 //! [`PendingStart`](crate::PendingStart) and [`PendingRun`](crate::PendingRun) *set a workflow
@@ -59,8 +60,8 @@
 //! of some other branch. Set it running outside the race; race what observes the result.
 //! [`select_step!`](crate::select_step) pushes each branch onto a set that takes a [`PendingStep`],
 //! so a start handed to one is a type error rather than a paragraph ignored. What no type stops is
-//! `tokio::select!`, which takes any future — there the prose is what stands between a body and
-//! the mistake.
+//! a runtime's own race, such as `tokio::select!`, which takes any future — there the prose is what
+//! stands between a body and the mistake.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -124,13 +125,18 @@ pub(crate) type Built<C> = Result<(C, StepPlacement), Error>;
 /// moved would go on running under the context it captured. Being polled is the only moment
 /// anything can tell where the call now stands.
 ///
-/// **A workflow body may `join!` these; it may not `select!` over them, and may not wrap one in
-/// `tokio::time::timeout`.** The ids are not the problem — those were taken where each call was
+/// **A workflow body may `join!` these; it may not race them, consume them in completion order, or
+/// wrap one in a timeout, on any runtime** (`tokio::select!`, `smol::future::race`,
+/// `FuturesUnordered`, `tokio::time::timeout`; see
+/// [determinism in workflows](crate#determinism-in-workflows) for the rest).
+/// The ids are not the problem — those were taken where each call was
 /// written, and a replay rebuilds the same ones in the same order, which is the whole point of
 /// this type. The problem is that a race **decides** something and nothing records what it
 /// decided, so a replay that races again may see the other branch answer first and take a path the
 /// first execution never took. A `timeout` is that same race against a clock, and the clock is not
-/// replayed either. An all-wait decides nothing, which is why `join!` needs no help.
+/// replayed either. An all-wait decides nothing, which is why `join!` needs no help. A `try_join!`
+/// is an all-wait only until something fails: [determinism in
+/// workflows](crate#determinism-in-workflows) says when one is safe.
 ///
 /// Inside a workflow body, reach for these instead: race durable calls with
 /// [`select_step!`](crate::select_step), which records which branch won and replays only that one;
@@ -140,12 +146,23 @@ pub(crate) type Built<C> = Result<(C, StepPlacement), Error>;
 /// one, and a whole workflow's is [`StartOptions::timeout`](crate::StartOptions::timeout); and put
 /// any other race **inside a step**, whose checkpoint stands for however its body reached the
 /// answer. That last is the general rule and the reason the others are narrow: the restriction is
-/// on racing *in a workflow body*, not on racing. In a step body, or outside a workflow, the whole
-/// of tokio is available.
+/// on racing *in a workflow body*, not on racing. In a step body, or outside a workflow, everything
+/// the runtime offers is available.
 ///
 /// **`Unpin`, which is contract rather than accident**: the run is already boxed, so a combinator
 /// holding one of these as a branch can do so by `Pin::new(&mut _)` rather than pinning it a
 /// second time.
+///
+/// ```no_run
+/// # async fn one() -> dbos::Result<u32> { Ok(1) }
+/// # async fn two() -> dbos::Result<u32> { Ok(2) }
+/// async fn workflow(_: ()) -> dbos::Result<u32> {
+///     // Each call takes its step ID as it is built, so these two get the same IDs on a replay,
+///     // and `join!` then runs them concurrently.
+///     let (a, b) = tokio::join!(dbos::step("one", one), dbos::step("two", two));
+///     Ok(a? + b?)
+/// }
+/// ```
 #[must_use = "a durable call that is not awaited never runs, and if it claimed a step id that id \
               is spent; await it, or hand it to a combinator"]
 pub struct PendingStep<'a, T, E = crate::EngineOnly> {

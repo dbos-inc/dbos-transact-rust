@@ -190,10 +190,12 @@ enum Repr {
 }
 
 impl JoinError {
+    /// Whether the task was aborted, or dropped by its runtime, before it finished.
     pub fn is_cancelled(&self) -> bool {
         matches!(self.0, Repr::Cancelled)
     }
 
+    /// Whether the task panicked.
     pub fn is_panic(&self) -> bool {
         matches!(self.0, Repr::Panic(_))
     }

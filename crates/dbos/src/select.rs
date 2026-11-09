@@ -6,8 +6,10 @@
 //! reason this module exists where a `tokio::join!` over [steps](crate::step()) needs nothing: an
 //! all-wait decides nothing, so there is nothing for a replay to get differently.
 //!
-//! **A plain `tokio::select!` over steps is the trap this replaces.** Since a step takes its id
-//! when it is built rather than at its first poll, the ids under a `select!` are already
+//! **A plain race over steps is the trap this replaces**, whichever runtime's it is
+//! (`tokio::select!`, `smol::future::race`; see
+//! [determinism in workflows](crate#determinism-in-workflows) for the rest). Since a step takes its
+//! id when it is built rather than at its first poll, the ids under a race are already
 //! deterministic — so it *looks* fixed. It is still not durable: nothing records which branch won,
 //! and nothing stops the replay choosing again. The failure is silent, which is why the macro over
 //! this refuses to be spelled like tokio's.

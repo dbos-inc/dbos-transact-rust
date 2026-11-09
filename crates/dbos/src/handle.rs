@@ -26,6 +26,16 @@ use crate::sysdb::types::{Outcome, StepRecord, StepTiming, Timestamp, WorkflowSt
 /// [`result`](Self::result): a result can be taken once, which the signature says rather than a
 /// runtime error.
 /// Dropping a handle does not stop the workflow — it only stops watching.
+///
+/// ```no_run
+/// # async fn f(workflow: dbos::WorkflowRef<u32, u32>) -> dbos::Result<()> {
+/// let handle = workflow.start(1).await?;
+/// println!("Started {}", handle.workflow_id());
+/// let result = handle.result().await?;
+/// # let _ = result;
+/// # Ok(())
+/// # }
+/// ```
 pub struct WorkflowHandle<R, E = crate::EngineOnly> {
     conn: Arc<Connection>,
     workflow_id: String,

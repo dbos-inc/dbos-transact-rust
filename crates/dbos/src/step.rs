@@ -242,8 +242,9 @@ impl<E> StepOptions<E> {
 /// code. A race decides something — which branch won — and that decision has to survive to the
 /// replay like any other, or the replay is free to decide it the other way and continue from a
 /// branch this execution abandoned. So what a workflow body has no use for is the *unrecorded*
-/// race: a bare `tokio::select!` over durable calls, and `tokio::time::timeout`, which is that
-/// same race against a clock no replay reproduces.
+/// race: a bare race over durable calls, such as `tokio::select!` or `smol::future::race`, and a
+/// timeout such as `tokio::time::timeout`, which is that same race against a clock no replay
+/// reproduces. See [determinism in workflows](crate#determinism-in-workflows) for every form.
 ///
 /// Recorded races are the supported ones. [`select_step!`](crate::select_step) is the general one:
 /// it checkpoints *which branch* won, and a replay polls that branch alone.

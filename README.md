@@ -2,7 +2,7 @@
 
 # DBOS Transact: Lightweight Durable Workflows
 
-#### [Documentation](https://docs.dbos.dev/) &nbsp;&nbsp;•&nbsp;&nbsp;  [Examples](https://docs.dbos.dev/examples) &nbsp;&nbsp;•&nbsp;&nbsp; [Github](https://github.com/dbos-inc) &nbsp;&nbsp;•&nbsp;&nbsp; [Discord](https://discord.com/invite/jsmC6pXGgX)
+#### [Documentation](https://docs.dbos.dev/rust/programming-guide) &nbsp;&nbsp;•&nbsp;&nbsp; [API reference](https://docs.rs/dbos) &nbsp;&nbsp;•&nbsp;&nbsp;  [Examples](https://docs.dbos.dev/examples) &nbsp;&nbsp;•&nbsp;&nbsp; [Github](https://github.com/dbos-inc) &nbsp;&nbsp;•&nbsp;&nbsp; [Discord](https://discord.com/invite/jsmC6pXGgX)
 </div>
 
 ---
@@ -21,6 +21,14 @@ Rather than bolting on ad-hoc retry logic and database checkpoints, DBOS workflo
 This library contains all you need to add durable workflows to your program: there's no separate service or orchestrator or any external dependencies except Postgres.
 Because it's just a library, you can incrementally add it to your projects.
 And because it's built on Postgres, it natively supports all the tooling you're familiar with (backups, GUIs, CLI tools) and works with any Postgres provider.
+
+## Writing workflows
+
+A workflow body must be deterministic: a recovery runs it again and replays what each durable call
+recorded, so it has to reach the same calls in the same order. Non-deterministic values belong in
+steps, and plain races, timeouts, spawns and completion-order streams over durable calls aren't
+supported in a workflow body. The crate docs list [what isn't supported and what to use
+instead](https://docs.rs/dbos/latest/dbos/#determinism-in-workflows), on every runtime.
 
 ## Try the starter app
 

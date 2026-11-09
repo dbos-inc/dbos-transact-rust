@@ -429,10 +429,10 @@ pub enum Error<E = EngineOnly> {
     /// - **Built in the workflow proper, carried into a step body.** Its checkpoint would sit
     ///   beneath a step whose own row already stands for whatever its body did.
     /// - **Polled where there is no context at all**, which in practice means
-    ///   `tokio::spawn(step(..))`. A spawned task inherits no workflow, so the step would run
-    ///   undurably wherever it was built — and a step built in the workflow proper has already
-    ///   spent an id that nothing will ever record against. Await the step in the workflow, or
-    ///   spawn work that is not a step.
+    ///   `tokio::spawn(step(..))` or `smol::spawn(step(..))`. A spawned task inherits no workflow,
+    ///   so the step would run undurably wherever it was built — and a step built in the workflow
+    ///   proper has already spent an id that nothing will ever record against. Await the step in
+    ///   the workflow, or spawn work that is not a step.
     ///
     /// `built` and `polled` name the two places, so a refusal reads "built inside a step of
     /// workflow w but polled in workflow w" rather than naming the same place twice.
