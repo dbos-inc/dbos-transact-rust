@@ -234,7 +234,13 @@ fn post_release(root: &Path, released: &str, mode: Mode) -> Result<()> {
     let next = format!("{major}.{}.0-dev", minor + 1);
     println!("Moving main from {released} to {next}");
     cargo_release(root, &["version", &next], mode)?;
-    cargo_release(root, &["commit"], mode)?;
+    if mode.executes() {
+        cargo_release(root, &["commit"], mode)?;
+    } else {
+        // A dry run of `version` leaves the manifests alone, so there is nothing for `commit` to
+        // commit, and cargo-release fails rather than reporting what it would do.
+        println!("would run: cargo release commit  (Version {next})");
+    }
     git(root, &["push", "origin", "main"], mode)
 }
 
