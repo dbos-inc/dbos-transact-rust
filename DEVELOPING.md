@@ -226,8 +226,16 @@ The tag starts the [`Release` workflow](.github/workflows/release.yml), which pu
 3. Publishes `dbos-macros`, waits for it to reach the index, then publishes `dbos`.
 4. Drafts a GitHub release for the tag.
 
-Watch it in the Actions tab. If it fails before the publish step, nothing was uploaded: fix the
-problem on `main`, and release again with the next version.
+Watch it in the Actions tab. If it fails, what to do depends on where:
+
+- **Before the publish step**, nothing was uploaded. If the cause is outside the code, such as
+  Trusted Publishing not yet set up or a crates.io outage, fix that and use "Re-run failed jobs".
+  If the code needs a change, the version is spent, because its tag and commit are already pushed:
+  fix it on `main`, cherry-pick it onto the release branch and cut a [patch](#patch-releases)
+  (for an `rc`, cut the next `rc` from `main`).
+- **Between the two crates**, `dbos-macros` is on crates.io and `dbos` isn't. Re-running would try
+  to publish `dbos-macros` again, which crates.io refuses, so publish `dbos` by hand from the tag
+  instead, as in [Publishing from CI](#publishing-from-ci), and then draft the GitHub release.
 
 The xtask drives cargo-release's per-step subcommands — `version`, `commit`, `tag` — rather than
 the all-in-one `cargo release <level>`, and the reason is step 1. cargo-release checks dependency
@@ -363,6 +371,7 @@ published. To publish by hand instead, from the tagged commit:
 ```bash
 git checkout v0.5.0
 cargo publish -p dbos-macros -p dbos   # needs `cargo login` as an owner of both crates
+cargo publish -p dbos                  # if dbos-macros is already up
 ```
 
 ### After a release
