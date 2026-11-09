@@ -257,7 +257,9 @@ fn push_release(root: &Path, branch: &str, tag: &str, mode: Mode) -> Result<()> 
             "--atomic",
             "origin",
             &format!("HEAD:refs/heads/{branch}"),
-            tag,
+            // Spelled out, so a local branch that happens to share the tag's name can't make the
+            // refspec ambiguous.
+            &format!("refs/tags/{tag}"),
         ],
         mode,
     )

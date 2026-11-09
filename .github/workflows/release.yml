@@ -3,19 +3,17 @@ name: Release
 # Publishes `dbos-macros` and `dbos` to crates.io when `cargo xtask` pushes a `v*` tag. The xtask
 # bumps, commits, tags and pushes; this workflow does the one step that can't be undone, after the
 # tag and its commit are already on GitHub. See "Creating a release" in DEVELOPING.md.
+#
+# No `RUSTFLAGS: -D warnings` here, unlike CI: the pull requests that reached the tagged commit
+# already passed that gate, and a lint new to today's toolchain must not fail a release whose tag
+# and commit are already pushed. No concurrency group either: releases of different tags don't
+# interfere, and a group would cancel a queued release when a third tag arrives.
 on:
   push:
     tags: ["v*"]
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: -D warnings
-
-# One release at a time, and never cancelled part-way: a publish that stopped between the two
-# crates would leave `dbos-macros` on the index without the `dbos` that pins it.
-concurrency:
-  group: release
-  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -29,8 +27,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          # Whole history, so the branch check below can see where the tagged commit is.
+          # Whole history and every branch, so the branch check below can see where the tagged
+          # commit is.
           fetch-depth: 0
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - id: version
         name: The tag names the version in the manifests
@@ -62,11 +62,14 @@ jobs:
     name: Documentation as docs.rs will build it
     runs-on: ubuntu-latest
     # On the latest nightly rather than CI's dated one, because that is what docs.rs builds the
-    # published crate with. A failure here stops the release before anything is uploaded.
+    # published crate with. Without `-D warnings`, as docs.rs builds: this is here to catch a build
+    # docs.rs would fail, such as a change to the unstable `doc_cfg`, not a new lint.
     env:
-      RUSTDOCFLAGS: --cfg docsrs -D warnings
+      RUSTDOCFLAGS: --cfg docsrs
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@nightly
       - run: cargo +nightly doc --no-deps -p dbos -p dbos-macros --all-features
 
@@ -74,30 +77,47 @@ jobs:
     name: Publish to crates.io
     needs: [verify, docs-rs]
     runs-on: ubuntu-latest
+    # The environment is what limits publishing to release tags. crates.io's trusted publisher for
+    # each crate names it, and its deployment policy admits only `v*` tags, which only admins can
+    # push. Without it, a run of an edited copy of this file on any branch could publish.
+    environment: crates-io
     permissions:
       # crates.io Trusted Publishing exchanges this workflow's OIDC token for a short-lived
       # publish token, so no crates.io token is stored anywhere.
       id-token: write
-      # To draft the GitHub release.
-      contents: write
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
+      - name: Package and verify both crates
+        # Verifying builds the crates, which runs their dependencies' build scripts and proc
+        # macros, so it runs before the publish token exists. One command, so `dbos` is verified
+        # against the `dbos-macros` just packaged rather than looked for on the index.
+        run: cargo publish --dry-run -p dbos-macros -p dbos
       - uses: rust-lang/crates-io-auth-action@v1
         id: auth
       - name: Publish dbos-macros, then dbos
-        # One command, so cargo publishes in dependency order and waits for `dbos-macros` to reach
-        # the index before verifying `dbos`, whose `=` pin requires it.
-        run: cargo publish -p dbos-macros -p dbos
+        # Verified above. One command, so cargo publishes in dependency order and waits for
+        # `dbos-macros` to reach the index before uploading `dbos`, whose `=` pin requires it.
+        run: cargo publish --no-verify -p dbos-macros -p dbos
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-      - name: Draft the GitHub release
-        # A draft, because the release notes are written by hand. Publish it once they're in.
-        run: |
+
+  github-release:
+    name: Draft the GitHub release
+    needs: [verify, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      # A draft, because the release notes are written by hand. Publish it once they're in.
+      # `--verify-tag`: the tag already exists, and this must not try to create one.
+      - run: |
           prerelease=""
           case "$VERSION" in *-*) prerelease="--prerelease" ;; esac
-          gh release create "$GITHUB_REF_NAME" --draft --verify-tag $prerelease \
-            --title "$VERSION" --notes "Release notes to follow."
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft --verify-tag \
+            $prerelease --title "$VERSION" --notes "Release notes to follow."
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.verify.outputs.version }}
