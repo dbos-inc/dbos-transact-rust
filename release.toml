@@ -8,7 +8,7 @@
 # Only `dbos-macros` and `dbos` are published, in that order: `dbos` requires `=<version>` of
 # the macros, which must already be on the index. The `Release` workflow
 # (`.github/workflows/release.yml`) publishes them when the tag is pushed; nothing here does.
-# `test-support` and the demo apps are `publish = false` and only have their version moved.
+# `test-support`, `test-macros` and `xtask` are `publish = false`; only their version moves.
 
 # Every member inherits `workspace.package.version`, and the `dbos-macros = "=..."` requirement
 # in `[workspace.dependencies]` is rewritten alongside it.
