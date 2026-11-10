@@ -19,8 +19,9 @@ members = [
 [workspace.package]
 # `main` always carries the *next* release with a `-dev` suffix, so a git dependency on `main`
 # reads as unreleased and a stray `cargo publish` from here would fail the `=` pin below rather
-# than ship a release-numbered build. `cargo release` (see `release.toml`) strips the suffix,
-# tags, publishes, and re-appends it — never edit these by hand for a release.
+# than ship a release-numbered build. `cargo xtask` (see DEVELOPING.md) strips the suffix and
+# tags, the Release workflow publishes, and the xtask re-appends it — never edit these by hand for
+# a release.
 version = "0.6.0-dev"
 edition = "2024"
 # Latest stable minus two, rolling. Stable was 1.99.0 on 2026-09-28. Bump this when
