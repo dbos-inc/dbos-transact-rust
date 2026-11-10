@@ -1,0 +1,135 @@
+name: Release
+
+# Publishes `dbos-macros` and `dbos` to crates.io when `cargo xtask` pushes a `v*` tag. The xtask
+# bumps, commits, tags and pushes; this workflow does the one step that can't be undone, after the
+# tag and its commit are already on GitHub. See "Creating a release" in DEVELOPING.md.
+#
+# No `RUSTFLAGS: -D warnings` here, unlike CI: the pull requests that reached the tagged commit
+# already passed that gate, and a lint new to today's toolchain must not fail a release whose tag
+# and commit are already pushed. No concurrency group either: releases of different tags don't
+# interfere, and a group would cancel a queued release when a third tag arrives.
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify the tag
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Whole history and every branch, so the branch check below can see where the tagged
+          # commit is.
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - id: version
+        name: The tag names the version in the manifests
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          version="$(cargo pkgid -p dbos | sed 's/.*[#@]//')"
+          if [ "$tag" != "v$version" ]; then
+            echo "::error::tag $tag doesn't match the manifests' version $version"
+            exit 1
+          fi
+          case "$version" in
+            *-dev*) echo "::error::$version is a -dev version, which is never published"; exit 1 ;;
+          esac
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: The tagged commit is on main or a release branch
+        # Both are protected, so a tag elsewhere would publish code nobody reviewed.
+        run: |
+          for branch in $(git for-each-ref --format='%(refname:strip=3)' \
+              'refs/remotes/origin/main' 'refs/remotes/origin/release/v*'); do
+            if git merge-base --is-ancestor "$GITHUB_SHA" "origin/$branch"; then
+              echo "$GITHUB_REF_NAME is on $branch"
+              exit 0
+            fi
+          done
+          echo "::error::$GITHUB_REF_NAME ($GITHUB_SHA) is on neither main nor a release/v* branch"
+          exit 1
+
+  docs-rs:
+    name: Documentation as docs.rs will build it
+    runs-on: ubuntu-latest
+    # On the latest nightly rather than CI's dated one, because that is what docs.rs builds the
+    # published crate with. Without `-D warnings`, as docs.rs builds: this is here to catch a build
+    # docs.rs would fail, such as a change to the unstable `doc_cfg`, not a new lint.
+    env:
+      RUSTDOCFLAGS: --cfg docsrs
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: cargo +nightly doc --no-deps -p dbos -p dbos-macros --all-features
+
+  package:
+    name: Package and verify both crates
+    runs-on: ubuntu-latest
+    # Verifying builds the crates, which runs their dependencies' build scripts and proc macros. So
+    # it runs here, in a job that can't request an OIDC token, rather than in the publish job, where
+    # any step could request one and trade it for a crates.io publish token.
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      # One command, so `dbos` is verified against the `dbos-macros` just packaged rather than
+      # looked for on the index.
+      - run: cargo publish --dry-run -p dbos-macros -p dbos
+
+  publish:
+    name: Publish to crates.io
+    needs: [verify, docs-rs, package]
+    runs-on: ubuntu-latest
+    # The environment is what limits publishing to release tags. crates.io's trusted publisher for
+    # each crate names it, and its deployment policy admits only `v*` tags, which only admins can
+    # push. Without it, a run of an edited copy of this file on any branch could publish.
+    environment: crates-io
+    permissions:
+      # crates.io Trusted Publishing exchanges this workflow's OIDC token for a short-lived
+      # publish token, so no crates.io token is stored anywhere. Every step of this job can request
+      # that token, so nothing here compiles: the crates were verified in `package`, and
+      # `--no-verify` below only packages their sources.
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+      - name: Publish dbos-macros, then dbos
+        # Verified in `package`. One command, so cargo publishes in dependency order and waits for
+        # `dbos-macros` to reach the index before uploading `dbos`, whose `=` pin requires it.
+        run: cargo publish --no-verify -p dbos-macros -p dbos
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+  github-release:
+    name: Draft the GitHub release
+    needs: [verify, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      # A draft, because the release notes are written by hand. Publish it once they're in.
+      # `--verify-tag`: the tag already exists, and this must not try to create one.
+      - run: |
+          prerelease=""
+          case "$VERSION" in *-*) prerelease="--prerelease" ;; esac
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft --verify-tag \
+            $prerelease --title "$VERSION" --notes "Release notes to follow."
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.verify.outputs.version }}
