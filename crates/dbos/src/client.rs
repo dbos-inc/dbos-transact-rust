@@ -315,7 +315,15 @@ impl ClientConfig {
 /// # }
 /// ```
 #[derive(Clone, Debug)]
-pub struct Client(Arc<Connection>);
+pub struct Client(Arc<Connection>, Closes);
+
+/// Whether closing a [`Client`] closes its connection. Not when the connection is a running
+/// executor's, which only the executor's shutdown may close.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Closes {
+    Connection,
+    Nothing,
+}
 
 impl Client {
     /// Connects to the system database.
@@ -330,7 +338,10 @@ impl Client {
     /// rewrite the schema it is inspecting is a tool that can break the application it was pointed
     /// at.
     pub async fn connect(config: ClientConfig) -> Result<Self> {
-        Ok(Self(Arc::new(Connection::for_client(&config).await?)))
+        Ok(Self(
+            Arc::new(Connection::for_client(&config).await?),
+            Closes::Connection,
+        ))
     }
 
     /// Closes the connection.
@@ -345,6 +356,10 @@ impl Client {
     /// pool's connections are closed, and the listener has *ended* rather than merely been told to,
     /// so afterwards nothing of this client is still running.
     pub async fn close(&self) {
+        if self.1 == Closes::Nothing {
+            tracing::debug!("not closing a client that shares a running executor's connection");
+            return;
+        }
         self.0.close().await;
         tracing::info!(
             app_name = self.0.app_name().unwrap_or("<none>"),
@@ -463,9 +478,10 @@ impl Client {
         &self.0
     }
 
-    /// A client over a connection someone else owns, which it must therefore never close.
+    /// A client over a running executor's connection, whose [`close`](Self::close) therefore
+    /// closes nothing.
     pub(crate) fn sharing(conn: Arc<Connection>) -> Self {
-        Self(conn)
+        Self(conn, Closes::Nothing)
     }
 }
 

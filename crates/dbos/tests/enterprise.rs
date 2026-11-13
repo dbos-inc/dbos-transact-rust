@@ -43,7 +43,11 @@ impl Seen {
     }
 }
 
-struct FakeEnterprise(Arc<Seen>);
+struct FakeEnterprise {
+    seen: Arc<Seen>,
+    /// Never finishes stopping, like a client stuck on an unreachable Conductor.
+    hangs_on_stop: bool,
+}
 
 impl EnterpriseProvider for FakeEnterprise {
     fn conductor(
@@ -51,13 +55,14 @@ impl EnterpriseProvider for FakeEnterprise {
         engine: ConductorEngine,
         options: ConductorOptions,
     ) -> dbos::Result<Box<dyn ConductorConnection>> {
-        self.0.record("build");
-        *self.0.options.lock().unwrap() = Some(options);
+        self.seen.record("build");
+        *self.seen.options.lock().unwrap() = Some(options);
         let engine = Arc::new(engine);
-        *self.0.engine.lock().unwrap() = Some(Arc::clone(&engine));
+        *self.seen.engine.lock().unwrap() = Some(Arc::clone(&engine));
         Ok(Box::new(FakeConductor {
-            seen: Arc::clone(&self.0),
+            seen: Arc::clone(&self.seen),
             engine,
+            hangs_on_stop: self.hangs_on_stop,
         }))
     }
 }
@@ -65,6 +70,7 @@ impl EnterpriseProvider for FakeEnterprise {
 struct FakeConductor {
     seen: Arc<Seen>,
     engine: Arc<ConductorEngine>,
+    hangs_on_stop: bool,
 }
 
 #[async_trait]
@@ -74,6 +80,9 @@ impl ConductorConnection for FakeConductor {
     }
 
     async fn stop(&mut self) {
+        if self.hangs_on_stop {
+            std::future::pending::<()>().await;
+        }
         // A read through the engine is what a real client does until it is stopped, so the system
         // database has to still be open here.
         let open = self.engine.sysdb().get_workflow("anything").await.is_ok();
@@ -90,10 +99,17 @@ fn config(app_name: &str, db: &TestDatabase) -> Config {
 }
 
 fn with_conductor(config: Config, seen: &Arc<Seen>) -> Config {
+    with_fake(config, seen, false)
+}
+
+fn with_fake(config: Config, seen: &Arc<Seen>, hangs_on_stop: bool) -> Config {
     Config {
         conductor_key: Some("conductor-key".to_owned()),
         conductor_url: Some("wss://conductor.invalid/conductor/v1alpha1".to_owned()),
-        enterprise: Some(Enterprise::new(FakeEnterprise(Arc::clone(seen)))),
+        enterprise: Some(Enterprise::new(FakeEnterprise {
+            seen: Arc::clone(seen),
+            hangs_on_stop,
+        })),
         ..config
     }
 }
@@ -131,6 +147,9 @@ async fn the_conductor_client_lives_inside_the_executor_s_lifetime() {
     assert_eq!(engine.app_name(), "enterprise-lifecycle-app");
     assert_eq!(engine.app_version(), APP_VERSION);
     assert_eq!(engine.dbos_version(), env!("CARGO_PKG_VERSION"));
+
+    // Shares the executor's pool, so closing it must leave the pool open: `stop` below reads.
+    engine.client().close().await;
 
     dbos.shutdown().await;
     assert_eq!(
@@ -208,4 +227,24 @@ async fn the_engine_recovers_the_executors_conductor_names() {
     assert_eq!(entered.load(Ordering::SeqCst), 2);
 
     survivor.shutdown().await;
+}
+
+/// A client that never finishes stopping is abandoned, and shutdown still closes the database.
+#[dbos_test_support::test]
+async fn a_conductor_client_stuck_stopping_does_not_hold_shutdown() {
+    let db = test_database().await;
+    let seen = Arc::new(Seen::default());
+    let dbos = DBOS::new(with_fake(config("enterprise-stuck-app", &db), &seen, true));
+    dbos.launch().await.expect("launch failed");
+
+    dbos::__rt::timeout(DEADLINE, dbos.shutdown())
+        .await
+        .expect("shutdown waited on the Conductor client");
+    assert!(!dbos.is_launched());
+    // A relaunch takes the lifecycle lock, which a stuck shutdown would still hold.
+    dbos::__rt::timeout(DEADLINE, dbos.launch())
+        .await
+        .expect("relaunch waited on the previous shutdown")
+        .expect("relaunch failed");
+    dbos.shutdown().await;
 }

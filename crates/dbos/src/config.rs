@@ -204,12 +204,6 @@ impl std::fmt::Debug for Config {
             conductor_metadata_only_mode,
             enterprise,
         } = self;
-        // Says whether the key is there, which is what someone reading a log needs, and nothing
-        // more.
-        let redacted = |value: Option<&str>| match value {
-            Some(v) if !v.is_empty() => "<redacted>",
-            _ => "<unset>",
-        };
         f.debug_struct("Config")
             .field("app_name", app_name)
             .field("database_url", &crate::sysdb::masked_url(database_url))
@@ -226,7 +220,10 @@ impl std::fmt::Debug for Config {
             .field("notification_coalesce", notification_coalesce)
             .field("idle_transaction_timeout", idle_transaction_timeout)
             .field("scheduler_polling_interval", scheduler_polling_interval)
-            .field("conductor_key", &redacted(conductor_key.as_deref()))
+            .field(
+                "conductor_key",
+                &crate::identity::redacted(conductor_key.as_deref()),
+            )
             .field("conductor_url", conductor_url)
             .field("conductor_executor_metadata", conductor_executor_metadata)
             .field("conductor_metadata_only_mode", conductor_metadata_only_mode)

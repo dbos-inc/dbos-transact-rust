@@ -79,15 +79,6 @@ impl Executor {
             self_recovery,
             discarded_executor_id,
         } = crate::identity::resolve(config, &Environment::read())?;
-        if let Some(discarded) = discarded_executor_id {
-            tracing::warn!(
-                configured_executor_id = discarded,
-                executor_id,
-                "a Conductor key is set, so this executor runs under a fresh id rather than the \
-                 one configured: Conductor has to tell one process from the next"
-            );
-        }
-
         // Before connecting, so that a missing enterprise crate is reported without a round trip.
         let conductor = crate::enterprise::conductor_plan(config, conductor)?;
 
@@ -121,6 +112,15 @@ impl Executor {
             }
         };
 
+        // Only once launch can no longer fail, so that it never names an id nothing ran under.
+        if let Some(discarded) = discarded_executor_id {
+            tracing::warn!(
+                configured_executor_id = discarded,
+                executor_id,
+                "a Conductor key is set, so this executor runs under a fresh id rather than the \
+                 one configured: Conductor has to tell one process from the next"
+            );
+        }
         tracing::info!(app_name, executor_id, app_version, "DBOS launched");
 
         let executor = Self {
@@ -385,12 +385,25 @@ impl Executor {
     pub(crate) async fn close(&self) {
         self.monitor_tasks.abort_all().await;
         let conductor = self.conductor().take();
-        if let Some(mut conductor) = conductor {
-            conductor.stop().await;
+        if let Some(mut conductor) = conductor
+            && crate::rt::timeout(CONDUCTOR_STOP_TIMEOUT, conductor.stop())
+                .await
+                .is_err()
+        {
+            // Dropped rather than waited for, so that shutdown still closes the database and
+            // releases the lifecycle lock. Its tasks see the pool close.
+            tracing::warn!(
+                timeout = ?CONDUCTOR_STOP_TIMEOUT,
+                "the Conductor client did not stop in time and was abandoned"
+            );
         }
         self.conn.close().await;
     }
 }
+
+/// How long shutdown waits for the Conductor client to stop: long enough for a websocket close
+/// handshake, short enough that an unreachable Conductor does not hold shutdown.
+const CONDUCTOR_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How often a draining shutdown says which workflows it is still waiting for.
 const DRAIN_REPORT_INTERVAL: Duration = Duration::from_secs(1);

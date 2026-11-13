@@ -20,6 +20,11 @@ pub(crate) fn masked_url(raw: &str) -> String {
     let Ok(mut url) = url::Url::parse(raw) else {
         return redacted();
     };
+    // `postgres:user:secret@host/db`, missing its `//`, parses with the whole thing as an opaque
+    // path, where no password is found to mask.
+    if url.cannot_be_a_base() {
+        return redacted();
+    }
     if url.password().is_some() && url.set_password(Some(MASK)).is_err() {
         return redacted();
     }
@@ -48,6 +53,14 @@ pub(crate) fn masked_url(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_url_missing_its_slashes_is_redacted_whole() {
+        assert_eq!(
+            masked_url("postgresql:dbos:s3cret@db.example/app"),
+            "<redacted>"
+        );
+    }
 
     #[test]
     fn the_password_in_the_user_info_is_masked_and_the_rest_is_kept() {

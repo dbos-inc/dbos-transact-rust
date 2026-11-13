@@ -82,7 +82,7 @@ pub(crate) fn hosted_conductor_url(domain: &str) -> String {
 /// environment is global mutable state, and `std::env::set_var` is `unsafe` — which this crate
 /// forbids — so a test that could only reach the rule through the real environment could not
 /// exercise it at all.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Default, Clone, PartialEq, Eq)]
 pub(crate) struct Environment {
     /// `DBOS__CLOUD`, which decides who wins every question below.
     pub cloud: bool,
@@ -103,6 +103,34 @@ pub(crate) struct Environment {
     pub conductor_url: Option<String>,
     /// `DBOS_DOMAIN`, the hosted Conductor's domain.
     pub dbos_domain: Option<String>,
+}
+
+impl std::fmt::Debug for Environment {
+    /// Hand-written so that DBOS Cloud's Conductor key is never printed.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            cloud,
+            app_id,
+            app_name,
+            app_version,
+            executor_id,
+            conductor_app_name,
+            conductor_key,
+            conductor_url,
+            dbos_domain,
+        } = self;
+        f.debug_struct("Environment")
+            .field("cloud", cloud)
+            .field("app_id", app_id)
+            .field("app_name", app_name)
+            .field("app_version", app_version)
+            .field("executor_id", executor_id)
+            .field("conductor_app_name", conductor_app_name)
+            .field("conductor_key", &redacted(conductor_key.as_deref()))
+            .field("conductor_url", conductor_url)
+            .field("dbos_domain", dbos_domain)
+            .finish()
+    }
 }
 
 impl Environment {
@@ -164,16 +192,32 @@ pub(crate) struct ConductorTarget {
 impl std::fmt::Debug for ConductorTarget {
     /// Hand-written so that the key is never printed.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self { url, key, app_name } = self;
         f.debug_struct("ConductorTarget")
-            .field("url", &self.url)
-            .field("app_name", &self.app_name)
-            .finish_non_exhaustive()
+            .field("url", url)
+            .field("key", &redacted(Some(key)))
+            .field("app_name", app_name)
+            .finish()
     }
 }
 
-/// A configured string, unless it is empty or only whitespace, which configures nothing.
-fn given(value: Option<&str>) -> Option<&str> {
-    value.filter(|v| !v.trim().is_empty())
+/// A configured string without its surrounding whitespace, unless nothing is left, which
+/// configures nothing.
+///
+/// Trimmed because these values come from environment variables and secret files, where a
+/// trailing newline is easy to pick up and, in a key, fails authentication with no hint why.
+pub(crate) fn given(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|v| !v.is_empty())
+}
+
+/// How a `Debug` impl prints a secret: whether it is set, by the rule [`given`] applies, and
+/// nothing more.
+pub(crate) fn redacted(secret: Option<&str>) -> &'static str {
+    if given(secret).is_some() {
+        "<redacted>"
+    } else {
+        "<unset>"
+    }
 }
 
 /// Reconciles what the application was configured with against what the deployment says.
@@ -596,6 +640,32 @@ mod tests {
             assert_eq!(resolved.executor_id, "env-executor");
             assert!(!resolved.self_recovery, "DBOS Cloud never self-recovers");
         }
+    }
+
+    #[test]
+    fn a_conductor_key_and_url_lose_their_surrounding_whitespace() {
+        let config = Config {
+            conductor_key: Some("config-key\n".to_owned()),
+            conductor_url: Some(" wss://conductor.example/conductor/v1alpha1 ".to_owned()),
+            ..config()
+        };
+        let target = resolve(&config, &deployed()).unwrap().conductor.unwrap();
+        assert_eq!(target.key, "config-key");
+        assert_eq!(target.url, "wss://conductor.example/conductor/v1alpha1");
+    }
+
+    #[test]
+    fn the_environment_never_prints_the_cloud_conductor_key() {
+        let printed = format!("{:?}", cloud_with_conductor());
+        assert!(!printed.contains("cloud-key"), "{printed}");
+        assert!(printed.contains("<redacted>"), "{printed}");
+    }
+
+    #[test]
+    fn a_blank_secret_prints_as_unset() {
+        assert_eq!(redacted(Some(" \n")), "<unset>");
+        assert_eq!(redacted(None), "<unset>");
+        assert_eq!(redacted(Some("key")), "<redacted>");
     }
 
     #[test]

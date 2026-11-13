@@ -141,14 +141,14 @@ impl std::fmt::Debug for ConductorOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let Self {
             url,
-            key: _,
+            key,
             app_name,
             executor_metadata,
             metadata_only_mode,
         } = self;
         f.debug_struct("ConductorOptions")
             .field("url", url)
-            .field("key", &"<redacted>")
+            .field("key", &crate::identity::redacted(Some(key)))
             .field("app_name", app_name)
             .field("executor_metadata", executor_metadata)
             .field("metadata_only_mode", metadata_only_mode)
@@ -185,8 +185,8 @@ impl ConductorEngine {
     /// A client over this executor's own connection, for the management operations Conductor
     /// asks for.
     ///
-    /// **Never close it.** It shares the executor's pool, so [`Client::close`] would close the
-    /// system database under the running application.
+    /// It shares the executor's pool, so its [`Client::close`] does nothing: the pool closes when
+    /// the executor shuts down.
     pub fn client(&self) -> Client {
         Client::sharing(Arc::clone(&self.conn))
     }
