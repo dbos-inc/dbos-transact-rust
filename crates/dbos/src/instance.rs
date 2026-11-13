@@ -71,7 +71,18 @@ impl Executor {
             app_version,
             executor_id,
             app_id,
+            conductor: _,
+            self_recovery,
+            discarded_executor_id,
         } = crate::identity::resolve(config, &Environment::read())?;
+        if let Some(discarded) = discarded_executor_id {
+            tracing::warn!(
+                configured_executor_id = discarded,
+                executor_id,
+                "a Conductor key is set, so this executor runs under a fresh id rather than the \
+                 one configured: Conductor has to tell one process from the next"
+            );
+        }
 
         let conn = Connection::for_application(config, &executor_id, &app_name).await?;
 
@@ -80,7 +91,8 @@ impl Executor {
         // notifier, and the listener's only way out of its loop is the pool closing — so a handle
         // dropped without `close` leaves both tasks and every connection alive for the life of the
         // process, with each retried `launch` adding another set.
-        let recovered = match prepare(conn.sysdb(), &executor_id, &app_version).await {
+        let recovered = match prepare(conn.sysdb(), &executor_id, &app_version, self_recovery).await
+        {
             Ok(recovered) => recovered,
             Err(error) => {
                 conn.close().await;
@@ -714,12 +726,20 @@ impl std::fmt::Debug for DBOS {
 /// to close the system database on; see the comment at its call site. Everything between the
 /// connect and the executor being built belongs here for that reason, and anything added later
 /// belongs here too.
+///
+/// Recovers nothing when `self_recovery` is off: Conductor then decides which executors are gone
+/// and recovers their work, and a sweep here would race it.
 async fn prepare(
     sysdb: &dyn SystemDatabase,
     executor_id: &str,
     app_version: &str,
+    self_recovery: bool,
 ) -> Result<Vec<String>> {
     register_version(sysdb, app_version).await?;
+    if !self_recovery {
+        tracing::debug!("skipping launch recovery: Conductor recovers this executor's workflows");
+        return Ok(Vec::new());
+    }
     crate::recovery::reenqueue(sysdb, executor_id, app_version).await
 }
 

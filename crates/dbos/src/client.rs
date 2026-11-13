@@ -73,7 +73,7 @@ use crate::{Queue, QueueChange, QueueConflict, QueueOptions};
 /// dequeues nothing) and no `migrate` (it is a guest in the database). Four fields that must not be
 /// set is four fields that should not exist, and an application name that may be absent is a fifth
 /// difference in the opposite direction.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ClientConfig {
     /// The application this client acts for, or `None` to act for every application.
     ///
@@ -166,6 +166,36 @@ pub struct ClientConfig {
     ///
     /// Sixty seconds by default; see [`IdleTransactionTimeout`](crate::IdleTransactionTimeout).
     pub idle_transaction_timeout: crate::IdleTransactionTimeout,
+}
+
+/// Hand-written rather than derived, so that the database URL's passwords are never printed.
+impl std::fmt::Debug for ClientConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            app_name,
+            database_url,
+            max_connections,
+            schema,
+            serializer,
+            use_listen_notify,
+            polling_concurrency,
+            outcome_poll_interval,
+            notification_coalesce,
+            idle_transaction_timeout,
+        } = self;
+        f.debug_struct("ClientConfig")
+            .field("app_name", app_name)
+            .field("database_url", &crate::sysdb::masked_url(database_url))
+            .field("max_connections", max_connections)
+            .field("schema", schema)
+            .field("serializer", serializer)
+            .field("use_listen_notify", use_listen_notify)
+            .field("polling_concurrency", polling_concurrency)
+            .field("outcome_poll_interval", outcome_poll_interval)
+            .field("notification_coalesce", notification_coalesce)
+            .field("idle_transaction_timeout", idle_transaction_timeout)
+            .finish()
+    }
 }
 
 impl ClientConfig {
@@ -437,6 +467,19 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_masks_the_database_password() {
+        let printed = format!(
+            "{:?}",
+            ClientConfig::new("postgres://dbos:s3cret@db.example/app")
+        );
+        assert!(!printed.contains("s3cret"), "{printed}");
+        assert!(
+            printed.contains("postgres://dbos:***@db.example/app"),
+            "{printed}"
+        );
+    }
 
     #[test]
     fn a_bare_configuration_speaks_for_no_application() {
