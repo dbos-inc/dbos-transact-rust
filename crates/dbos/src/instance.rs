@@ -740,7 +740,7 @@ async fn prepare(
         tracing::debug!("skipping launch recovery: Conductor recovers this executor's workflows");
         return Ok(Vec::new());
     }
-    crate::recovery::reenqueue(sysdb, executor_id, app_version).await
+    crate::recovery::reenqueue(sysdb, &[executor_id], app_version).await
 }
 
 /// Registers this version and warns if it is not the one a rolling deploy would prefer.

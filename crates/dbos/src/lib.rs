@@ -295,6 +295,8 @@ mod dequeue;
 #[cfg(feature = "engine")]
 mod enqueue;
 #[cfg(feature = "engine")]
+mod enterprise;
+#[cfg(feature = "engine")]
 mod error;
 #[cfg(feature = "engine")]
 mod event;
@@ -354,6 +356,8 @@ pub use context::{StepStatus, cancellation_token, step_id, step_status, workflow
 pub use debouncer::{DebounceOptions, Debouncer, DebouncerClient};
 #[cfg(feature = "engine")]
 pub use enqueue::EnqueueOptions;
+#[cfg(feature = "engine")]
+pub use enterprise::Enterprise;
 #[cfg(feature = "engine")]
 pub use error::{DurableError, EngineOnly, Error, Result};
 #[cfg(feature = "engine")]
@@ -596,4 +600,20 @@ pub mod __private {
     };
     // Not for a macro: the one knob tests need that applications shouldn't have.
     pub use crate::timeout_sweep::set_interval as set_workflow_timeout_sweep_interval;
+}
+
+/// The contract between `dbos` and the closed-source enterprise crate, which pins this crate's
+/// exact version.
+///
+/// **No semver promise**: anything here may change in any release, patch releases included.
+/// Applications never need it; they register the enterprise crate on
+/// [`Config::enterprise`](crate::Config::enterprise) and nothing more.
+#[cfg(feature = "engine")]
+#[doc(hidden)]
+pub mod __enterprise {
+    pub use crate::enterprise::{
+        ConductorConnection, ConductorEngine, ConductorOptions, EnterpriseProvider,
+    };
+    // The trait's `async fn` is declared through this macro, so an implementation needs it too.
+    pub use async_trait::async_trait;
 }

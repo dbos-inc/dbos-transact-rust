@@ -462,6 +462,11 @@ impl Client {
     pub(crate) fn connection(&self) -> &Arc<Connection> {
         &self.0
     }
+
+    /// A client over a connection someone else owns, which it must therefore never close.
+    pub(crate) fn sharing(conn: Arc<Connection>) -> Self {
+        Self(conn)
+    }
 }
 
 #[cfg(test)]

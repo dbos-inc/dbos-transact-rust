@@ -168,6 +168,14 @@ pub struct Config {
     /// Whether Conductor is sent only workflow metadata, never workflow data: no inputs, outputs,
     /// events, messages or stream values, and error kinds without their messages.
     pub conductor_metadata_only_mode: bool,
+
+    /// The enterprise crate, registered here so that launch can use its features.
+    ///
+    /// `dbos` cannot depend on that crate, so the application depends on both and passes this
+    /// along: `enterprise: Some(dbos_enterprise::enterprise())`. Launch fails, naming the crate to
+    /// add, when something that needs it is configured and nothing is registered here. For now that
+    /// is Conductor: a [`conductor_key`](Self::conductor_key), or DBOS Cloud's Conductor variables.
+    pub enterprise: Option<crate::Enterprise>,
 }
 
 /// Hand-written rather than derived, so that neither the database URL's passwords nor the Conductor
@@ -194,6 +202,7 @@ impl std::fmt::Debug for Config {
             conductor_url,
             conductor_executor_metadata,
             conductor_metadata_only_mode,
+            enterprise,
         } = self;
         // Says whether the key is there, which is what someone reading a log needs, and nothing
         // more.
@@ -221,6 +230,7 @@ impl std::fmt::Debug for Config {
             .field("conductor_url", conductor_url)
             .field("conductor_executor_metadata", conductor_executor_metadata)
             .field("conductor_metadata_only_mode", conductor_metadata_only_mode)
+            .field("enterprise", enterprise)
             .finish()
     }
 }
@@ -252,6 +262,7 @@ impl Config {
             conductor_url: None,
             conductor_executor_metadata: None,
             conductor_metadata_only_mode: false,
+            enterprise: None,
         }
     }
 
