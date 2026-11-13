@@ -25,7 +25,6 @@
 
 use std::sync::Arc;
 
-use crate::client::Client;
 use crate::config::Config;
 use crate::connection::Connection;
 use crate::identity::ConductorTarget;
@@ -182,16 +181,7 @@ impl ConductorEngine {
         }
     }
 
-    /// A client over this executor's own connection, for the management operations Conductor
-    /// asks for.
-    ///
-    /// It shares the executor's pool, so its [`Client::close`] does nothing: the pool closes when
-    /// the executor shuts down.
-    pub fn client(&self) -> Client {
-        Client::sharing(Arc::clone(&self.conn))
-    }
-
-    /// The system database, for the reads and writes no public operation covers.
+    /// The system database this executor runs against, which the client reads and writes through.
     pub fn sysdb(&self) -> &dyn SystemDatabase {
         self.conn.sysdb()
     }

@@ -148,9 +148,6 @@ async fn the_conductor_client_lives_inside_the_executor_s_lifetime() {
     assert_eq!(engine.app_version(), APP_VERSION);
     assert_eq!(engine.dbos_version(), env!("CARGO_PKG_VERSION"));
 
-    // Shares the executor's pool, so closing it must leave the pool open: `stop` below reads.
-    engine.client().close().await;
-
     dbos.shutdown().await;
     assert_eq!(
         seen.events(),
