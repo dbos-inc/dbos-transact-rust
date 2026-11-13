@@ -25,10 +25,15 @@
 
 use std::sync::Arc;
 
-use crate::Result;
 use crate::client::Client;
+use crate::config::Config;
 use crate::connection::Connection;
+use crate::identity::ConductorTarget;
 use crate::sysdb::SystemDatabase;
+use crate::{Error, Result};
+
+/// The crate an application adds for the enterprise features, as a launch error names it.
+const ENTERPRISE_CRATE: &str = "dbos-enterprise";
 
 /// An enterprise crate, registered on [`Config::enterprise`](crate::Config::enterprise).
 ///
@@ -55,7 +60,6 @@ impl Enterprise {
     }
 
     /// What the registered crate provides.
-    #[allow(dead_code)] // Launch calls it, in the change that wires the contract in.
     pub(crate) fn provider(&self) -> &dyn EnterpriseProvider {
         &*self.0
     }
@@ -164,7 +168,6 @@ pub struct ConductorEngine {
 }
 
 impl ConductorEngine {
-    #[allow(dead_code)] // Launch builds one, in the change that wires the contract in.
     pub(crate) fn new(
         conn: &Arc<Connection>,
         executor_id: &str,
@@ -233,6 +236,37 @@ impl std::fmt::Debug for ConductorEngine {
     }
 }
 
+/// What launch connects to Conductor with, given where identity resolution said to connect.
+///
+/// Fails when Conductor is configured and no enterprise crate is registered, naming the crate and
+/// the line that registers it. Launch calls this before connecting to the system database, so a
+/// missing registration costs nothing to find out.
+pub(crate) fn conductor_plan(
+    config: &Config,
+    target: Option<ConductorTarget>,
+) -> Result<Option<(Enterprise, ConductorOptions)>> {
+    let Some(ConductorTarget { url, key, app_name }) = target else {
+        return Ok(None);
+    };
+    let Some(enterprise) = &config.enterprise else {
+        return Err(Error::Config(format!(
+            "connecting to DBOS Conductor needs the {ENTERPRISE_CRATE} crate: add it to \
+             Cargo.toml and register it with `enterprise: Some({}::enterprise())` in the Config",
+            ENTERPRISE_CRATE.replace('-', "_"),
+        )));
+    };
+    Ok(Some((
+        enterprise.clone(),
+        ConductorOptions {
+            url,
+            key,
+            app_name,
+            executor_metadata: config.conductor_executor_metadata.clone(),
+            metadata_only_mode: config.conductor_metadata_only_mode,
+        },
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -254,6 +288,53 @@ mod tests {
         let registered = Enterprise::new(Nothing);
         assert_eq!(registered, registered.clone());
         assert_ne!(registered, Enterprise::new(Nothing));
+    }
+
+    fn target() -> ConductorTarget {
+        ConductorTarget {
+            url: "wss://conductor.example/conductor/v1alpha1".to_owned(),
+            key: "key".to_owned(),
+            app_name: "app".to_owned(),
+        }
+    }
+
+    #[test]
+    fn without_conductor_nothing_is_needed() {
+        let config = Config::new("app", "postgres://localhost/app");
+        assert!(conductor_plan(&config, None).unwrap().is_none());
+    }
+
+    #[test]
+    fn conductor_without_a_registration_names_the_crate_and_the_line() {
+        let config = Config::new("app", "postgres://localhost/app");
+        let err = conductor_plan(&config, Some(target())).unwrap_err();
+        assert!(matches!(err, Error::Config(_)), "{err}");
+        let message = err.to_string();
+        assert!(message.contains("the dbos-enterprise crate"), "{message}");
+        assert!(
+            message.contains("enterprise: Some(dbos_enterprise::enterprise())"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn conductor_with_a_registration_carries_the_target_and_the_config() {
+        let mut metadata = serde_json::Map::new();
+        metadata.insert("region".to_owned(), "eu".into());
+        let enterprise = Enterprise::new(Nothing);
+        let config = Config {
+            enterprise: Some(enterprise.clone()),
+            conductor_executor_metadata: Some(metadata.clone()),
+            conductor_metadata_only_mode: true,
+            ..Config::new("app", "postgres://localhost/app")
+        };
+        let (registered, options) = conductor_plan(&config, Some(target())).unwrap().unwrap();
+        assert_eq!(registered, enterprise);
+        assert_eq!(options.url, "wss://conductor.example/conductor/v1alpha1");
+        assert_eq!(options.key, "key");
+        assert_eq!(options.app_name, "app");
+        assert_eq!(options.executor_metadata, Some(metadata));
+        assert!(options.metadata_only_mode);
     }
 
     #[test]
