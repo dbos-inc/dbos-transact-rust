@@ -7,6 +7,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
 use crate::connection::Connection;
+use crate::enterprise::{ConductorConnection, ConductorEngine};
 use crate::identity::{Environment, Identity};
 use crate::registry::{Registry, Snapshot};
 use crate::serialization::Serializer;
@@ -40,6 +41,9 @@ pub struct Executor {
     monitor_tasks: Tasks,
     /// Cancelled when shutdown begins, which is what the producers' loops watch to stop.
     stopping: CancellationToken,
+    /// The Conductor client, if configured: built by [`start`](Self::start), stopped by
+    /// [`close`](Self::close).
+    conductor: std::sync::Mutex<Option<Box<dyn ConductorConnection>>>,
 }
 
 impl Executor {
@@ -71,27 +75,54 @@ impl Executor {
             app_version,
             executor_id,
             app_id,
+            conductor_target,
+            self_recovery,
+            discarded_executor_id,
         } = crate::identity::resolve(config, &Environment::read())?;
+        // Before connecting, so a missing enterprise crate fails fast.
+        let conductor = crate::enterprise::resolve_conductor(config, conductor_target)?;
 
-        let conn = Connection::for_application(config, &executor_id, &app_name).await?;
+        let conn = Arc::new(Connection::for_application(config, &executor_id, &app_name).await?);
 
-        // Everything that can fail after the connect goes through one call, so there is one error
-        // path and it closes the handle. `connect` has already spawned the listener and the
+        // Everything that can fail after the connect goes through this one block, so there is one
+        // error path and it closes the handle. `connect` has already spawned the listener and the
         // notifier, and the listener's only way out of its loop is the pool closing — so a handle
         // dropped without `close` leaves both tasks and every connection alive for the life of the
         // process, with each retried `launch` adding another set.
-        let recovered = match prepare(conn.sysdb(), &executor_id, &app_version).await {
-            Ok(recovered) => recovered,
+        // The Conductor client is built last, so no failure here leaves one to stop.
+        let prepared = async {
+            let recovered =
+                prepare(conn.sysdb(), &executor_id, &app_version, self_recovery).await?;
+            let conductor = match conductor {
+                Some((enterprise, options)) => Some(enterprise.provider().conductor(
+                    ConductorEngine::new(&conn, &executor_id, &app_name, &app_version),
+                    options,
+                )?),
+                None => None,
+            };
+            Ok::<_, Error>((recovered, conductor))
+        };
+        let (recovered, conductor) = match prepared.await {
+            Ok(prepared) => prepared,
             Err(error) => {
                 conn.close().await;
                 return Err(error);
             }
         };
 
+        // Only once launch can't fail, so it never names an id nothing ran under.
+        if let Some(discarded) = discarded_executor_id {
+            tracing::warn!(
+                configured_executor_id = discarded,
+                executor_id,
+                "a Conductor key is set, so this executor runs under a fresh id rather than the \
+                 one configured: Conductor has to tell one process from the next"
+            );
+        }
         tracing::info!(app_name, executor_id, app_version, "DBOS launched");
 
         let executor = Self {
-            conn: Arc::new(conn),
+            conn,
             executor_id,
             app_version,
             app_id,
@@ -105,8 +136,24 @@ impl Executor {
             workflow_tasks: Tasks::default(),
             monitor_tasks: Tasks::default(),
             stopping: CancellationToken::new(),
+            conductor: std::sync::Mutex::new(conductor),
         };
         Ok((executor, recovered))
+    }
+
+    /// Starts the Conductor client, if any. Launch's last step, so Conductor meets an executor
+    /// already polling its queues.
+    fn start_conductor(&self) {
+        if let Some(conductor) = self.conductor().as_mut() {
+            conductor.start();
+        }
+    }
+
+    fn conductor(&self) -> std::sync::MutexGuard<'_, Option<Box<dyn ConductorConnection>>> {
+        // The value is one `Option`, so poisoning can't leave it torn.
+        self.conductor
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// The connection this executor talks through, which is all a caller needs to read or write a
@@ -322,21 +369,35 @@ impl Executor {
         }
     }
 
-    /// Stops the background monitors and closes the system database. Called after
-    /// [`stop`](Self::stop), once no workflow is running.
+    /// Stops the background monitors and the Conductor client, then closes the system database.
+    /// Called after [`stop`](Self::stop), once no workflow is running.
     ///
     /// **The monitors outlive the drain** because a workflow still running may be waiting on the
     /// timeout sweep to record that its deadline has passed. **The system database closes last**,
     /// so everything before it could still checkpoint.
     ///
-    /// A Conductor connection, once there is one, is closed between the two: after the drain, so
-    /// the executor stays visibly alive to Conductor for as long as it is running workflows, and
-    /// before the pool, which it reads through.
+    /// The Conductor client stops between the two: after the drain, so Conductor sees the executor
+    /// alive while it runs workflows, and before the pool it reads through.
     pub(crate) async fn close(&self) {
         self.monitor_tasks.abort_all().await;
+        let conductor = self.conductor().take();
+        if let Some(mut conductor) = conductor
+            && crate::rt::timeout(CONDUCTOR_STOP_TIMEOUT, conductor.stop())
+                .await
+                .is_err()
+        {
+            // Abandoned, so shutdown still closes the database and releases the lifecycle lock.
+            tracing::warn!(
+                timeout = ?CONDUCTOR_STOP_TIMEOUT,
+                "the Conductor client did not stop in time and was abandoned"
+            );
+        }
         self.conn.close().await;
     }
 }
+
+/// How long shutdown waits for the Conductor client to stop.
+const CONDUCTOR_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How often a draining shutdown says which workflows it is still waiting for.
 const DRAIN_REPORT_INTERVAL: Duration = Duration::from_secs(1);
@@ -472,6 +533,10 @@ impl DBOS {
     /// Connects to the system database, migrates it, registers this application version, and starts
     /// the executor.
     ///
+    /// With Conductor configured, by [`Config::conductor_key`] or on DBOS Cloud, launch also starts
+    /// the Conductor client from [`Config::enterprise`], failing with [`Error::Config`] if none is
+    /// registered.
+    ///
     /// **Idempotent**: launching an already-launched instance warns and returns. It is not an error
     /// because the common cause is two entry points both being defensive, and failing there would
     /// punish the caller who did nothing wrong.
@@ -525,7 +590,9 @@ impl DBOS {
         // Every executor sweeps every deadline of its application, so a workflow nobody is running
         // still times out.
         crate::timeout_sweep::spawn(Arc::clone(&executor));
-        crate::dequeue::spawn(executor);
+        crate::dequeue::spawn(Arc::clone(&executor));
+        // Last, so Conductor meets a fully running executor.
+        executor.start_conductor();
         Ok(())
     }
 
@@ -562,7 +629,8 @@ impl DBOS {
     ///    left `PENDING`, so it is recovered from its last checkpoint rather than marked failed.
     /// 4. The workflow-timeout sweep stops, after the wait, since a workflow still running may be
     ///    waiting on it.
-    /// 5. The system database closes last, so a workflow finishing during the wait can still
+    /// 5. The Conductor client stops, if there is one.
+    /// 6. The system database closes last, so a workflow finishing during the wait can still
     ///    checkpoint.
     ///
     /// The instance stays launched until step 3 is over, so a workflow finishing during the wait
@@ -710,17 +778,20 @@ impl std::fmt::Debug for DBOS {
 
 /// Registers this version and returns what a previous run of this executor abandoned to its queue.
 ///
-/// One function rather than two calls inline so that [`Executor::start`] has a single error path
-/// to close the system database on; see the comment at its call site. Everything between the
-/// connect and the executor being built belongs here for that reason, and anything added later
-/// belongs here too.
+/// Runs inside [`Executor::start`]'s single error path, which closes the system database on
+/// failure. Recovers nothing when `self_recovery` is off, leaving that to Conductor.
 async fn prepare(
     sysdb: &dyn SystemDatabase,
     executor_id: &str,
     app_version: &str,
+    self_recovery: bool,
 ) -> Result<Vec<String>> {
     register_version(sysdb, app_version).await?;
-    crate::recovery::reenqueue(sysdb, executor_id, app_version).await
+    if !self_recovery {
+        tracing::debug!("skipping launch recovery: Conductor recovers this executor's workflows");
+        return Ok(Vec::new());
+    }
+    crate::recovery::reenqueue(sysdb, &[executor_id], app_version).await
 }
 
 /// Registers this version and warns if it is not the one a rolling deploy would prefer.
@@ -816,6 +887,20 @@ mod tests {
         });
         let err = dbos.launch().await.unwrap_err();
         assert!(matches!(err, Error::Config(_)), "{err}");
+        assert!(!dbos.is_launched());
+    }
+
+    /// The database URL reaches nothing, so getting the configuration error rather than a
+    /// connection error shows the check runs first.
+    #[tokio::test]
+    async fn a_conductor_key_without_the_enterprise_crate_is_refused_before_connecting() {
+        let dbos = DBOS::new(Config {
+            conductor_key: Some("key".to_owned()),
+            ..config()
+        });
+        let err = dbos.launch().await.unwrap_err();
+        assert!(matches!(err, Error::Config(_)), "{err}");
+        assert!(err.to_string().contains("dbos-enterprise"), "{err}");
         assert!(!dbos.is_launched());
     }
 

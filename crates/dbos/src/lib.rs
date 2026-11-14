@@ -295,6 +295,8 @@ mod dequeue;
 #[cfg(feature = "engine")]
 mod enqueue;
 #[cfg(feature = "engine")]
+mod enterprise;
+#[cfg(feature = "engine")]
 mod error;
 #[cfg(feature = "engine")]
 mod event;
@@ -354,6 +356,8 @@ pub use context::{StepStatus, cancellation_token, step_id, step_status, workflow
 pub use debouncer::{DebounceOptions, Debouncer, DebouncerClient};
 #[cfg(feature = "engine")]
 pub use enqueue::EnqueueOptions;
+#[cfg(feature = "engine")]
+pub use enterprise::Enterprise;
 #[cfg(feature = "engine")]
 pub use error::{DurableError, EngineOnly, Error, Result};
 #[cfg(feature = "engine")]
@@ -596,4 +600,16 @@ pub mod __private {
     };
     // Not for a macro: the one knob tests need that applications shouldn't have.
     pub use crate::timeout_sweep::set_interval as set_workflow_timeout_sweep_interval;
+}
+
+/// The contract the enterprise crate implements. No semver promise: that crate pins this one's
+/// exact version.
+#[cfg(feature = "engine")]
+#[doc(hidden)]
+pub mod __enterprise {
+    pub use crate::enterprise::{
+        ConductorConnection, ConductorEngine, ConductorOptions, EnterpriseProvider,
+    };
+    // `ConductorConnection` is declared with this macro, so implementations need it too.
+    pub use async_trait::async_trait;
 }

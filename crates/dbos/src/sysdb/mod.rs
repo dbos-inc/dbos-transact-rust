@@ -64,6 +64,7 @@ pub fn is_stream_closed(value: &str, serialization: Option<&str>) -> bool {
 pub const PARTITIONED_DEQUEUE_SWEEP_CAP: u32 = 8192;
 
 pub mod error;
+mod masked_url;
 pub mod migrations;
 pub(crate) mod notify;
 pub mod postgres;
@@ -75,6 +76,7 @@ use async_trait::async_trait;
 // Re-exported: `sysdb::Error` is how the rest of the crate and its callers name it, and moving
 // the definition to a file should not move the path.
 pub use error::{BackendError, BackendErrorKind, Error};
+pub(crate) use masked_url::masked_url;
 
 use std::time::Duration;
 

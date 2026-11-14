@@ -53,13 +53,34 @@ pub const EXECUTOR_ID_ENV: &str = "DBOS__VMID";
 /// The executor id for a process nothing named, shared with the other SDKs.
 const DEFAULT_EXECUTOR_ID: &str = "local";
 
+/// Names the application to Conductor on DBOS Cloud, which uses Conductor only when this and the
+/// two variables below are all set.
+const CLOUD_CONDUCTOR_APP_NAME_ENV: &str = "DBOS__CONDUCTOR_APP_NAME";
+
+/// Environment variable carrying the Conductor key on DBOS Cloud.
+const CLOUD_CONDUCTOR_KEY_ENV: &str = "DBOS__CONDUCTOR_KEY";
+
+/// Environment variable carrying the Conductor URL on DBOS Cloud.
+const CLOUD_CONDUCTOR_URL_ENV: &str = "DBOS__CONDUCTOR_URL";
+
+/// The hosted Conductor's domain.
+const DBOS_DOMAIN_ENV: &str = "DBOS_DOMAIN";
+
+/// The domain of DBOS's hosted Conductor when [`DBOS_DOMAIN_ENV`] names none.
+const DEFAULT_DBOS_DOMAIN: &str = "cloud.dbos.dev";
+
+/// The hosted Conductor's websocket URL on `domain`.
+pub(crate) fn hosted_conductor_url(domain: &str) -> String {
+    format!("wss://{domain}/conductor/v1alpha1")
+}
+
 /// What the environment says about this process.
 ///
 /// Taken as a snapshot so that [`resolve`] is a pure function of a `Config` and this: the process
 /// environment is global mutable state, and `std::env::set_var` is `unsafe` — which this crate
 /// forbids — so a test that could only reach the rule through the real environment could not
 /// exercise it at all.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Default, Clone, PartialEq, Eq)]
 pub(crate) struct Environment {
     /// `DBOS__CLOUD`, which decides who wins every question below.
     pub cloud: bool,
@@ -71,6 +92,43 @@ pub(crate) struct Environment {
     pub app_version: Option<String>,
     /// `DBOS__VMID`, a deployment's way of naming the VM this process runs on.
     pub executor_id: Option<String>,
+    /// `DBOS__CONDUCTOR_APP_NAME`, the name DBOS Cloud registers the application under in
+    /// Conductor.
+    pub conductor_app_name: Option<String>,
+    /// `DBOS__CONDUCTOR_KEY`.
+    pub conductor_key: Option<String>,
+    /// `DBOS__CONDUCTOR_URL`.
+    pub conductor_url: Option<String>,
+    /// `DBOS_DOMAIN`, the hosted Conductor's domain.
+    pub dbos_domain: Option<String>,
+}
+
+impl std::fmt::Debug for Environment {
+    /// Hand-written so that DBOS Cloud's Conductor key is never printed.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            cloud,
+            app_id,
+            app_name,
+            app_version,
+            executor_id,
+            conductor_app_name,
+            conductor_key,
+            conductor_url,
+            dbos_domain,
+        } = self;
+        f.debug_struct("Environment")
+            .field("cloud", cloud)
+            .field("app_id", app_id)
+            .field("app_name", app_name)
+            .field("app_version", app_version)
+            .field("executor_id", executor_id)
+            .field("conductor_app_name", conductor_app_name)
+            .field("conductor_key", &redacted(conductor_key.as_deref()))
+            .field("conductor_url", conductor_url)
+            .field("dbos_domain", dbos_domain)
+            .finish()
+    }
 }
 
 impl Environment {
@@ -86,6 +144,10 @@ impl Environment {
             app_name: var(CLOUD_APP_NAME_ENV),
             app_version: var(APP_VERSION_ENV),
             executor_id: var(EXECUTOR_ID_ENV),
+            conductor_app_name: var(CLOUD_CONDUCTOR_APP_NAME_ENV),
+            conductor_key: var(CLOUD_CONDUCTOR_KEY_ENV),
+            conductor_url: var(CLOUD_CONDUCTOR_URL_ENV),
+            dbos_domain: var(DBOS_DOMAIN_ENV),
         }
     }
 }
@@ -98,6 +160,51 @@ pub(crate) struct Identity {
     pub app_version: String,
     pub executor_id: String,
     pub app_id: String,
+    /// The Conductor this executor connects to, or `None` to connect to none.
+    pub conductor_target: Option<ConductorTarget>,
+    /// Whether launch recovers this executor's own abandoned workflows. Not on DBOS Cloud or with
+    /// a Conductor key, where Conductor recovers the executors it sees go.
+    pub self_recovery: bool,
+    /// A configured executor id replaced because a Conductor key is set, for launch to warn about.
+    pub discarded_executor_id: Option<String>,
+}
+
+/// Where and as whom an executor connects to DBOS Conductor.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct ConductorTarget {
+    /// The websocket URL.
+    pub url: String,
+    /// The Conductor key, a credential.
+    pub key: String,
+    /// The name Conductor addresses the application by.
+    pub app_name: String,
+}
+
+impl std::fmt::Debug for ConductorTarget {
+    /// Hand-written so that the key is never printed.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self { url, key, app_name } = self;
+        f.debug_struct("ConductorTarget")
+            .field("url", url)
+            .field("key", &redacted(Some(key)))
+            .field("app_name", app_name)
+            .finish()
+    }
+}
+
+/// `value` trimmed, or `None` if that leaves nothing. Trimmed because a key read from a secret file
+/// often ends in a newline.
+pub(crate) fn non_blank(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|v| !v.is_empty())
+}
+
+/// How a `Debug` impl prints a secret: `<redacted>` if set, `<unset>` if not.
+pub(crate) fn redacted(secret: Option<&str>) -> &'static str {
+    if non_blank(secret).is_some() {
+        "<redacted>"
+    } else {
+        "<unset>"
+    }
 }
 
 /// Reconciles what the application was configured with against what the deployment says.
@@ -142,11 +249,56 @@ pub(crate) fn resolve(config: &Config, env: &Environment) -> Result<Identity> {
         )));
     };
 
+    // On DBOS Cloud, Conductor is used only when all three of its variables are set. Off it, only
+    // the configuration's key and URL count.
+    let conductor_key = non_blank(config.conductor_key.as_deref());
+    let conductor_target = if env.cloud {
+        match (
+            non_blank(env.conductor_app_name.as_deref()),
+            non_blank(env.conductor_key.as_deref()),
+            non_blank(env.conductor_url.as_deref()),
+        ) {
+            (Some(app_name), Some(key), Some(url)) => Some(ConductorTarget {
+                url: url.to_owned(),
+                key: key.to_owned(),
+                app_name: app_name.to_owned(),
+            }),
+            _ => None,
+        }
+    } else {
+        conductor_key.map(|key| ConductorTarget {
+            url: non_blank(config.conductor_url.as_deref()).map_or_else(
+                || {
+                    hosted_conductor_url(
+                        non_blank(env.dbos_domain.as_deref()).unwrap_or(DEFAULT_DBOS_DOMAIN),
+                    )
+                },
+                str::to_owned,
+            ),
+            key: key.to_owned(),
+            app_name: app_name.clone(),
+        })
+    };
+
+    // Off DBOS Cloud, a Conductor key means a fresh id per launch, so Conductor never takes a new
+    // process for an old one. On DBOS Cloud the id is the VM's, as Conductor expects.
+    let (executor_id, discarded_executor_id) = if !env.cloud && conductor_key.is_some() {
+        (uuid::Uuid::new_v4().to_string(), executor_id)
+    } else {
+        (
+            executor_id.unwrap_or_else(|| DEFAULT_EXECUTOR_ID.to_owned()),
+            None,
+        )
+    };
+
     Ok(Identity {
         app_name,
         app_version,
-        executor_id: executor_id.unwrap_or_else(|| DEFAULT_EXECUTOR_ID.to_owned()),
+        executor_id,
         app_id: env.app_id.clone(),
+        conductor_target,
+        self_recovery: !(env.cloud || conductor_key.is_some()),
+        discarded_executor_id,
     })
 }
 
@@ -209,6 +361,25 @@ mod tests {
             app_name: Some("env-app".to_owned()),
             app_version: Some("env-v9".to_owned()),
             executor_id: Some("env-executor".to_owned()),
+            ..Environment::default()
+        }
+    }
+
+    /// DBOS Cloud, with all three of its Conductor variables set.
+    fn cloud_with_conductor() -> Environment {
+        Environment {
+            cloud: true,
+            conductor_app_name: Some("cloud-conductor-app".to_owned()),
+            conductor_key: Some("cloud-key".to_owned()),
+            conductor_url: Some("wss://conductor.example/v1alpha1".to_owned()),
+            ..deployed()
+        }
+    }
+
+    fn with_key(config: Config) -> Config {
+        Config {
+            conductor_key: Some("config-key".to_owned()),
+            ..config
         }
     }
 
@@ -309,5 +480,189 @@ mod tests {
         };
         let err = resolve(&config(), &env).unwrap_err();
         assert!(err.to_string().contains("Not A Name"), "{err}");
+    }
+
+    #[test]
+    fn without_a_conductor_key_nothing_connects_and_launch_recovers() {
+        let config = Config {
+            // A URL alone configures nothing: the key is what connects.
+            conductor_url: Some("wss://conductor.example/v1alpha1".to_owned()),
+            ..config()
+        };
+        let resolved = resolve(&config, &deployed()).unwrap();
+        assert_eq!(resolved.conductor_target, None);
+        assert!(resolved.self_recovery);
+        assert_eq!(resolved.executor_id, "config-executor");
+        assert_eq!(resolved.discarded_executor_id, None);
+    }
+
+    #[test]
+    fn a_conductor_key_connects_to_the_hosted_conductor_under_the_application_name() {
+        let resolved = resolve(&with_key(config()), &deployed()).unwrap();
+        let conductor = resolved.conductor_target.expect("a key connects");
+        assert_eq!(conductor.url, "wss://cloud.dbos.dev/conductor/v1alpha1");
+        assert_eq!(conductor.key, "config-key");
+        assert_eq!(conductor.app_name, "config-app");
+        assert!(!resolved.self_recovery, "Conductor drives recovery");
+    }
+
+    #[test]
+    fn dbos_domain_moves_the_hosted_conductor_and_a_configured_url_replaces_it() {
+        let env = Environment {
+            dbos_domain: Some("staging.dbos.dev".to_owned()),
+            ..deployed()
+        };
+        let resolved = resolve(&with_key(config()), &env).unwrap();
+        assert_eq!(
+            resolved.conductor_target.unwrap().url,
+            "wss://staging.dbos.dev/conductor/v1alpha1"
+        );
+
+        let config = Config {
+            conductor_url: Some("ws://localhost:8090/".to_owned()),
+            ..with_key(config())
+        };
+        let resolved = resolve(&config, &env).unwrap();
+        assert_eq!(
+            resolved.conductor_target.unwrap().url,
+            "ws://localhost:8090/"
+        );
+    }
+
+    #[test]
+    fn a_conductor_key_replaces_the_executor_id_with_a_fresh_uuid_per_launch() {
+        let first = resolve(&with_key(config()), &deployed()).unwrap();
+        let second = resolve(&with_key(config()), &deployed()).unwrap();
+        for resolved in [&first, &second] {
+            uuid::Uuid::parse_str(&resolved.executor_id).expect("a UUID");
+            assert_eq!(
+                resolved.discarded_executor_id.as_deref(),
+                Some("config-executor"),
+                "the configured id is reported, so launch can warn"
+            );
+        }
+        assert_ne!(first.executor_id, second.executor_id);
+    }
+
+    #[test]
+    fn replacing_an_id_nobody_chose_reports_nothing() {
+        let config = Config {
+            executor_id: None,
+            ..with_key(config())
+        };
+        let env = Environment {
+            executor_id: None,
+            ..deployed()
+        };
+        let resolved = resolve(&config, &env).unwrap();
+        uuid::Uuid::parse_str(&resolved.executor_id).expect("a UUID");
+        assert_eq!(resolved.discarded_executor_id, None);
+
+        // `DBOS__VMID` off DBOS Cloud is a choice too, and is reported like the configuration's.
+        let config = Config {
+            executor_id: None,
+            ..with_key(Config::new("config-app", "postgres://x"))
+        };
+        let resolved = resolve(&config, &deployed()).unwrap();
+        assert_eq!(
+            resolved.discarded_executor_id.as_deref(),
+            Some("env-executor")
+        );
+    }
+
+    #[test]
+    fn a_blank_conductor_key_or_url_configures_nothing() {
+        let config = Config {
+            conductor_key: Some("  ".to_owned()),
+            ..config()
+        };
+        let resolved = resolve(&config, &deployed()).unwrap();
+        assert_eq!(resolved.conductor_target, None);
+        assert!(resolved.self_recovery);
+        assert_eq!(resolved.executor_id, "config-executor");
+
+        let config = Config {
+            conductor_url: Some(String::new()),
+            ..with_key(config)
+        };
+        let resolved = resolve(&config, &deployed()).unwrap();
+        assert_eq!(
+            resolved.conductor_target.unwrap().url,
+            "wss://cloud.dbos.dev/conductor/v1alpha1"
+        );
+    }
+
+    #[test]
+    fn dbos_cloud_connects_with_its_own_three_variables_and_keeps_the_vm_id() {
+        // The configuration's key is not consulted on DBOS Cloud.
+        let resolved = resolve(&with_key(config()), &cloud_with_conductor()).unwrap();
+        let conductor = resolved.conductor_target.expect("all three are set");
+        assert_eq!(conductor.url, "wss://conductor.example/v1alpha1");
+        assert_eq!(conductor.key, "cloud-key");
+        assert_eq!(conductor.app_name, "cloud-conductor-app");
+        assert_eq!(resolved.executor_id, "env-executor");
+        assert_eq!(resolved.discarded_executor_id, None);
+        assert!(!resolved.self_recovery);
+    }
+
+    #[test]
+    fn dbos_cloud_without_all_three_conductor_variables_connects_to_none() {
+        let partial = [
+            Environment {
+                conductor_url: None,
+                ..cloud_with_conductor()
+            },
+            Environment {
+                conductor_key: Some(" ".to_owned()),
+                ..cloud_with_conductor()
+            },
+            Environment {
+                cloud: true,
+                ..deployed()
+            },
+        ];
+        for env in partial {
+            let resolved = resolve(&with_key(config()), &env).unwrap();
+            assert_eq!(resolved.conductor_target, None, "{env:?}");
+            assert_eq!(resolved.executor_id, "env-executor");
+            assert!(!resolved.self_recovery, "DBOS Cloud never self-recovers");
+        }
+    }
+
+    #[test]
+    fn a_conductor_key_and_url_lose_their_surrounding_whitespace() {
+        let config = Config {
+            conductor_key: Some("config-key\n".to_owned()),
+            conductor_url: Some(" wss://conductor.example/conductor/v1alpha1 ".to_owned()),
+            ..config()
+        };
+        let target = resolve(&config, &deployed())
+            .unwrap()
+            .conductor_target
+            .unwrap();
+        assert_eq!(target.key, "config-key");
+        assert_eq!(target.url, "wss://conductor.example/conductor/v1alpha1");
+    }
+
+    #[test]
+    fn the_environment_never_prints_the_cloud_conductor_key() {
+        let printed = format!("{:?}", cloud_with_conductor());
+        assert!(!printed.contains("cloud-key"), "{printed}");
+        assert!(printed.contains("<redacted>"), "{printed}");
+    }
+
+    #[test]
+    fn a_blank_secret_prints_as_unset() {
+        assert_eq!(redacted(Some(" \n")), "<unset>");
+        assert_eq!(redacted(None), "<unset>");
+        assert_eq!(redacted(Some("key")), "<redacted>");
+    }
+
+    #[test]
+    fn a_conductor_target_never_prints_its_key() {
+        let resolved = resolve(&with_key(config()), &deployed()).unwrap();
+        let printed = format!("{resolved:?}");
+        assert!(!printed.contains("config-key"), "{printed}");
+        assert!(printed.contains("cloud.dbos.dev"), "{printed}");
     }
 }
