@@ -176,6 +176,10 @@ impl ConductorEngine {
 
     /// Re-enqueues the named executors' `PENDING` workflows on this application version, returning
     /// their ids. What Conductor's `recovery` message asks for.
+    ///
+    /// **Only for executors that are gone.** Each matching workflow loses its owner and goes back
+    /// to a queue, so naming a running executor, this one included, hands work it is still running
+    /// to another runner.
     pub async fn recover(&self, executor_ids: &[&str]) -> Result<Vec<String>> {
         crate::recovery::reenqueue(self.conn.sysdb(), executor_ids, &self.app_version).await
     }
