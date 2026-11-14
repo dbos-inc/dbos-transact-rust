@@ -161,7 +161,7 @@ pub(crate) struct Identity {
     pub executor_id: String,
     pub app_id: String,
     /// The Conductor this executor connects to, or `None` to connect to none.
-    pub conductor: Option<ConductorTarget>,
+    pub conductor_target: Option<ConductorTarget>,
     /// Whether launch recovers this executor's own abandoned workflows. Not on DBOS Cloud or with
     /// a Conductor key, where Conductor recovers the executors it sees go.
     pub self_recovery: bool,
@@ -252,7 +252,7 @@ pub(crate) fn resolve(config: &Config, env: &Environment) -> Result<Identity> {
     // On DBOS Cloud, Conductor is used only when all three of its variables are set. Off it, only
     // the configuration's key and URL count.
     let conductor_key = non_blank(config.conductor_key.as_deref());
-    let conductor = if env.cloud {
+    let conductor_target = if env.cloud {
         match (
             non_blank(env.conductor_app_name.as_deref()),
             non_blank(env.conductor_key.as_deref()),
@@ -296,7 +296,7 @@ pub(crate) fn resolve(config: &Config, env: &Environment) -> Result<Identity> {
         app_version,
         executor_id,
         app_id: env.app_id.clone(),
-        conductor,
+        conductor_target,
         self_recovery: !(env.cloud || conductor_key.is_some()),
         discarded_executor_id,
     })
@@ -490,7 +490,7 @@ mod tests {
             ..config()
         };
         let resolved = resolve(&config, &deployed()).unwrap();
-        assert_eq!(resolved.conductor, None);
+        assert_eq!(resolved.conductor_target, None);
         assert!(resolved.self_recovery);
         assert_eq!(resolved.executor_id, "config-executor");
         assert_eq!(resolved.discarded_executor_id, None);
@@ -499,7 +499,7 @@ mod tests {
     #[test]
     fn a_conductor_key_connects_to_the_hosted_conductor_under_the_application_name() {
         let resolved = resolve(&with_key(config()), &deployed()).unwrap();
-        let conductor = resolved.conductor.expect("a key connects");
+        let conductor = resolved.conductor_target.expect("a key connects");
         assert_eq!(conductor.url, "wss://cloud.dbos.dev/conductor/v1alpha1");
         assert_eq!(conductor.key, "config-key");
         assert_eq!(conductor.app_name, "config-app");
@@ -514,7 +514,7 @@ mod tests {
         };
         let resolved = resolve(&with_key(config()), &env).unwrap();
         assert_eq!(
-            resolved.conductor.unwrap().url,
+            resolved.conductor_target.unwrap().url,
             "wss://staging.dbos.dev/conductor/v1alpha1"
         );
 
@@ -523,7 +523,10 @@ mod tests {
             ..with_key(config())
         };
         let resolved = resolve(&config, &env).unwrap();
-        assert_eq!(resolved.conductor.unwrap().url, "ws://localhost:8090/");
+        assert_eq!(
+            resolved.conductor_target.unwrap().url,
+            "ws://localhost:8090/"
+        );
     }
 
     #[test]
@@ -574,7 +577,7 @@ mod tests {
             ..config()
         };
         let resolved = resolve(&config, &deployed()).unwrap();
-        assert_eq!(resolved.conductor, None);
+        assert_eq!(resolved.conductor_target, None);
         assert!(resolved.self_recovery);
         assert_eq!(resolved.executor_id, "config-executor");
 
@@ -584,7 +587,7 @@ mod tests {
         };
         let resolved = resolve(&config, &deployed()).unwrap();
         assert_eq!(
-            resolved.conductor.unwrap().url,
+            resolved.conductor_target.unwrap().url,
             "wss://cloud.dbos.dev/conductor/v1alpha1"
         );
     }
@@ -593,7 +596,7 @@ mod tests {
     fn dbos_cloud_connects_with_its_own_three_variables_and_keeps_the_vm_id() {
         // The configuration's key is not consulted on DBOS Cloud.
         let resolved = resolve(&with_key(config()), &cloud_with_conductor()).unwrap();
-        let conductor = resolved.conductor.expect("all three are set");
+        let conductor = resolved.conductor_target.expect("all three are set");
         assert_eq!(conductor.url, "wss://conductor.example/v1alpha1");
         assert_eq!(conductor.key, "cloud-key");
         assert_eq!(conductor.app_name, "cloud-conductor-app");
@@ -620,7 +623,7 @@ mod tests {
         ];
         for env in partial {
             let resolved = resolve(&with_key(config()), &env).unwrap();
-            assert_eq!(resolved.conductor, None, "{env:?}");
+            assert_eq!(resolved.conductor_target, None, "{env:?}");
             assert_eq!(resolved.executor_id, "env-executor");
             assert!(!resolved.self_recovery, "DBOS Cloud never self-recovers");
         }
@@ -633,7 +636,10 @@ mod tests {
             conductor_url: Some(" wss://conductor.example/conductor/v1alpha1 ".to_owned()),
             ..config()
         };
-        let target = resolve(&config, &deployed()).unwrap().conductor.unwrap();
+        let target = resolve(&config, &deployed())
+            .unwrap()
+            .conductor_target
+            .unwrap();
         assert_eq!(target.key, "config-key");
         assert_eq!(target.url, "wss://conductor.example/conductor/v1alpha1");
     }
