@@ -201,14 +201,14 @@ impl std::fmt::Debug for ConductorTarget {
 ///
 /// Trimmed because these values come from environment variables and secret files, where a
 /// trailing newline is easy to pick up and, in a key, fails authentication with no hint why.
-pub(crate) fn given(value: Option<&str>) -> Option<&str> {
+pub(crate) fn non_blank(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|v| !v.is_empty())
 }
 
-/// How a `Debug` impl prints a secret: whether it is set, by the rule [`given`] applies, and
+/// How a `Debug` impl prints a secret: whether it is set, by the rule [`non_blank`] applies, and
 /// nothing more.
 pub(crate) fn redacted(secret: Option<&str>) -> &'static str {
-    if given(secret).is_some() {
+    if non_blank(secret).is_some() {
         "<redacted>"
     } else {
         "<unset>"
@@ -260,12 +260,12 @@ pub(crate) fn resolve(config: &Config, env: &Environment) -> Result<Identity> {
     // On DBOS Cloud the deployment says whether there is a Conductor, through three variables that
     // mean nothing apart. Off it, a Conductor key is what connects, and the configuration's own
     // key and URL are the only ones read.
-    let conductor_key = given(config.conductor_key.as_deref());
+    let conductor_key = non_blank(config.conductor_key.as_deref());
     let conductor = if env.cloud {
         match (
-            given(env.conductor_app_name.as_deref()),
-            given(env.conductor_key.as_deref()),
-            given(env.conductor_url.as_deref()),
+            non_blank(env.conductor_app_name.as_deref()),
+            non_blank(env.conductor_key.as_deref()),
+            non_blank(env.conductor_url.as_deref()),
         ) {
             (Some(app_name), Some(key), Some(url)) => Some(ConductorTarget {
                 url: url.to_owned(),
@@ -276,10 +276,10 @@ pub(crate) fn resolve(config: &Config, env: &Environment) -> Result<Identity> {
         }
     } else {
         conductor_key.map(|key| ConductorTarget {
-            url: given(config.conductor_url.as_deref()).map_or_else(
+            url: non_blank(config.conductor_url.as_deref()).map_or_else(
                 || {
                     hosted_conductor_url(
-                        given(env.dbos_domain.as_deref()).unwrap_or(DEFAULT_DBOS_DOMAIN),
+                        non_blank(env.dbos_domain.as_deref()).unwrap_or(DEFAULT_DBOS_DOMAIN),
                     )
                 },
                 str::to_owned,
