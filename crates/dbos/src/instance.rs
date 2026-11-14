@@ -41,8 +41,8 @@ pub struct Executor {
     monitor_tasks: Tasks,
     /// Cancelled when shutdown begins, which is what the producers' loops watch to stop.
     stopping: CancellationToken,
-    /// The Conductor client, when Conductor is configured. Built by [`start`](Self::start),
-    /// started once launch is otherwise done, and taken and stopped by [`close`](Self::close).
+    /// The Conductor client, if configured: built by [`start`](Self::start), stopped by
+    /// [`close`](Self::close).
     conductor: std::sync::Mutex<Option<Box<dyn ConductorConnection>>>,
 }
 
@@ -79,7 +79,7 @@ impl Executor {
             self_recovery,
             discarded_executor_id,
         } = crate::identity::resolve(config, &Environment::read())?;
-        // Before connecting, so that a missing enterprise crate is reported without a round trip.
+        // Before connecting, so a missing enterprise crate fails fast.
         let conductor = crate::enterprise::conductor_plan(config, conductor)?;
 
         let conn = Arc::new(Connection::for_application(config, &executor_id, &app_name).await?);
@@ -89,9 +89,7 @@ impl Executor {
         // notifier, and the listener's only way out of its loop is the pool closing — so a handle
         // dropped without `close` leaves both tasks and every connection alive for the life of the
         // process, with each retried `launch` adding another set.
-        //
-        // The Conductor client is built last, so nothing here can fail after it: it is built but
-        // not started, and a failure after it would have to stop it too.
+        // The Conductor client is built last, so no failure here leaves one to stop.
         let prepared = async {
             let recovered =
                 prepare(conn.sysdb(), &executor_id, &app_version, self_recovery).await?;
@@ -112,7 +110,7 @@ impl Executor {
             }
         };
 
-        // Only once launch can no longer fail, so that it never names an id nothing ran under.
+        // Only once launch can't fail, so it never names an id nothing ran under.
         if let Some(discarded) = discarded_executor_id {
             tracing::warn!(
                 configured_executor_id = discarded,
@@ -143,8 +141,8 @@ impl Executor {
         Ok((executor, recovered))
     }
 
-    /// Starts the Conductor client, if there is one. The last thing launch does, so that a
-    /// recovery Conductor asks for runs on an executor that is already polling its queues.
+    /// Starts the Conductor client, if any. Launch's last step, so Conductor meets an executor
+    /// already polling its queues.
     fn start_conductor(&self) {
         if let Some(conductor) = self.conductor().as_mut() {
             conductor.start();
@@ -152,8 +150,7 @@ impl Executor {
     }
 
     fn conductor(&self) -> std::sync::MutexGuard<'_, Option<Box<dyn ConductorConnection>>> {
-        // Poisoning cannot leave this torn: the value is one `Option`, and `start` is the only
-        // thing run under the lock.
+        // The value is one `Option`, so poisoning can't leave it torn.
         self.conductor
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -379,9 +376,8 @@ impl Executor {
     /// timeout sweep to record that its deadline has passed. **The system database closes last**,
     /// so everything before it could still checkpoint.
     ///
-    /// The Conductor client stops between the two: after the drain, so the executor stays visibly
-    /// alive to Conductor for as long as it is running workflows, and before the pool, which it
-    /// reads through.
+    /// The Conductor client stops between the two: after the drain, so Conductor sees the executor
+    /// alive while it runs workflows, and before the pool it reads through.
     pub(crate) async fn close(&self) {
         self.monitor_tasks.abort_all().await;
         let conductor = self.conductor().take();
@@ -390,8 +386,7 @@ impl Executor {
                 .await
                 .is_err()
         {
-            // Dropped rather than waited for, so that shutdown still closes the database and
-            // releases the lifecycle lock. Its tasks see the pool close.
+            // Abandoned, so shutdown still closes the database and releases the lifecycle lock.
             tracing::warn!(
                 timeout = ?CONDUCTOR_STOP_TIMEOUT,
                 "the Conductor client did not stop in time and was abandoned"
@@ -401,8 +396,7 @@ impl Executor {
     }
 }
 
-/// How long shutdown waits for the Conductor client to stop: long enough for a websocket close
-/// handshake, short enough that an unreachable Conductor does not hold shutdown.
+/// How long shutdown waits for the Conductor client to stop.
 const CONDUCTOR_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How often a draining shutdown says which workflows it is still waiting for.
@@ -539,9 +533,9 @@ impl DBOS {
     /// Connects to the system database, migrates it, registers this application version, and starts
     /// the executor.
     ///
-    /// When Conductor is configured, by [`Config::conductor_key`] or on DBOS Cloud, launch also
-    /// starts the Conductor client from the enterprise crate registered on
-    /// [`Config::enterprise`], and fails with [`Error::Config`] if none is registered.
+    /// With Conductor configured, by [`Config::conductor_key`] or on DBOS Cloud, launch also starts
+    /// the Conductor client from [`Config::enterprise`], failing with [`Error::Config`] if none is
+    /// registered.
     ///
     /// **Idempotent**: launching an already-launched instance warns and returns. It is not an error
     /// because the common cause is two entry points both being defensive, and failing there would
@@ -597,8 +591,7 @@ impl DBOS {
         // still times out.
         crate::timeout_sweep::spawn(Arc::clone(&executor));
         crate::dequeue::spawn(Arc::clone(&executor));
-        // Last, so Conductor meets an executor that is fully running. Nothing in launch fails once
-        // the executor is built, so a failed launch never leaves a client running.
+        // Last, so Conductor meets a fully running executor.
         executor.start_conductor();
         Ok(())
     }
@@ -636,8 +629,7 @@ impl DBOS {
     ///    left `PENDING`, so it is recovered from its last checkpoint rather than marked failed.
     /// 4. The workflow-timeout sweep stops, after the wait, since a workflow still running may be
     ///    waiting on it.
-    /// 5. The Conductor connection closes, if there is one. Conductor sees the executor as alive
-    ///    for as long as it runs workflows.
+    /// 5. The Conductor client stops, if there is one.
     /// 6. The system database closes last, so a workflow finishing during the wait can still
     ///    checkpoint.
     ///
@@ -786,12 +778,8 @@ impl std::fmt::Debug for DBOS {
 
 /// Registers this version and returns what a previous run of this executor abandoned to its queue.
 ///
-/// Runs inside the block of [`Executor::start`] that is its single error path, the one that closes
-/// the system database; see the comment there. Anything added between the connect and the
-/// executor being built belongs in that block too.
-///
-/// Recovers nothing when `self_recovery` is off: Conductor then decides which executors are gone
-/// and recovers their work, and a sweep here would race it.
+/// Runs inside [`Executor::start`]'s single error path, which closes the system database on
+/// failure. Recovers nothing when `self_recovery` is off, leaving that to Conductor.
 async fn prepare(
     sysdb: &dyn SystemDatabase,
     executor_id: &str,

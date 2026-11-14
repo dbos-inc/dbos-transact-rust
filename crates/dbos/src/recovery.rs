@@ -28,9 +28,9 @@ use crate::sysdb::{INTERNAL_QUEUE, SystemDatabase};
 
 /// Returns the abandoned workflows of `executor_ids` on `app_version` to their queues.
 ///
-/// Called by [`Executor::start`](crate::instance::Executor) for its own id before `launch`
-/// returns, and by the Conductor client for the executors Conductor names. Reports what moved
-/// rather than handles: this process may run none of them.
+/// Called by [`Executor::start`](crate::instance::Executor) for its own id, and by the Conductor
+/// client for the executors Conductor names. Returns ids, not handles: this process may run none
+/// of them.
 pub(crate) async fn reenqueue(
     sysdb: &dyn SystemDatabase,
     executor_ids: &[&str],

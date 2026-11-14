@@ -1,27 +1,12 @@
 //! The seam the closed-source enterprise crate plugs into.
 //!
-//! **`dbos` never depends on the enterprise crate.** The dependency would be a cycle, which Cargo
-//! rejects, and it would carry closed-licence code into an MIT crate. The application depends on
-//! both and registers the enterprise crate on its configuration instead:
+//! `dbos` can't depend on that crate: it would be a cycle, and closed-licence code in an MIT
+//! crate. The application registers it on [`Config::enterprise`](crate::Config::enterprise)
+//! instead. Registration is explicit rather than link-time (`inventory`, `linkme`), which LTO can
+//! drop silently.
 //!
-//! ```ignore
-//! let config = dbos::Config {
-//!     enterprise: Some(dbos_enterprise::enterprise()),
-//!     conductor_key: Some(key),
-//!     ..dbos::Config::from_env("my-app")
-//! };
-//! ```
-//!
-//! That is Rust's counterpart to Go's blank import, Java's `ServiceLoader` and Python's import of
-//! `dbos_enterprise`. It is explicit rather than link-time registration (`inventory`, `linkme`)
-//! because LTO and static linking can drop a registration nothing names, and a Conductor connection
-//! that silently never happens is worse than an error at launch.
-//!
-//! **The contract is [`__enterprise`](crate::__enterprise), and it carries no semver promise.**
-//! It is public because another crate has to see it, and hidden because applications have no use
-//! for it. The enterprise crate pins `dbos = "=0.7.N"`, so it is always built against the exact
-//! version whose contract it was written for, and that is what lets the contract change in a patch
-//! release.
+//! The contract is [`__enterprise`](crate::__enterprise), with no semver promise: the enterprise
+//! crate pins `dbos = "=0.7.N"`.
 
 use std::sync::Arc;
 
@@ -31,7 +16,7 @@ use crate::identity::ConductorTarget;
 use crate::sysdb::SystemDatabase;
 use crate::{Error, Result};
 
-/// The crate an application adds for the enterprise features, as a launch error names it.
+/// The enterprise crate's name, for the launch error.
 const ENTERPRISE_CRATE: &str = "dbos-enterprise";
 
 /// An enterprise crate, registered on [`Config::enterprise`](crate::Config::enterprise).
@@ -45,14 +30,12 @@ const ENTERPRISE_CRATE: &str = "dbos-enterprise";
 /// };
 /// ```
 ///
-/// Two registrations are equal only if one is a clone of the other, which is all that comparing
-/// two configurations needs.
+/// Equal only to its own clones.
 #[derive(Clone)]
 pub struct Enterprise(Arc<dyn EnterpriseProvider>);
 
 impl Enterprise {
-    /// Wraps the enterprise crate's implementation of the contract. Called by that crate, not by
-    /// applications.
+    /// Called by the enterprise crate, not by applications.
     #[doc(hidden)]
     pub fn new(provider: impl EnterpriseProvider) -> Self {
         Self(Arc::new(provider))
@@ -78,19 +61,11 @@ impl std::fmt::Debug for Enterprise {
     }
 }
 
-/// What an enterprise crate provides: one factory per feature.
-///
-/// Only the Conductor client so far. Auto-upgrade, suspension, external storage and the sharded
-/// system database join it as they are ported.
+/// What an enterprise crate provides, one factory per feature. Only Conductor so far.
 pub trait EnterpriseProvider: Send + Sync + 'static {
-    /// Builds the Conductor client, without connecting.
-    ///
-    /// Called during launch once the system database is connected and migrated, and only when
-    /// Conductor is configured. It must neither connect nor spawn: launch can still fail after
-    /// it, and a failed launch then has only [`ConductorConnection::stop`] to call.
-    /// [`ConductorConnection::start`] is where the connection begins.
-    ///
-    /// An error fails the launch.
+    /// Builds the Conductor client without connecting or spawning, which is
+    /// [`ConductorConnection::start`]'s job. Called during launch, after the system database is
+    /// migrated. An error fails the launch.
     fn conductor(
         &self,
         engine: ConductorEngine,
@@ -98,21 +73,15 @@ pub trait EnterpriseProvider: Send + Sync + 'static {
     ) -> Result<Box<dyn ConductorConnection>>;
 }
 
-/// The Conductor client's link to a running executor.
+/// The Conductor client, as launch and shutdown drive it.
 ///
-/// Launch calls [`start`](Self::start) as its last act, once the executor is installed and polling
-/// its queues, so a recovery Conductor asks for runs at once. Shutdown calls
-/// [`stop`](Self::stop) after running workflows have drained, so the executor stays visible to
-/// Conductor for as long as it runs workflows, and before the system database closes, since the
-/// client reads through it.
-///
-/// A launch that fails after the client was built calls `stop` without having called `start`.
+/// Launch calls [`start`](Self::start) last, once the executor is polling its queues. Shutdown
+/// calls [`stop`](Self::stop) after the drain and before the system database closes, and waits
+/// at most five seconds.
 #[async_trait::async_trait]
 pub trait ConductorConnection: Send + 'static {
-    /// Starts connecting, on tasks spawned through [`dbos::__rt`](crate::__rt), and returns.
-    ///
-    /// Reconnecting after a dropped connection is the client's business, so there is nothing to
-    /// report here: Conductor being unreachable does not stop an application.
+    /// Starts connecting, on tasks spawned through [`dbos::__rt`](crate::__rt). Reconnecting is
+    /// the client's job: an unreachable Conductor doesn't stop the application.
     fn start(&mut self);
 
     /// Closes the connection and waits for the client's tasks to end.
@@ -122,10 +91,9 @@ pub trait ConductorConnection: Send + 'static {
 /// The Conductor settings a launch resolved, for the client to connect with.
 #[derive(Clone)]
 pub struct ConductorOptions {
-    /// The websocket URL, ending in the protocol version (`/conductor/v1alpha1`). The client adds
-    /// the application name and the key.
+    /// The websocket URL, ending in `/conductor/v1alpha1`.
     pub url: String,
-    /// The key the client authenticates with. Never printed.
+    /// The key the client authenticates with.
     pub key: String,
     /// The application name Conductor files this executor under.
     pub app_name: String,
@@ -157,8 +125,8 @@ impl std::fmt::Debug for ConductorOptions {
 
 /// The running executor, as the Conductor client sees it.
 ///
-/// It holds the executor's connection and identity rather than the executor itself. The executor
-/// owns the Conductor connection, which owns this, so holding the executor would make a cycle.
+/// Holds the executor's connection, not the executor: the executor owns the client, so that would
+/// be a cycle.
 pub struct ConductorEngine {
     conn: Arc<Connection>,
     executor_id: String,
@@ -181,7 +149,7 @@ impl ConductorEngine {
         }
     }
 
-    /// The system database this executor runs against, which the client reads and writes through.
+    /// The executor's system database.
     pub fn sysdb(&self) -> &dyn SystemDatabase {
         self.conn.sysdb()
     }
@@ -206,11 +174,8 @@ impl ConductorEngine {
         env!("CARGO_PKG_VERSION")
     }
 
-    /// Returns the given executors' abandoned workflows on this application version to their
-    /// queues, and the ids of the workflows it moved.
-    ///
-    /// What Conductor's `recovery` message asks for. Launch does the same for its own executor
-    /// when no Conductor is configured.
+    /// Re-enqueues the named executors' `PENDING` workflows on this application version, returning
+    /// their ids. What Conductor's `recovery` message asks for.
     pub async fn recover(&self, executor_ids: &[&str]) -> Result<Vec<String>> {
         crate::recovery::reenqueue(self.conn.sysdb(), executor_ids, &self.app_version).await
     }
@@ -226,11 +191,8 @@ impl std::fmt::Debug for ConductorEngine {
     }
 }
 
-/// What launch connects to Conductor with, given where identity resolution said to connect.
-///
-/// Fails when Conductor is configured and no enterprise crate is registered, naming the crate and
-/// the line that registers it. Launch calls this before connecting to the system database, so a
-/// missing registration costs nothing to find out.
+/// The enterprise crate and options launch connects to Conductor with, if `target` is set. Fails
+/// when no enterprise crate is registered.
 pub(crate) fn conductor_plan(
     config: &Config,
     target: Option<ConductorTarget>,

@@ -142,44 +142,31 @@ pub struct Config {
     /// rejected: it would re-read the table continuously.
     pub scheduler_polling_interval: Option<Duration>,
 
-    /// The key this application connects to DBOS Conductor with, or `None` not to connect.
+    /// The key to connect to DBOS Conductor with, or `None` not to connect.
     ///
-    /// Setting it changes launch in two ways besides connecting. The executor id becomes a fresh
-    /// UUID for each launch, replacing [`executor_id`](Self::executor_id) and `DBOS__VMID` with a
-    /// warning, since Conductor must be able to tell one process from the next. And launch no
-    /// longer recovers this executor's abandoned workflows: Conductor decides which executors are
-    /// gone and recovers their work itself.
-    ///
-    /// An empty or blank key is no key. On DBOS Cloud this is not read: the deployment supplies its
-    /// own Conductor settings.
+    /// With a key, each launch runs under a fresh UUID executor id, replacing a configured one with
+    /// a warning, and leaves recovery to Conductor. A blank key is no key. Not read on DBOS Cloud,
+    /// which supplies its own Conductor settings.
     pub conductor_key: Option<String>,
 
-    /// Where Conductor is, as a websocket URL. `None` is DBOS's hosted Conductor,
-    /// `wss://cloud.dbos.dev/conductor/v1alpha1`, or the same path on the domain `DBOS_DOMAIN`
-    /// names.
-    ///
-    /// Read only when [`conductor_key`](Self::conductor_key) is set. An empty or blank URL is no
-    /// URL.
+    /// Conductor's websocket URL. `None` is the hosted Conductor,
+    /// `wss://cloud.dbos.dev/conductor/v1alpha1`, on `DBOS_DOMAIN` if that is set. A blank URL is
+    /// no URL.
     pub conductor_url: Option<String>,
 
     /// What this executor reports about itself to Conductor, shown beside it in the Console.
     pub conductor_executor_metadata: Option<serde_json::Map<String, serde_json::Value>>,
 
-    /// Whether Conductor is sent only workflow metadata, never workflow data: no inputs, outputs,
-    /// events, messages or stream values, and error kinds without their messages.
+    /// Whether Conductor is sent workflow metadata only: no inputs, outputs, events, messages,
+    /// stream values or error messages.
     pub conductor_metadata_only_mode: bool,
 
-    /// The enterprise crate, registered here so that launch can use its features.
-    ///
-    /// `dbos` cannot depend on that crate, so the application depends on both and passes this
-    /// along: `enterprise: Some(dbos_enterprise::enterprise())`. Launch fails, naming the crate to
-    /// add, when something that needs it is configured and nothing is registered here. For now that
-    /// is Conductor: a [`conductor_key`](Self::conductor_key), or DBOS Cloud's Conductor variables.
+    /// The enterprise crate, as `Some(dbos_enterprise::enterprise())`. Launch fails without it
+    /// when Conductor is configured.
     pub enterprise: Option<crate::Enterprise>,
 }
 
-/// Hand-written rather than derived, so that neither the database URL's passwords nor the Conductor
-/// key is ever printed.
+/// Hand-written so that no password or Conductor key is printed.
 impl std::fmt::Debug for Config {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let Self {

@@ -602,18 +602,14 @@ pub mod __private {
     pub use crate::timeout_sweep::set_interval as set_workflow_timeout_sweep_interval;
 }
 
-/// The contract between `dbos` and the closed-source enterprise crate, which pins this crate's
+/// The contract the enterprise crate implements. No semver promise: that crate pins this one's
 /// exact version.
-///
-/// **No semver promise**: anything here may change in any release, patch releases included.
-/// Applications never need it; they register the enterprise crate on
-/// [`Config::enterprise`](crate::Config::enterprise) and nothing more.
 #[cfg(feature = "engine")]
 #[doc(hidden)]
 pub mod __enterprise {
     pub use crate::enterprise::{
         ConductorConnection, ConductorEngine, ConductorOptions, EnterpriseProvider,
     };
-    // The trait's `async fn` is declared through this macro, so an implementation needs it too.
+    // `ConductorConnection` is declared with this macro, so implementations need it too.
     pub use async_trait::async_trait;
 }

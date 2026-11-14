@@ -6,12 +6,9 @@ const MASK: &str = "***";
 /// Query parameters a PostgreSQL connection URL may carry a secret in.
 const SECRET_PARAMS: &[&str] = &["password", "sslpassword"];
 
-/// `raw` with every password in it replaced by `***`: the one in the user-info part, and the value
-/// of any `password` or `sslpassword` query parameter.
-///
-/// The host, port, database, user and the other parameters are kept, since they are what someone
-/// reading a log needs to tell where a connection went. A URL that does not parse is redacted
-/// whole rather than printed: if it cannot be read, its secrets cannot be found in it either.
+/// `raw` with its passwords replaced by `***`: the user-info password and any `password` or
+/// `sslpassword` query parameter. Everything else is kept. A URL that doesn't parse prints as
+/// `<redacted>`.
 pub(crate) fn masked_url(raw: &str) -> String {
     if raw.is_empty() {
         return "<unset>".to_owned();
@@ -20,16 +17,14 @@ pub(crate) fn masked_url(raw: &str) -> String {
     let Ok(mut url) = url::Url::parse(raw) else {
         return redacted();
     };
-    // `postgres:user:secret@host/db`, missing its `//`, parses with the whole thing as an opaque
-    // path, where no password is found to mask.
+    // `postgres:user:secret@host/db`, missing its `//`, parses as an opaque path with no password.
     if url.cannot_be_a_base() {
         return redacted();
     }
     if url.password().is_some() && url.set_password(Some(MASK)).is_err() {
         return redacted();
     }
-    // Rewritten only when there is something to mask, so a URL with no secrets in its query keeps
-    // its exact spelling.
+    // Only rewritten when needed, so other URLs keep their exact spelling.
     let has_secret = url
         .query_pairs()
         .any(|(key, _)| SECRET_PARAMS.contains(&key.as_ref()));

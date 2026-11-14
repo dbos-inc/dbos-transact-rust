@@ -53,9 +53,8 @@ pub const EXECUTOR_ID_ENV: &str = "DBOS__VMID";
 /// The executor id for a process nothing named, shared with the other SDKs.
 const DEFAULT_EXECUTOR_ID: &str = "local";
 
-/// Environment variable naming the application to DBOS Conductor on DBOS Cloud.
-///
-/// One of three DBOS Cloud sets together; Conductor is used there only when all three are.
+/// Names the application to Conductor on DBOS Cloud, which uses Conductor only when this and the
+/// two variables below are all set.
 const CLOUD_CONDUCTOR_APP_NAME_ENV: &str = "DBOS__CONDUCTOR_APP_NAME";
 
 /// Environment variable carrying the Conductor key on DBOS Cloud.
@@ -64,8 +63,7 @@ const CLOUD_CONDUCTOR_KEY_ENV: &str = "DBOS__CONDUCTOR_KEY";
 /// Environment variable carrying the Conductor URL on DBOS Cloud.
 const CLOUD_CONDUCTOR_URL_ENV: &str = "DBOS__CONDUCTOR_URL";
 
-/// Environment variable naming the domain of DBOS's hosted Conductor, for an application that
-/// gives a Conductor key and no URL.
+/// The hosted Conductor's domain.
 const DBOS_DOMAIN_ENV: &str = "DBOS_DOMAIN";
 
 /// The domain of DBOS's hosted Conductor when [`DBOS_DOMAIN_ENV`] names none.
@@ -167,9 +165,7 @@ pub(crate) struct Identity {
     /// Whether launch recovers this executor's own abandoned workflows. Not on DBOS Cloud or with
     /// a Conductor key, where Conductor recovers the executors it sees go.
     pub self_recovery: bool,
-    /// An executor id the configuration or the environment named, replaced because a Conductor key
-    /// is set. Reported so that launch can say so: the id an operator chose is not the one rows are
-    /// stamped with.
+    /// A configured executor id replaced because a Conductor key is set, for launch to warn about.
     pub discarded_executor_id: Option<String>,
 }
 
@@ -196,17 +192,13 @@ impl std::fmt::Debug for ConductorTarget {
     }
 }
 
-/// A configured string without its surrounding whitespace, unless nothing is left, which
-/// configures nothing.
-///
-/// Trimmed because these values come from environment variables and secret files, where a
-/// trailing newline is easy to pick up and, in a key, fails authentication with no hint why.
+/// `value` trimmed, or `None` if that leaves nothing. Trimmed because a key read from a secret file
+/// often ends in a newline.
 pub(crate) fn non_blank(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|v| !v.is_empty())
 }
 
-/// How a `Debug` impl prints a secret: whether it is set, by the rule [`non_blank`] applies, and
-/// nothing more.
+/// How a `Debug` impl prints a secret: `<redacted>` if set, `<unset>` if not.
 pub(crate) fn redacted(secret: Option<&str>) -> &'static str {
     if non_blank(secret).is_some() {
         "<redacted>"
@@ -257,9 +249,8 @@ pub(crate) fn resolve(config: &Config, env: &Environment) -> Result<Identity> {
         )));
     };
 
-    // On DBOS Cloud the deployment says whether there is a Conductor, through three variables that
-    // mean nothing apart. Off it, a Conductor key is what connects, and the configuration's own
-    // key and URL are the only ones read.
+    // On DBOS Cloud, Conductor is used only when all three of its variables are set. Off it, only
+    // the configuration's key and URL count.
     let conductor_key = non_blank(config.conductor_key.as_deref());
     let conductor = if env.cloud {
         match (
@@ -289,10 +280,8 @@ pub(crate) fn resolve(config: &Config, env: &Environment) -> Result<Identity> {
         })
     };
 
-    // Conductor tells executors apart by id, and an id that outlives the process would let a new
-    // executor answer for the old one's workflows. So off DBOS Cloud, where nothing guarantees an
-    // id names one process, a Conductor key means a fresh id per launch. On DBOS Cloud the id is
-    // the VM's, which is what Conductor expects there.
+    // Off DBOS Cloud, a Conductor key means a fresh id per launch, so Conductor never takes a new
+    // process for an old one. On DBOS Cloud the id is the VM's, as Conductor expects.
     let (executor_id, discarded_executor_id) = if !env.cloud && conductor_key.is_some() {
         (uuid::Uuid::new_v4().to_string(), executor_id)
     } else {
