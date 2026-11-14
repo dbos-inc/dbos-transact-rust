@@ -165,7 +165,7 @@
 use std::sync::Arc;
 
 use crate::checkpoint::{PendingStep, StepPlacement, StepPosition, revive};
-use crate::connection::Connection;
+use crate::db_connection::DbConnection;
 use crate::error::{Error, Result};
 use crate::instance::DBOS;
 use crate::serialization::{decode_tagged, encode};
@@ -212,9 +212,9 @@ use crate::sysdb::types::{Outcome, Timestamp, step_names};
 pub fn select_workflow<'a, E: crate::DurableError + 'a>(
     workflow_ids: &'a [&'a str],
 ) -> PendingStep<'a, String, E> {
-    let built = StepPlacement::ambient_connection("select_workflow")
-        .and_then(|conn| Connection::placed(&conn, "select_workflow"));
-    Connection::pending_select_workflow(built, workflow_ids)
+    let built = StepPlacement::ambient_db_connection("select_workflow")
+        .and_then(|db_conn| DbConnection::placed(&db_conn, "select_workflow"));
+    DbConnection::pending_select_workflow(built, workflow_ids)
 }
 
 /// Waits until every one of these workflows has finished.
@@ -263,8 +263,8 @@ pub fn select_workflow<'a, E: crate::DurableError + 'a>(
 /// # Ok(total) }
 /// ```
 pub async fn join_workflows<E: crate::DurableError>(workflow_ids: &[&str]) -> crate::Result<(), E> {
-    let conn = StepPlacement::ambient_connection("join_workflows").map_err(Error::lift)?;
-    Connection::join_workflows(&conn, workflow_ids)
+    let db_conn = StepPlacement::ambient_db_connection("join_workflows").map_err(Error::lift)?;
+    DbConnection::join_workflows(&db_conn, workflow_ids)
         .await
         .map_err(Error::lift)
 }
@@ -558,8 +558,8 @@ impl DBOS {
     pub fn select_workflow<'a>(&self, workflow_ids: &'a [&'a str]) -> PendingStep<'a, String> {
         let built = self
             .executor("select_workflow")
-            .and_then(|executor| Connection::placed(executor.connection(), "select_workflow"));
-        Connection::pending_select_workflow(built, workflow_ids)
+            .and_then(|executor| DbConnection::placed(executor.db_connection(), "select_workflow"));
+        DbConnection::pending_select_workflow(built, workflow_ids)
     }
 
     /// Waits until every one of these workflows has finished.
@@ -600,7 +600,7 @@ impl DBOS {
     /// the only thing that error ever guarded.
     pub async fn join_workflows(&self, workflow_ids: &[&str]) -> Result<()> {
         let executor = self.executor("join_workflows")?;
-        Connection::join_workflows(executor.connection(), workflow_ids).await
+        DbConnection::join_workflows(executor.db_connection(), workflow_ids).await
     }
 }
 
@@ -621,8 +621,8 @@ impl crate::Client {
     /// See [`DBOS::select_workflow`]. Nothing is checkpointed, because a client has nothing to
     /// checkpoint against.
     pub async fn select_workflow(&self, workflow_ids: &[&str]) -> Result<String> {
-        let (conn, placement) = Connection::placed(self.connection(), "select_workflow")?;
-        Connection::select_workflow(&conn, placement, workflow_ids).await
+        let (db_conn, placement) = DbConnection::placed(self.db_connection(), "select_workflow")?;
+        DbConnection::select_workflow(&db_conn, placement, workflow_ids).await
     }
 
     /// Waits until every one of these workflows has finished.
@@ -631,7 +631,7 @@ impl crate::Client {
     /// checkpointed nowhere, so this surface differs from that one only in where it finds a
     /// connection.
     pub async fn join_workflows(&self, workflow_ids: &[&str]) -> Result<()> {
-        Connection::join_workflows(self.connection(), workflow_ids).await
+        DbConnection::join_workflows(self.db_connection(), workflow_ids).await
     }
 }
 
@@ -653,7 +653,7 @@ fn summarize(workflow_ids: &[&str]) -> String {
     }
 }
 
-impl Connection {
+impl DbConnection {
     /// The connection the first-wait goes through, paired with where that wait stands.
     ///
     /// **The set is not looked at here**, which is the point rather than an omission: which slot a
@@ -666,11 +666,11 @@ impl Connection {
     /// A repeated id is not looked at either: the first-wait answers with the id itself, which
     /// names one workflow however many entries pointed at it.
     pub(crate) fn placed(
-        conn: &Arc<Self>,
+        db_conn: &Arc<Self>,
         operation: &'static str,
     ) -> Result<(Arc<Self>, StepPlacement)> {
-        let placement = StepPlacement::of(conn, operation)?;
-        Ok((Arc::clone(conn), placement))
+        let placement = StepPlacement::of(db_conn, operation)?;
+        Ok((Arc::clone(db_conn), placement))
     }
 
     /// The first-wait as a [`PendingStep`], for the two surfaces that take a step id.
@@ -686,8 +686,8 @@ impl Connection {
         PendingStep::placed(
             step_names::SELECT_WORKFLOW,
             built,
-            move |conn, placement| async move {
-                Self::select_workflow(&conn, placement, workflow_ids)
+            move |db_conn, placement| async move {
+                Self::select_workflow(&db_conn, placement, workflow_ids)
                     .await
                     .map_err(Error::lift)
             },

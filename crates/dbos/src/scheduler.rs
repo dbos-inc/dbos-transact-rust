@@ -461,11 +461,11 @@ async fn attempt_tick(
     tick: Instant,
     workflow_id: &str,
 ) -> Result<Attempt> {
-    let conn = executor.connection();
+    let db_conn = executor.db_connection();
     let firing = match fresh {
         Some((firing, read_at)) if read_at.elapsed() < REFRESH_INTERVAL => firing,
         _ => {
-            let Some(current) = conn
+            let Some(current) = db_conn
                 .get_schedule(&record.schedule_name, None)
                 .await?
                 .filter(|current| {
@@ -487,7 +487,7 @@ async fn attempt_tick(
             }
             // From the row as it is now: the definition is the same, but the owner may have
             // claimed an unclaimed schedule since.
-            let prepared = match conn
+            let prepared = match db_conn
                 .prepare_firing(&current, Some(executor.workflows()))
                 .await
             {
@@ -503,7 +503,7 @@ async fn attempt_tick(
             &fresh.insert((prepared, std::time::Instant::now())).0
         }
     };
-    if conn
+    if db_conn
         .fire_unless_fired(record, firing, tick, workflow_id)
         .await?
     {
@@ -517,7 +517,8 @@ async fn attempt_tick(
     // The tick, not the clock: it is what automatic backfill resumes from, and a backfill from the
     // clock would skip whatever fired between the tick and the write.
     if state.enqueued {
-        conn.sysdb()
+        db_conn
+            .sysdb()
             .update_schedule_last_fired_at(
                 &record.schedule_name,
                 Timestamp::from_epoch_ms(tick.as_millisecond()),

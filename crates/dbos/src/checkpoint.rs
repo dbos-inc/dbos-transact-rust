@@ -68,8 +68,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::Poll;
 
-use crate::connection::{Connection, Owner};
 use crate::context::Ctx;
+use crate::db_connection::{DbConnection, Owner};
 use crate::error::{DurableError, Error};
 use crate::instance::Executor;
 use crate::serialization::{PayloadEncoding, Serializer, decode_error};
@@ -525,7 +525,7 @@ pub(crate) enum StepPlacement {
 }
 
 impl StepPlacement {
-    /// Where a call reached through `conn` stands, allocating the step id if it is to be recorded.
+    /// Where a call reached through `db_conn` stands, allocating the step id if it is to be recorded.
     ///
     /// **Allocating is the point, and it happens here rather than at the write**: the position of
     /// this call in the workflow has to be the same on the replay as it was on the run, so the id
@@ -533,7 +533,7 @@ impl StepPlacement {
     ///
     /// `operation` names the call for [`Error::WrongInstance`], which is the one error this can
     /// return.
-    pub(crate) fn of(conn: &Arc<Connection>, operation: &'static str) -> Result<Self, Error> {
+    pub(crate) fn of(db_conn: &Arc<DbConnection>, operation: &'static str) -> Result<Self, Error> {
         let Some(ctx) = Ctx::current() else {
             return Ok(Self::Outside);
         };
@@ -550,8 +550,8 @@ impl StepPlacement {
         // The comparison is of *databases* rather than of executors, because the database is what
         // the two halves would disagree about, and it is the thing a connection from a
         // [`Client`](crate::Client) has in common with one from a running executor.
-        if !Arc::ptr_eq(ctx.executor().connection(), conn) {
-            return match conn.owner() {
+        if !Arc::ptr_eq(ctx.executor().db_connection(), db_conn) {
+            return match db_conn.owner() {
                 // **A client's is a plain call, not a refusal.** There is no second counter here
                 // to have meant instead — a client has none — so the operation degrades to the
                 // undurable version of itself, which is what `Client::enqueue` documents about a
@@ -589,7 +589,7 @@ impl StepPlacement {
         operation: &'static str,
     ) -> Result<(Arc<Executor>, Self), Error> {
         let executor = executor?;
-        let placement = Self::of(executor.connection(), operation)?;
+        let placement = Self::of(executor.db_connection(), operation)?;
         Ok((executor, placement))
     }
 
@@ -609,9 +609,11 @@ impl StepPlacement {
     ///
     /// `operation` names the caller for the error, which is the only thing that differs between
     /// them.
-    pub(crate) fn ambient_connection(operation: &'static str) -> Result<Arc<Connection>, Error> {
+    pub(crate) fn ambient_db_connection(
+        operation: &'static str,
+    ) -> Result<Arc<DbConnection>, Error> {
         Ctx::current()
-            .map(|ctx| Arc::clone(ctx.executor().connection()))
+            .map(|ctx| Arc::clone(ctx.executor().db_connection()))
             .ok_or(Error::NotInWorkflow {
                 operation: operation.into(),
             })
@@ -854,7 +856,7 @@ impl StepPlacement {
     /// describing a step row would be the same word for two unrelated things.
     pub(crate) async fn check(
         &self,
-        conn: &Connection,
+        db_conn: &DbConnection,
         step_name: &str,
     ) -> Result<Option<StepRecord>, Error> {
         let Some(StepPosition {
@@ -864,7 +866,8 @@ impl StepPlacement {
         else {
             return Ok(None);
         };
-        conn.sysdb()
+        db_conn
+            .sysdb()
             .check_step(workflow_id, step_id, step_name)
             .await
             .map_err(Error::from_execution)
@@ -883,7 +886,7 @@ impl StepPlacement {
     /// Pairs with [`check`](Self::check), as `record_step` pairs with `check_step`.
     pub(crate) async fn record(
         &self,
-        conn: &Connection,
+        db_conn: &DbConnection,
         step_name: &str,
         outcome: Outcome<'_>,
         started_at: Timestamp,
@@ -896,13 +899,14 @@ impl StepPlacement {
         else {
             return Ok(());
         };
-        conn.sysdb()
+        db_conn
+            .sysdb()
             .record_step(
                 workflow_id,
                 step_id,
                 step_name,
                 outcome,
-                Some(conn.serializer().name()),
+                Some(db_conn.serializer().name()),
                 Some(StepTiming {
                     started_at,
                     completed_at: Timestamp::now(),

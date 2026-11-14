@@ -315,7 +315,7 @@ impl Client {
         options.validate(&workflow)?;
         let encoding = PayloadEncoding::resolve(
             options.serialization,
-            self.connection().serializer().encoding(),
+            self.db_connection().serializer().encoding(),
         );
         let input = encode_input(&input, &encoding)?;
         self.enqueue_encoded(&workflow, &input, encoding, options, None)
@@ -393,7 +393,7 @@ impl Client {
             // The enqueue's own, then this client's. Naming another application deliberately is
             // what lets a tool hand work to an application it is not; naming none at all writes an
             // unclaimed row, which any application may run.
-            application_name: options.app_name.or_else(|| self.connection().app_name()),
+            application_name: options.app_name.or_else(|| self.db_connection().app_name()),
             // **Only if the caller said so.** A version pins the row to executors running exactly
             // that code, and a client has no version of its own to offer — see
             // [`EnqueueOptions::app_version`].
@@ -414,7 +414,7 @@ impl Client {
         // A client has no step counter of its own, so an enqueue it makes records against no
         // parent — the line drawn for every other call a client makes.
         match init_or_join(
-            self.connection(),
+            self.db_connection(),
             &new,
             options.duplication_policy,
             options.workflow_id_reuse_policy,
@@ -433,7 +433,7 @@ impl Client {
                 // This call wrote the row, so a later absence is a deletion: the handle fails
                 // fast rather than polling for a row that will never reappear.
                 Ok(WorkflowHandle::polling(
-                    Arc::clone(self.connection()),
+                    Arc::clone(self.db_connection()),
                     workflow_id.to_owned(),
                     true,
                 ))
@@ -443,7 +443,7 @@ impl Client {
             // is nothing to record about the join — which is the whole of the difference from
             // `start_with`.
             Submitted::Joined(holder) => Ok(WorkflowHandle::polling(
-                Arc::clone(self.connection()),
+                Arc::clone(self.db_connection()),
                 holder,
                 true,
             )),
@@ -570,7 +570,7 @@ impl DBOS {
             options.validate(&workflow)?;
             let (input, encoding) = encode_input(&executor, &options)?;
             let attributes = encode_attributes(options.attributes)?;
-            let placement = StepPlacement::of(executor.connection(), ENQUEUE_OPERATION)?;
+            let placement = StepPlacement::of(executor.db_connection(), ENQUEUE_OPERATION)?;
             if matches!(placement, StepPlacement::InsideStep { .. }) {
                 return Err(Error::InsideStep {
                     operation: ENQUEUE_OPERATION.into(),

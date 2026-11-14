@@ -283,11 +283,11 @@ mod client;
 #[cfg(feature = "engine")]
 mod config;
 #[cfg(feature = "engine")]
-mod connection;
-#[cfg(feature = "engine")]
 mod context;
 #[cfg(feature = "engine")]
 mod cron;
+#[cfg(feature = "engine")]
+mod db_connection;
 #[cfg(feature = "engine")]
 mod debouncer;
 #[cfg(feature = "engine")]

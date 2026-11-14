@@ -45,7 +45,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::config::SYSTEM_DATABASE_URL_ENV;
-use crate::connection::Connection;
+use crate::db_connection::DbConnection;
 use crate::error::{Error, Result};
 use crate::handle::WorkflowHandle;
 use crate::identity::validate_app_name;
@@ -285,7 +285,7 @@ impl ClientConfig {
 /// # }
 /// ```
 #[derive(Clone, Debug)]
-pub struct Client(Arc<Connection>);
+pub struct Client(Arc<DbConnection>);
 
 impl Client {
     /// Connects to the system database.
@@ -300,7 +300,7 @@ impl Client {
     /// rewrite the schema it is inspecting is a tool that can break the application it was pointed
     /// at.
     pub async fn connect(config: ClientConfig) -> Result<Self> {
-        Ok(Self(Arc::new(Connection::for_client(&config).await?)))
+        Ok(Self(Arc::new(DbConnection::for_client(&config).await?)))
     }
 
     /// Closes the connection.
@@ -429,7 +429,7 @@ impl Client {
     }
 
     /// The connection this client talks through, for surfaces implemented against one.
-    pub(crate) fn connection(&self) -> &Arc<Connection> {
+    pub(crate) fn db_connection(&self) -> &Arc<DbConnection> {
         &self.0
     }
 }
@@ -470,8 +470,8 @@ mod tests {
         .expect("connect failed");
 
         let started = (
-            default.connection().sysdb().is_pushing(),
-            opted_in.connection().sysdb().is_pushing(),
+            default.db_connection().sysdb().is_pushing(),
+            opted_in.db_connection().sysdb().is_pushing(),
         );
         default.close().await;
         opted_in.close().await;
@@ -522,10 +522,12 @@ mod tests {
         .await
         .expect("connect failed");
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while !client.connection().sysdb().is_delivering() && std::time::Instant::now() < deadline {
+        while !client.db_connection().sysdb().is_delivering()
+            && std::time::Instant::now() < deadline
+        {
             crate::rt::sleep(Duration::from_millis(50)).await;
         }
-        let delivering = client.connection().sysdb().is_delivering();
+        let delivering = client.db_connection().sysdb().is_delivering();
 
         let handle = workflow.start(()).await.expect("start failed");
         let id = handle.workflow_id().to_owned();

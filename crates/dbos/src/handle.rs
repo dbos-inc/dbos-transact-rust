@@ -13,7 +13,7 @@ use std::sync::Arc;
 use serde::de::DeserializeOwned;
 
 use crate::checkpoint::{PendingStep, StepPlacement, StepPosition, StepWriter};
-use crate::connection::Connection;
+use crate::db_connection::DbConnection;
 use crate::error::EngineOnly;
 use crate::error::{DurableError, EncodedError, Error, Failure, Result};
 use crate::rt::JoinHandle;
@@ -37,7 +37,7 @@ use crate::sysdb::types::{Outcome, StepRecord, StepTiming, Timestamp, WorkflowSt
 /// # }
 /// ```
 pub struct WorkflowHandle<R, E = crate::EngineOnly> {
-    conn: Arc<Connection>,
+    db_conn: Arc<DbConnection>,
     workflow_id: String,
     provenance: Provenance,
     /// `fn() -> (R, E)`: the handle holds neither, it only names them — which keeps it `Send`,
@@ -66,12 +66,12 @@ enum Provenance {
 impl<R, E> WorkflowHandle<R, E> {
     /// A handle over the task this process spawned.
     pub(crate) fn local(
-        conn: Arc<Connection>,
+        db_conn: Arc<DbConnection>,
         workflow_id: String,
         task: JoinHandle<std::result::Result<EncodedOutput, Failure>>,
     ) -> Self {
         Self {
-            conn,
+            db_conn,
             workflow_id,
             provenance: Provenance::Local(task),
             types: PhantomData,
@@ -88,12 +88,12 @@ impl<R, E> WorkflowHandle<R, E> {
     /// `false` for an id it was merely given. [`result`](Self::result) spells out what the two do
     /// differently when the row is not there.
     pub(crate) fn polling(
-        conn: Arc<Connection>,
+        db_conn: Arc<DbConnection>,
         workflow_id: String,
         fail_if_missing: bool,
     ) -> Self {
         Self {
-            conn,
+            db_conn,
             workflow_id,
             provenance: Provenance::Polling { fail_if_missing },
             types: PhantomData,
@@ -108,7 +108,7 @@ impl<R, E> WorkflowHandle<R, E> {
     /// The workflow's status, as its row records it right now.
     pub async fn status(&self) -> Result<WorkflowStatus> {
         let row = self
-            .conn
+            .db_conn
             .sysdb()
             .get_workflow(&self.workflow_id)
             .await
@@ -201,7 +201,7 @@ where
         // await in the parent has to be the same on the replay as it was on the run. A refusal
         // here is carried into the future by `placed`, so `handle.result().await?` keeps its
         // single `?` and nothing was claimed on the way to it.
-        let built = ChildResultPlacement::of(&self.conn).map(|awaiting| {
+        let built = ChildResultPlacement::of(&self.db_conn).map(|awaiting| {
             let placement = awaiting.placement().clone();
             (awaiting, placement)
         });
@@ -221,7 +221,7 @@ where
     /// ambient context and the connection, and the handle has no say in either.
     pub(crate) async fn settle(self, awaiting: ChildResultPlacement) -> Result<R, E> {
         if let Some(recorded) = awaiting
-            .check(&self.conn, &self.workflow_id)
+            .check(&self.db_conn, &self.workflow_id)
             .await
             .map_err(Error::lift)?
         {
@@ -229,7 +229,7 @@ where
                 workflow_id = self.workflow_id,
                 "the child's outcome was already recorded; the parent does not wait again"
             );
-            return Self::interpret(recorded, self.conn.serializer(), &self.workflow_id);
+            return Self::interpret(recorded, self.db_conn.serializer(), &self.workflow_id);
         }
 
         let started_at = Timestamp::now();
@@ -247,7 +247,7 @@ where
             // was minted, because that is the only place that knows whether anything ever saw the
             // row.
             Provenance::Polling { fail_if_missing } => {
-                self.conn.adopt(&self.workflow_id, fail_if_missing).await
+                self.db_conn.adopt(&self.workflow_id, fail_if_missing).await
             }
         };
 
@@ -255,7 +255,7 @@ where
         // the parent's row as the child's own row holds them, under the child's own tag, so the
         // two copies cannot disagree about what the child returned.
         awaiting
-            .record(&self.conn, &self.workflow_id, &outcome, started_at)
+            .record(&self.db_conn, &self.workflow_id, &outcome, started_at)
             .await
             .map_err(Error::lift)?;
 
@@ -329,8 +329,8 @@ impl ChildResultPlacement {
     /// The placement rules — and the argument for each of them — are
     /// [`StepPlacement::of`](crate::checkpoint::StepPlacement::of)'s, shared with every other
     /// library step in the crate. What stays here is only what an *await* does with the answer.
-    pub(crate) fn of(conn: &Arc<Connection>) -> std::result::Result<Self, Error> {
-        StepPlacement::of(conn, "awaiting a workflow's result").map(Self)
+    pub(crate) fn of(db_conn: &Arc<DbConnection>) -> std::result::Result<Self, Error> {
+        StepPlacement::of(db_conn, "awaiting a workflow's result").map(Self)
     }
 
     /// Where this await stands, for the [`PendingStep`] that has to ask again on every poll.
@@ -340,7 +340,7 @@ impl ChildResultPlacement {
 
     async fn check(
         &self,
-        conn: &Connection,
+        db_conn: &DbConnection,
         awaited_workflow_id: &str,
     ) -> std::result::Result<Option<StepRecord>, Error> {
         let Some(StepPosition {
@@ -350,7 +350,7 @@ impl ChildResultPlacement {
         else {
             return Ok(None);
         };
-        let Some(recorded) = conn
+        let Some(recorded) = db_conn
             .sysdb()
             .check_child_result(workflow_id, step_id)
             .await
@@ -407,7 +407,7 @@ impl ChildResultPlacement {
     /// whereas a cancelled child has an error of its own, [`Error::AwaitedWorkflowCancelled`].
     async fn record(
         &self,
-        conn: &Connection,
+        db_conn: &DbConnection,
         child_workflow_id: &str,
         settled: &std::result::Result<EncodedOutput, Failure>,
         started_at: Timestamp,
@@ -433,7 +433,7 @@ impl ChildResultPlacement {
             // rewritten on the way in for the same reason it is rewritten on the way out: the row
             // has to say the awaited workflow was cancelled, not this one.
             Err(Failure::Control(Error::WorkflowCancelled { workflow_id })) => {
-                configured = conn.serializer().encoding();
+                configured = db_conn.serializer().encoding();
                 cancelled = encode(
                     &Error::<EngineOnly>::AwaitedWorkflowCancelled {
                         workflow_id: workflow_id.clone(),
@@ -445,7 +445,8 @@ impl ChildResultPlacement {
             }
             Err(Failure::Control(_)) => return Ok(()),
         };
-        conn.sysdb()
+        db_conn
+            .sysdb()
             .record_child_result(
                 workflow_id,
                 step_id,

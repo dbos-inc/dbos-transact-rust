@@ -33,12 +33,12 @@
 //! order to send a message would have made that the documented way to write one.
 //!
 //! **Every send in the crate is here, and they meet at one place per surface.**
-//! `Connection::send_encoded` and `Connection::send_all_encoded` are the shared paths — each takes
+//! `DbConnection::send_encoded` and `DbConnection::send_all_encoded` are the shared paths — each takes
 //! the payloads its caller encoded, names the encoding, and hands `sysdb` the matching call — so
 //! the surfaces above them differ only in what they can say before they reach one: which ambient
 //! context to read, whether the send is checkpointed, and whether a handle's executor has to be
 //! reconciled with it.
-//! That is [`event`](crate::event)'s shape too, where `Connection::get_event` is the one read under
+//! That is [`event`](crate::event)'s shape too, where `DbConnection::get_event` is the one read under
 //! three callers. The single send and the batch stay separate all the way down, because which one
 //! is called is what chooses the recorded step name — `sysdb` takes it from the method rather than
 //! deriving it from a count.
@@ -71,8 +71,8 @@ use serde::de::DeserializeOwned;
 
 use crate::DBOS;
 use crate::checkpoint::{Built, PendingStep, StepPlacement, StepPosition, StepWriter};
-use crate::connection::Connection;
 use crate::context::Ctx;
+use crate::db_connection::DbConnection;
 use crate::error::{DurableError, Error, Result};
 use crate::serialization::{PayloadEncoding, SerializationFormat, decode_tagged, encode};
 use crate::sysdb::types::Message as SysdbMessage;
@@ -162,14 +162,14 @@ where
     // happened and never moved the counter. Inside a step the placement records nothing, which is
     // what makes that send plain: no id is allocated, so nothing shifts the replay slots of the
     // steps around it.
-    let built = StepPlacement::ambient_connection("send")
-        .and_then(|conn| {
+    let built = StepPlacement::ambient_db_connection("send")
+        .and_then(|db_conn| {
             let encoding =
-                PayloadEncoding::resolve_ambient(options.serialization, conn.serializer());
+                PayloadEncoding::resolve_ambient(options.serialization, db_conn.serializer());
             let encoded = encode_one(&message, encoding)?;
-            Ok((encoded, conn))
+            Ok((encoded, db_conn))
         })
-        .and_then(|(encoded, conn)| place_send(encoded, conn, "send"));
+        .and_then(|(encoded, db_conn)| place_send(encoded, db_conn, "send"));
     pending_send(built, options.send_to_forks)
 }
 
@@ -221,13 +221,13 @@ where
     T: Serialize,
     E: DurableError,
 {
-    let built = StepPlacement::ambient_connection("send_bulk")
-        .and_then(|conn| {
+    let built = StepPlacement::ambient_db_connection("send_bulk")
+        .and_then(|db_conn| {
             let encoding =
-                PayloadEncoding::resolve_ambient(options.serialization, conn.serializer());
-            Ok((encode_all(messages, &encoding)?, conn))
+                PayloadEncoding::resolve_ambient(options.serialization, db_conn.serializer());
+            Ok((encode_all(messages, &encoding)?, db_conn))
         })
-        .and_then(|(encoded, conn)| place_send(encoded, conn, "send_bulk"));
+        .and_then(|(encoded, db_conn)| place_send(encoded, db_conn, "send_bulk"));
     pending_send_bulk(built, options.send_to_forks)
 }
 
@@ -388,7 +388,7 @@ impl DBOS {
                 Ok((encoded, StepPlacement::taken(Ok(executor), "send")?))
             })
             .map(|(encoded, (executor, placement))| {
-                ((Arc::clone(executor.connection()), encoded), placement)
+                ((Arc::clone(executor.db_connection()), encoded), placement)
             });
         pending_send(built, options.send_to_forks)
     }
@@ -420,7 +420,7 @@ impl DBOS {
                 Ok((encoded, StepPlacement::taken(Ok(executor), "send_bulk")?))
             })
             .map(|(encoded, (executor, placement))| {
-                ((Arc::clone(executor.connection()), encoded), placement)
+                ((Arc::clone(executor.db_connection()), encoded), placement)
             });
         pending_send_bulk(built, options.send_to_forks)
     }
@@ -434,11 +434,11 @@ impl DBOS {
 /// further.
 fn place_send<C>(
     encoded: C,
-    conn: Arc<Connection>,
+    db_conn: Arc<DbConnection>,
     operation: &'static str,
-) -> Built<(Arc<Connection>, C)> {
-    let placement = StepPlacement::of(&conn, operation)?;
-    Ok(((conn, encoded), placement))
+) -> Built<(Arc<DbConnection>, C)> {
+    let placement = StepPlacement::of(&db_conn, operation)?;
+    Ok(((db_conn, encoded), placement))
 }
 
 /// One message with its payload already encoded, which is what a send carries from its call into
@@ -511,35 +511,36 @@ fn encode_all<T: Serialize>(
 /// [`Client`](crate::Client)'s stays a plain `async fn`, because it takes no id and is legitimately
 /// driven from anywhere.
 fn pending_send<E: DurableError>(
-    built: Built<(Arc<Connection>, EncodedSendMessage)>,
+    built: Built<(Arc<DbConnection>, EncodedSendMessage)>,
     forks: Forks,
 ) -> PendingStep<'static, (), E> {
     PendingStep::placed(
         step_names::SEND,
         built,
-        move |(conn, encoded), placement| async move {
-            conn.send_encoded(
-                &encoded.as_sysdb_message(),
-                &encoded.encoding,
-                placement.step_position(),
-                forks,
-                placement.owner(),
-            )
-            .await
-            .map_err(Error::lift)
+        move |(db_conn, encoded), placement| async move {
+            db_conn
+                .send_encoded(
+                    &encoded.as_sysdb_message(),
+                    &encoded.encoding,
+                    placement.step_position(),
+                    forks,
+                    placement.owner(),
+                )
+                .await
+                .map_err(Error::lift)
         },
     )
 }
 
 /// A batch send as a [`PendingStep`] — see [`pending_send`], of which this is the plural.
 fn pending_send_bulk<E: DurableError>(
-    built: Built<(Arc<Connection>, Vec<EncodedSendMessage>)>,
+    built: Built<(Arc<DbConnection>, Vec<EncodedSendMessage>)>,
     forks: Forks,
 ) -> PendingStep<'static, (), E> {
     PendingStep::placed(
         step_names::SEND_BULK,
         built,
-        move |(conn, encoded), placement| async move {
+        move |(db_conn, encoded), placement| async move {
             // One encoding for the whole batch, which `encode_all` gave every message; an empty
             // batch writes nothing for it to label.
             let encoding = encoded
@@ -550,20 +551,21 @@ fn pending_send_bulk<E: DurableError>(
                 .iter()
                 .map(EncodedSendMessage::as_sysdb_message)
                 .collect();
-            conn.send_all_encoded(
-                &messages,
-                &encoding,
-                placement.step_position(),
-                forks,
-                placement.owner(),
-            )
-            .await
-            .map_err(Error::lift)
+            db_conn
+                .send_all_encoded(
+                    &messages,
+                    &encoding,
+                    placement.step_position(),
+                    forks,
+                    placement.owner(),
+                )
+                .await
+                .map_err(Error::lift)
         },
     )
 }
 
-impl Connection {
+impl DbConnection {
     /// One message, written to `sysdb`'s single-send method.
     ///
     /// **Takes a payload that is already encoded, because every caller encodes before it gets
@@ -672,12 +674,12 @@ impl crate::Client {
         // workflow body is still a client, and writes as one.
         let encoding = PayloadEncoding::resolve(
             options.serialization,
-            self.connection().serializer().encoding(),
+            self.db_connection().serializer().encoding(),
         );
         let encoded = encode_one(&message, encoding)?;
         // No caller: a client is never inside a workflow, so there is no step to record the send
         // against and nothing to replay it for.
-        self.connection()
+        self.db_connection()
             .send_encoded(
                 &encoded.as_sysdb_message(),
                 &encoded.encoding,
@@ -715,7 +717,7 @@ impl crate::Client {
         // to avoid.
         let encoding = PayloadEncoding::resolve(
             options.serialization,
-            self.connection().serializer().encoding(),
+            self.db_connection().serializer().encoding(),
         );
         let encoded = encode_all(messages, &encoding)?;
         let messages: Vec<SysdbMessage<'_>> = encoded
@@ -724,7 +726,7 @@ impl crate::Client {
             .collect();
         // No caller: a client is never inside a workflow, so there is no step to record the batch
         // against and nothing to replay it for.
-        self.connection()
+        self.db_connection()
             .send_all_encoded(&messages, &encoding, None, options.send_to_forks, None)
             .await
     }
