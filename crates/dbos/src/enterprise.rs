@@ -193,7 +193,7 @@ impl std::fmt::Debug for ConductorEngine {
 
 /// The enterprise crate and options launch connects to Conductor with, if `target` is set. Fails
 /// when no enterprise crate is registered.
-pub(crate) fn conductor_plan(
+pub(crate) fn resolve_conductor(
     config: &Config,
     target: Option<ConductorTarget>,
 ) -> Result<Option<(Enterprise, ConductorOptions)>> {
@@ -253,13 +253,13 @@ mod tests {
     #[test]
     fn without_conductor_nothing_is_needed() {
         let config = Config::new("app", "postgres://localhost/app");
-        assert!(conductor_plan(&config, None).unwrap().is_none());
+        assert!(resolve_conductor(&config, None).unwrap().is_none());
     }
 
     #[test]
     fn conductor_without_a_registration_names_the_crate_and_the_line() {
         let config = Config::new("app", "postgres://localhost/app");
-        let err = conductor_plan(&config, Some(target())).unwrap_err();
+        let err = resolve_conductor(&config, Some(target())).unwrap_err();
         assert!(matches!(err, Error::Config(_)), "{err}");
         let message = err.to_string();
         assert!(message.contains("the dbos-enterprise crate"), "{message}");
@@ -280,7 +280,7 @@ mod tests {
             conductor_metadata_only_mode: true,
             ..Config::new("app", "postgres://localhost/app")
         };
-        let (registered, options) = conductor_plan(&config, Some(target())).unwrap().unwrap();
+        let (registered, options) = resolve_conductor(&config, Some(target())).unwrap().unwrap();
         assert_eq!(registered, enterprise);
         assert_eq!(options.url, "wss://conductor.example/conductor/v1alpha1");
         assert_eq!(options.key, "key");

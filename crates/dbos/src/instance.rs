@@ -80,7 +80,7 @@ impl Executor {
             discarded_executor_id,
         } = crate::identity::resolve(config, &Environment::read())?;
         // Before connecting, so a missing enterprise crate fails fast.
-        let conductor = crate::enterprise::conductor_plan(config, conductor)?;
+        let conductor = crate::enterprise::resolve_conductor(config, conductor)?;
 
         let conn = Arc::new(Connection::for_application(config, &executor_id, &app_name).await?);
 
