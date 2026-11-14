@@ -164,13 +164,8 @@ pub(crate) struct Identity {
     pub app_id: String,
     /// The Conductor this executor connects to, or `None` to connect to none.
     pub conductor: Option<ConductorTarget>,
-    /// Whether launch recovers this executor's own abandoned workflows.
-    ///
-    /// Not when Conductor drives recovery: it decides which executors are gone and recovers them
-    /// itself, and a launch-time sweep would race that decision. On DBOS Cloud the executor id
-    /// survives a restart, so a sweep there could re-enqueue workflows the replaced process is
-    /// still running. Conductor is taken to drive recovery on DBOS Cloud, and wherever a Conductor
-    /// key is configured.
+    /// Whether launch recovers this executor's own abandoned workflows. Not on DBOS Cloud or with
+    /// a Conductor key, where Conductor recovers the executors it sees go.
     pub self_recovery: bool,
     /// An executor id the configuration or the environment named, replaced because a Conductor key
     /// is set. Reported so that launch can say so: the id an operator chose is not the one rows are
