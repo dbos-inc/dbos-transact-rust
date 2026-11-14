@@ -30,8 +30,8 @@ use serde::de::DeserializeOwned;
 
 use crate::DBOS;
 use crate::checkpoint::{Built, PendingStep, StepPlacement, StepWriter, revive};
-use crate::connection::Connection;
 use crate::context::Ctx;
+use crate::db_connection::DbConnection;
 use crate::error::{DurableError, EngineOnly, Error, Result};
 use crate::serialization::SerializationFormat;
 use crate::serialization::{PORTABLE_JSON, PayloadEncoding, decode_tagged, encode};
@@ -180,55 +180,59 @@ where
                 StreamWrite::Close => None,
             };
             Ok((
-                (Arc::clone(ctx.executor().connection()), encoded),
+                (Arc::clone(ctx.executor().db_connection()), encoded),
                 StepPlacement::at(ctx),
             ))
         });
-    PendingStep::placed(name, built, move |(conn, encoded), placement| async move {
-        // A step id of the workflow's own when written from its body; the enclosing step's id when
-        // written from inside one, where the write records nothing and the column is all it gets.
-        let (workflow_id, step_id, owner_xid, written_by) = match &placement {
-            StepPlacement::Recorded { ctx, step_id } => (
-                ctx.workflow_id(),
-                *step_id,
-                ctx.owner_xid(),
-                WrittenBy::Workflow,
-            ),
-            StepPlacement::InsideStep { ctx } => (
-                ctx.workflow_id(),
-                ctx.step_id()
-                    .expect("a context inside a step knows its step id"),
-                ctx.owner_xid(),
-                WrittenBy::Step,
-            ),
-            StepPlacement::Outside | StepPlacement::ClientConnection => {
-                unreachable!("a stream write is placed from the ambient workflow's own context")
+    PendingStep::placed(
+        name,
+        built,
+        move |(db_conn, encoded), placement| async move {
+            // A step id of the workflow's own when written from its body; the enclosing step's id when
+            // written from inside one, where the write records nothing and the column is all it gets.
+            let (workflow_id, step_id, owner_xid, written_by) = match &placement {
+                StepPlacement::Recorded { ctx, step_id } => (
+                    ctx.workflow_id(),
+                    *step_id,
+                    ctx.owner_xid(),
+                    WrittenBy::Workflow,
+                ),
+                StepPlacement::InsideStep { ctx } => (
+                    ctx.workflow_id(),
+                    ctx.step_id()
+                        .expect("a context inside a step knows its step id"),
+                    ctx.owner_xid(),
+                    WrittenBy::Step,
+                ),
+                StepPlacement::Outside | StepPlacement::ClientConnection => {
+                    unreachable!("a stream write is placed from the ambient workflow's own context")
+                }
+            };
+            let sysdb = db_conn.sysdb();
+            match &encoded {
+                Some((value, encoding)) => {
+                    sysdb
+                        .write_stream(
+                            workflow_id,
+                            step_id,
+                            key,
+                            value,
+                            Some(encoding.name()),
+                            written_by,
+                            owner_xid,
+                        )
+                        .await
+                }
+                None => {
+                    sysdb
+                        .close_stream(workflow_id, step_id, key, written_by, owner_xid)
+                        .await
+                }
             }
-        };
-        let sysdb = conn.sysdb();
-        match &encoded {
-            Some((value, encoding)) => {
-                sysdb
-                    .write_stream(
-                        workflow_id,
-                        step_id,
-                        key,
-                        value,
-                        Some(encoding.name()),
-                        written_by,
-                        owner_xid,
-                    )
-                    .await
-            }
-            None => {
-                sysdb
-                    .close_stream(workflow_id, step_id, key, written_by, owner_xid)
-                    .await
-            }
-        }
-        .map_err(Error::from_execution)
-        .map_err(Error::lift)
-    })
+            .map_err(Error::from_execution)
+            .map_err(Error::lift)
+        },
+    )
 }
 
 /// Reads stream `key` of workflow `workflow_id` from the beginning, from a workflow body.
@@ -249,7 +253,7 @@ where
     E: DurableError,
 {
     StreamReader::new(
-        StepPlacement::ambient_connection("read_stream"),
+        StepPlacement::ambient_db_connection("read_stream"),
         workflow_id,
         key,
         0,
@@ -278,7 +282,7 @@ where
     E: DurableError,
 {
     StreamReader::new(
-        StepPlacement::ambient_connection("read_stream_from"),
+        StepPlacement::ambient_db_connection("read_stream_from"),
         workflow_id,
         key,
         offset,
@@ -308,7 +312,7 @@ where
     E: DurableError + 'a,
 {
     read_value(
-        StepPlacement::ambient_connection("read_stream_value"),
+        StepPlacement::ambient_db_connection("read_stream_value"),
         workflow_id,
         key,
         offset,
@@ -335,7 +339,7 @@ impl DBOS {
     ) -> StreamReader<T> {
         StreamReader::new(
             self.executor("read_stream")
-                .map(|executor| Arc::clone(executor.connection())),
+                .map(|executor| Arc::clone(executor.db_connection())),
             workflow_id,
             key,
             0,
@@ -357,7 +361,7 @@ impl DBOS {
     ) -> StreamReader<T> {
         StreamReader::new(
             self.executor("read_stream_from")
-                .map(|executor| Arc::clone(executor.connection())),
+                .map(|executor| Arc::clone(executor.db_connection())),
             workflow_id,
             key,
             offset,
@@ -379,7 +383,7 @@ impl DBOS {
     ) -> PendingStep<'a, T> {
         read_value(
             self.executor("read_stream_value")
-                .map(|executor| Arc::clone(executor.connection())),
+                .map(|executor| Arc::clone(executor.db_connection())),
             workflow_id,
             key,
             offset,
@@ -400,7 +404,7 @@ impl crate::Client {
         options: ReadStreamOptions,
     ) -> StreamReader<T> {
         StreamReader::new(
-            Ok(Arc::clone(self.connection())),
+            Ok(Arc::clone(self.db_connection())),
             workflow_id,
             key,
             0,
@@ -418,7 +422,7 @@ impl crate::Client {
         options: ReadStreamOptions,
     ) -> StreamReader<T> {
         StreamReader::new(
-            Ok(Arc::clone(self.connection())),
+            Ok(Arc::clone(self.db_connection())),
             workflow_id,
             key,
             offset,
@@ -438,7 +442,7 @@ impl crate::Client {
         options: ReadStreamOptions,
     ) -> Result<T> {
         read_value(
-            Ok(Arc::clone(self.connection())),
+            Ok(Arc::clone(self.db_connection())),
             workflow_id,
             key,
             offset,
@@ -484,7 +488,7 @@ impl crate::Client {
 pub struct StreamReader<T, E = EngineOnly> {
     /// The connection the reads go through, or what stopped the reader being built — reported by
     /// the first `next`, taken out of here as it is.
-    source: std::result::Result<Arc<Connection>, Option<Error>>,
+    source: std::result::Result<Arc<DbConnection>, Option<Error>>,
     /// The call that made this reader, which a refusal names.
     operation: &'static str,
     /// Which stream, and how each value is waited for.
@@ -523,7 +527,7 @@ where
 {
     /// A reader of the stream from `offset` on. `operation` is the call a refusal names.
     fn new(
-        source: Result<Arc<Connection>>,
+        source: Result<Arc<DbConnection>>,
         workflow_id: &str,
         key: &str,
         offset: i32,
@@ -531,9 +535,9 @@ where
         operation: &'static str,
     ) -> Self {
         let read = ReadOf::new(workflow_id, key, options);
-        let source = source.and_then(|conn| {
+        let source = source.and_then(|db_conn| {
             read.validate(offset, operation)?;
-            Ok(conn)
+            Ok(db_conn)
         });
         Self {
             source: source.map_err(Some),
@@ -562,8 +566,8 @@ where
         PendingStep::placed(
             step_names::READ_STREAM,
             built,
-            move |conn, placement| async move {
-                let read = self.read_next(&conn, &placement).await;
+            move |db_conn, placement| async move {
+                let read = self.read_next(&db_conn, &placement).await;
                 if read.is_err() {
                     self.ended = true;
                 }
@@ -579,12 +583,12 @@ where
     }
 
     /// The next read's placement, or `None` once the stream has ended for this reader.
-    fn place(&mut self) -> Option<Built<Arc<Connection>>> {
+    fn place(&mut self) -> Option<Built<Arc<DbConnection>>> {
         if self.ended {
             return None;
         }
         let built = match &mut self.source {
-            Ok(conn) => place(Arc::clone(conn), self.operation),
+            Ok(db_conn) => place(Arc::clone(db_conn), self.operation),
             Err(refused) => Err(refused
                 .take()
                 .expect("a refusal is reported once, and the reader then ends")),
@@ -597,7 +601,7 @@ where
     /// One value: replayed if this workflow recorded it, otherwise read and then recorded.
     async fn read_next(
         &mut self,
-        conn: &Connection,
+        db_conn: &DbConnection,
         placement: &StepPlacement,
     ) -> Result<Option<T>> {
         let name = step_names::READ_STREAM;
@@ -605,13 +609,13 @@ where
         let started_at = Timestamp::now();
 
         if self.replaying {
-            match check(conn, placement, name).await? {
+            match check(db_conn, placement, name).await? {
                 Some(Replayed::Value(output, tag)) => {
                     self.offset += 1;
                     return decode_tagged(
                         Some(&output),
                         tag.as_deref(),
-                        conn.serializer(),
+                        db_conn.serializer(),
                         "stream value",
                     )
                     .map(Some);
@@ -628,7 +632,14 @@ where
         if self.buffer.is_empty() {
             match self
                 .read
-                .await_values(conn, placement, name, self.offset, STREAM_PAGE, started_at)
+                .await_values(
+                    db_conn,
+                    placement,
+                    name,
+                    self.offset,
+                    STREAM_PAGE,
+                    started_at,
+                )
                 .await?
             {
                 AwaitedStream::Values(values) => {
@@ -642,14 +653,14 @@ where
                     }
                 }
                 AwaitedStream::Ended => {
-                    record_end(conn, placement, name, started_at).await?;
+                    record_end(db_conn, placement, name, started_at).await?;
                     self.ended = true;
                     return Ok(None);
                 }
                 AwaitedStream::TimedOut => {
                     return Err(self
                         .read
-                        .time_out(conn, placement, name, started_at)
+                        .time_out(db_conn, placement, name, started_at)
                         .await?);
                 }
             }
@@ -660,12 +671,12 @@ where
         // offset that has not moved, for the next read.
         let front = self.buffer.front().expect("a value is buffered by now");
         if is_close(front) {
-            record_end(conn, placement, name, started_at).await?;
+            record_end(db_conn, placement, name, started_at).await?;
             self.buffer.clear();
             self.ended = true;
             return Ok(None);
         }
-        record_value(conn, placement, name, front, started_at).await?;
+        record_value(db_conn, placement, name, front, started_at).await?;
         let entry = self.buffer.pop_front().expect("the value just recorded");
         self.offset += 1;
         // Decoded only as it is delivered, so a value that cannot be decoded fails its own read
@@ -674,7 +685,7 @@ where
         decode_tagged(
             Some(&entry.value),
             entry.serialization.as_deref(),
-            conn.serializer(),
+            db_conn.serializer(),
             "stream value",
         )
         .map(Some)
@@ -687,7 +698,7 @@ where
 /// The same steps as one [`StreamReader::next`] — replay, wait, record — with a page of one and
 /// nothing kept afterwards.
 fn read_value<'a, T, E>(
-    source: Result<Arc<Connection>>,
+    source: Result<Arc<DbConnection>>,
     workflow_id: &str,
     key: &str,
     offset: i32,
@@ -700,12 +711,12 @@ where
     let name = step_names::READ_STREAM_VALUE;
     let read = ReadOf::new(workflow_id, key, options);
     let built = source
-        .and_then(|conn| {
+        .and_then(|db_conn| {
             read.validate(offset, "read_stream_value")?;
-            Ok(conn)
+            Ok(db_conn)
         })
-        .and_then(|conn| place(conn, "read_stream_value"));
-    PendingStep::placed(name, built, move |conn, placement| async move {
+        .and_then(|db_conn| place(db_conn, "read_stream_value"));
+    PendingStep::placed(name, built, move |db_conn, placement| async move {
         async {
             let started_at = Timestamp::now();
             // No value will ever arrive: the stream ended before the offset.
@@ -714,12 +725,12 @@ where
                 key: read.key.clone(),
                 timeout: None,
             };
-            match check(&conn, &placement, name).await? {
+            match check(&db_conn, &placement, name).await? {
                 Some(Replayed::Value(output, tag)) => {
                     return decode_tagged(
                         Some(&output),
                         tag.as_deref(),
-                        conn.serializer(),
+                        db_conn.serializer(),
                         "stream value",
                     );
                 }
@@ -727,7 +738,7 @@ where
                 None => {}
             }
             let entry = match read
-                .await_values(&conn, &placement, name, offset, 1, started_at)
+                .await_values(&db_conn, &placement, name, offset, 1, started_at)
                 .await?
             {
                 AwaitedStream::Values(values) => values
@@ -735,22 +746,24 @@ where
                     .next()
                     .expect("a page of values is never empty"),
                 AwaitedStream::Ended => {
-                    record_end(&conn, &placement, name, started_at).await?;
+                    record_end(&db_conn, &placement, name, started_at).await?;
                     return Err(ended());
                 }
                 AwaitedStream::TimedOut => {
-                    return Err(read.time_out(&conn, &placement, name, started_at).await?);
+                    return Err(read
+                        .time_out(&db_conn, &placement, name, started_at)
+                        .await?);
                 }
             };
             if is_close(&entry) {
-                record_end(&conn, &placement, name, started_at).await?;
+                record_end(&db_conn, &placement, name, started_at).await?;
                 return Err(ended());
             }
-            record_value(&conn, &placement, name, &entry, started_at).await?;
+            record_value(&db_conn, &placement, name, &entry, started_at).await?;
             decode_tagged(
                 Some(&entry.value),
                 entry.serialization.as_deref(),
-                conn.serializer(),
+                db_conn.serializer(),
                 "stream value",
             )
         }
@@ -813,7 +826,7 @@ impl ReadOf {
     /// it rather than learning anything, and a replay reads again.
     async fn await_values(
         &self,
-        conn: &Connection,
+        db_conn: &DbConnection,
         placement: &StepPlacement,
         name: &str,
         offset: i32,
@@ -826,7 +839,7 @@ impl ReadOf {
                 .checked_add(timeout)
                 .unwrap_or(Timestamp::from_epoch_ms(i64::MAX))
         });
-        let wait = conn.sysdb().await_stream_values(
+        let wait = db_conn.sysdb().await_stream_values(
             &self.workflow_id,
             &self.key,
             offset,
@@ -848,10 +861,10 @@ impl ReadOf {
         match awaited {
             Err(refused) if refused.should_record() => {
                 let refused = Error::SystemDatabase(refused);
-                let encoding = conn.serializer().encoding();
+                let encoding = db_conn.serializer().encoding();
                 let encoded = encode(&refused, &encoding, "stream read refusal")?;
                 record(
-                    conn,
+                    db_conn,
                     placement,
                     name,
                     Outcome::Error(&encoded),
@@ -871,7 +884,7 @@ impl ReadOf {
     /// it without waiting.
     async fn time_out(
         &self,
-        conn: &Connection,
+        db_conn: &DbConnection,
         placement: &StepPlacement,
         name: &str,
         started_at: Timestamp,
@@ -881,10 +894,10 @@ impl ReadOf {
             key: self.key.clone(),
             timeout: self.timeout,
         };
-        let encoding = conn.serializer().encoding();
+        let encoding = db_conn.serializer().encoding();
         let encoded = encode(&timed_out, &encoding, "stream timeout")?;
         record(
-            conn,
+            db_conn,
             placement,
             name,
             Outcome::Error(&encoded),
@@ -897,9 +910,9 @@ impl ReadOf {
 }
 
 /// Everything a read does before it runs: the step id, where it takes one.
-fn place(conn: Arc<Connection>, operation: &'static str) -> Built<Arc<Connection>> {
-    let placement = StepPlacement::of(&conn, operation)?;
-    Ok((conn, placement))
+fn place(db_conn: Arc<DbConnection>, operation: &'static str) -> Built<Arc<DbConnection>> {
+    let placement = StepPlacement::of(&db_conn, operation)?;
+    Ok((db_conn, placement))
 }
 
 /// What a read's step recorded, found on replay.
@@ -919,11 +932,11 @@ enum Replayed {
 /// as well as where it has not run yet. A recorded error — a timeout, or a stream whose workflow
 /// does not exist — is raised again.
 async fn check(
-    conn: &Connection,
+    db_conn: &DbConnection,
     placement: &StepPlacement,
     name: &str,
 ) -> Result<Option<Replayed>> {
-    let Some(step) = placement.check(conn, name).await? else {
+    let Some(step) = placement.check(db_conn, name).await? else {
         return Ok(None);
     };
     tracing::debug!(step_id = ?placement.step_id(), name, "replaying a stream read");
@@ -931,7 +944,7 @@ async fn check(
         return Err(revive(
             &error,
             step.serialization.as_deref(),
-            conn.serializer(),
+            db_conn.serializer(),
             name,
         ));
     }
@@ -948,14 +961,14 @@ async fn check(
 /// Records a value a read delivers, before it is handed over: the entry's own encoding, under its
 /// own label.
 async fn record_value(
-    conn: &Connection,
+    db_conn: &DbConnection,
     placement: &StepPlacement,
     name: &str,
     entry: &EncodedValue,
     started_at: Timestamp,
 ) -> Result<()> {
     record(
-        conn,
+        db_conn,
         placement,
         name,
         Outcome::Output(Some(&entry.value)),
@@ -967,13 +980,13 @@ async fn record_value(
 
 /// Records the end of the stream, so a replay ends at the same place.
 async fn record_end(
-    conn: &Connection,
+    db_conn: &DbConnection,
     placement: &StepPlacement,
     name: &str,
     started_at: Timestamp,
 ) -> Result<()> {
     record(
-        conn,
+        db_conn,
         placement,
         name,
         Outcome::Output(Some(STREAM_CLOSED)),
@@ -993,7 +1006,7 @@ fn is_close(entry: &EncodedValue) -> bool {
 /// Through `record_step` rather than [`StepPlacement::record`], because a value is recorded under
 /// the label it was written with rather than this connection's serializer.
 async fn record(
-    conn: &Connection,
+    db_conn: &DbConnection,
     placement: &StepPlacement,
     name: &str,
     outcome: Outcome<'_>,
@@ -1008,7 +1021,8 @@ async fn record(
     else {
         return Ok(());
     };
-    conn.sysdb()
+    db_conn
+        .sysdb()
         .record_step(
             workflow_id,
             step_id,

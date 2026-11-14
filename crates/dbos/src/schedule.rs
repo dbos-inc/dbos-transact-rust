@@ -53,9 +53,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::checkpoint::{PendingStep, StepPlacement, StepWriter};
 use crate::client::Client;
-use crate::connection::Connection;
 use crate::context::Ctx;
 use crate::cron::{CronSchedule, firing_id, trigger_id};
+use crate::db_connection::DbConnection;
 use crate::error::{Error, Result};
 use crate::handle::WorkflowHandle;
 use crate::instance::DBOS;
@@ -551,32 +551,32 @@ impl DBOS {
             // Checks of the spec alone, which a replay answers the same way, so they can refuse
             // the call before it takes a step id.
             spec.validate(OPERATION)?;
-            let placement = StepPlacement::of(executor.connection(), OPERATION)?;
+            let placement = StepPlacement::of(executor.db_connection(), OPERATION)?;
             Ok((executor, placement))
         });
         PendingStep::placed(
             step_names::CREATE_SCHEDULE,
             built,
             move |executor, placement| async move {
-                let conn = executor.connection();
+                let db_conn = executor.db_connection();
                 // Checks of the world as it is now — the registry, the queues table — only on the
                 // first run. A replay returns what that run recorded, even if the queue has since
                 // been deleted.
                 if placement
-                    .check(conn, step_names::CREATE_SCHEDULE)
+                    .check(db_conn, step_names::CREATE_SCHEDULE)
                     .await?
                     .is_none()
                 {
                     refuse_unregistered(&executor, &spec.workflow, OPERATION)?;
                     refuse_unknown_queue(
-                        conn,
+                        db_conn,
                         &spec.schedule_name,
                         spec.queue_name.as_deref(),
                         OPERATION,
                     )
                     .await?;
                 }
-                conn.create_schedule(spec, placement.step_writer()).await
+                db_conn.create_schedule(spec, placement.step_writer()).await
             },
         )
     }
@@ -602,7 +602,7 @@ impl DBOS {
             refuse_unregistered(&executor, &spec.workflow, OPERATION)?;
             if checked.insert(spec.queue_name.as_deref()) {
                 refuse_unknown_queue(
-                    executor.connection(),
+                    executor.db_connection(),
                     &spec.schedule_name,
                     spec.queue_name.as_deref(),
                     OPERATION,
@@ -610,7 +610,7 @@ impl DBOS {
                 .await?;
             }
         }
-        executor.connection().apply_schedules(specs).await
+        executor.db_connection().apply_schedules(specs).await
     }
 
     /// The schedules matching `filter`, by name.
@@ -625,7 +625,7 @@ impl DBOS {
             self.placed("list schedules"),
             move |executor, placement| async move {
                 let records = executor
-                    .connection()
+                    .db_connection()
                     .list_schedules(filter, placement.step_writer())
                     .await?;
                 let serializer = executor.serializer();
@@ -644,7 +644,7 @@ impl DBOS {
             self.placed("read a schedule"),
             move |executor, placement| async move {
                 let record = executor
-                    .connection()
+                    .db_connection()
                     .get_schedule(name, placement.step_writer())
                     .await?;
                 Ok(record.map(|record| Schedule::from_record(record, executor.serializer())))
@@ -666,24 +666,25 @@ impl DBOS {
         let built = self.executor(OPERATION).and_then(|executor| {
             change.validate(name, OPERATION)?;
             let context = change.encode_context(executor.serializer())?;
-            let placement = StepPlacement::of(executor.connection(), OPERATION)?;
+            let placement = StepPlacement::of(executor.db_connection(), OPERATION)?;
             Ok(((executor, context), placement))
         });
         PendingStep::placed(
             step_names::UPDATE_SCHEDULE,
             built,
             move |(executor, context), placement| async move {
-                let conn = executor.connection();
+                let db_conn = executor.db_connection();
                 // As in `create_schedule`: the queue is checked on the first run only.
                 if let Change::Set(queue) = change.queue_name
                     && placement
-                        .check(conn, step_names::UPDATE_SCHEDULE)
+                        .check(db_conn, step_names::UPDATE_SCHEDULE)
                         .await?
                         .is_none()
                 {
-                    refuse_unknown_queue(conn, name, queue, OPERATION).await?;
+                    refuse_unknown_queue(db_conn, name, queue, OPERATION).await?;
                 }
-                conn.update_schedule(name, change, context.as_deref(), placement.step_writer())
+                db_conn
+                    .update_schedule(name, change, context.as_deref(), placement.step_writer())
                     .await
             },
         )
@@ -701,7 +702,7 @@ impl DBOS {
             self.placed("pause a schedule"),
             move |executor, placement| async move {
                 executor
-                    .connection()
+                    .db_connection()
                     .set_schedule_status(name, ScheduleStatus::Paused, placement.step_writer())
                     .await
             },
@@ -715,7 +716,7 @@ impl DBOS {
             self.placed("resume a schedule"),
             move |executor, placement| async move {
                 executor
-                    .connection()
+                    .db_connection()
                     .set_schedule_status(name, ScheduleStatus::Active, placement.step_writer())
                     .await
             },
@@ -731,7 +732,7 @@ impl DBOS {
             self.placed("delete a schedule"),
             move |executor, placement| async move {
                 executor
-                    .connection()
+                    .db_connection()
                     .delete_schedule(name, placement.step_writer())
                     .await
             },
@@ -754,7 +755,7 @@ impl DBOS {
         let executor = self.executor(OPERATION)?;
         refuse_inside_workflow(OPERATION)?;
         executor
-            .connection()
+            .db_connection()
             .backfill_schedule(name, start, end, Some(executor.workflows()))
             .await
     }
@@ -769,7 +770,7 @@ impl DBOS {
         let executor = self.executor(OPERATION)?;
         refuse_inside_workflow(OPERATION)?;
         executor
-            .connection()
+            .db_connection()
             .trigger_schedule(name, Some(executor.workflows()))
             .await
     }
@@ -799,7 +800,7 @@ fn refuse_unregistered(
 /// dequeued. On [`DBOS`] only, like [`refuse_unregistered`]: a client may be scheduling onto a
 /// queue its application registers later.
 async fn refuse_unknown_queue(
-    conn: &Connection,
+    db_conn: &DbConnection,
     schedule_name: &str,
     queue: Option<&str>,
     operation: &'static str,
@@ -807,7 +808,7 @@ async fn refuse_unknown_queue(
     let Some(queue) = queue else {
         return Ok(());
     };
-    if queue == INTERNAL_QUEUE || conn.queue(queue).await?.is_some() {
+    if queue == INTERNAL_QUEUE || db_conn.queue(queue).await?.is_some() {
         return Ok(());
     }
     Err(Error::InvalidArgument {
@@ -831,7 +832,7 @@ impl Client {
     /// Creates a schedule. See [`DBOS::create_schedule`].
     pub async fn create_schedule(&self, spec: &ScheduleSpec) -> Result<()> {
         spec.validate("create a schedule")?;
-        self.connection().create_schedule(spec, None).await
+        self.db_connection().create_schedule(spec, None).await
     }
 
     /// Creates or replaces a set of schedules, in one transaction. See [`DBOS::apply_schedules`].
@@ -839,52 +840,52 @@ impl Client {
         for spec in specs {
             spec.validate("apply schedules")?;
         }
-        self.connection().apply_schedules(specs).await
+        self.db_connection().apply_schedules(specs).await
     }
 
     /// The schedules matching `filter`. See [`DBOS::list_schedules`].
     pub async fn list_schedules(&self, filter: &ScheduleFilter<'_>) -> Result<Vec<Schedule>> {
-        let conn = self.connection();
-        let records = conn.list_schedules(filter, None).await?;
+        let db_conn = self.db_connection();
+        let records = db_conn.list_schedules(filter, None).await?;
         Ok(records
             .into_iter()
-            .map(|record| Schedule::from_record(record, conn.serializer()))
+            .map(|record| Schedule::from_record(record, db_conn.serializer()))
             .collect())
     }
 
     /// The schedule with this name, or `None`.
     pub async fn get_schedule(&self, name: &str) -> Result<Option<Schedule>> {
-        let conn = self.connection();
-        let record = conn.get_schedule(name, None).await?;
-        Ok(record.map(|record| Schedule::from_record(record, conn.serializer())))
+        let db_conn = self.db_connection();
+        let record = db_conn.get_schedule(name, None).await?;
+        Ok(record.map(|record| Schedule::from_record(record, db_conn.serializer())))
     }
 
     /// Changes a schedule's definition. See [`DBOS::update_schedule`].
     pub async fn update_schedule(&self, name: &str, change: &ScheduleChange<'_>) -> Result<()> {
         change.validate(name, "update a schedule")?;
-        let context = change.encode_context(self.connection().serializer())?;
-        self.connection()
+        let context = change.encode_context(self.db_connection().serializer())?;
+        self.db_connection()
             .update_schedule(name, change, context.as_deref(), None)
             .await
     }
 
     /// Stops a schedule firing. See [`DBOS::pause_schedule`].
     pub async fn pause_schedule(&self, name: &str) -> Result<()> {
-        self.connection()
+        self.db_connection()
             .set_schedule_status(name, ScheduleStatus::Paused, None)
             .await
     }
 
     /// Lets a paused schedule fire again.
     pub async fn resume_schedule(&self, name: &str) -> Result<()> {
-        self.connection()
+        self.db_connection()
             .set_schedule_status(name, ScheduleStatus::Active, None)
             .await
     }
 
     /// Deletes a schedule. Deleting one that does not exist is not an error.
     pub async fn delete_schedule(&self, name: &str) -> Result<()> {
-        self.connection().delete_schedule(name, None).await
+        self.db_connection().delete_schedule(name, None).await
     }
 
     /// Enqueues every tick of a schedule strictly between `start` and `end`. See
@@ -895,18 +896,18 @@ impl Client {
         start: SystemTime,
         end: SystemTime,
     ) -> Result<Vec<WorkflowHandle<R, E>>> {
-        self.connection()
+        self.db_connection()
             .backfill_schedule(name, start, end, None)
             .await
     }
 
     /// Enqueues one run of a schedule's workflow now. See [`DBOS::trigger_schedule`].
     pub async fn trigger_schedule<R, E>(&self, name: &str) -> Result<WorkflowHandle<R, E>> {
-        self.connection().trigger_schedule(name, None).await
+        self.db_connection().trigger_schedule(name, None).await
     }
 }
 
-impl Connection {
+impl DbConnection {
     pub(crate) async fn create_schedule(
         &self,
         spec: &ScheduleSpec,
@@ -1201,7 +1202,7 @@ pub(crate) struct Firing {
     workflow: QualifiedWorkflowName,
 }
 
-impl Connection {
+impl DbConnection {
     /// Reads what [`enqueue_run`](Self::enqueue_run) stamps on a run of `record`.
     ///
     /// **The latest version is read at the time of firing**, not at the time the schedule was

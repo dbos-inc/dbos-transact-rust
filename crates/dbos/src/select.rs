@@ -236,7 +236,7 @@ pub async fn check_select<E: DurableError>(branches: &Branches<E>) -> Result<Rac
 
     if let Some(executor) = placement.executor()
         && let Some(recorded) = placement
-            .check(executor.connection(), step_names::SELECT_STEP)
+            .check(executor.db_connection(), step_names::SELECT_STEP)
             .await
             .map_err(Error::lift)?
     {
@@ -308,7 +308,7 @@ pub async fn record_select<E: DurableError>(recording: Recording, winner: usize)
     )?;
     placement
         .record(
-            executor.connection(),
+            executor.db_connection(),
             step_names::SELECT_STEP,
             Outcome::Output(Some(&encoded)),
             started_at,
@@ -610,7 +610,7 @@ mod tests {
                     )
                     .expect("encodes"),
                 )),
-                Some(executor.connection().serializer().name()),
+                Some(executor.db_connection().serializer().name()),
                 None,
                 crate::context::TEST_OWNER,
             )

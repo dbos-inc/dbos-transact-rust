@@ -27,8 +27,8 @@ use serde::de::DeserializeOwned;
 
 use crate::DBOS;
 use crate::checkpoint::{Built, PendingStep, StepPlacement, StepWriter};
-use crate::connection::Connection;
 use crate::context::Ctx;
+use crate::db_connection::DbConnection;
 use crate::error::{DurableError, Error, Result};
 use crate::serialization::SerializationFormat;
 use crate::serialization::{PayloadEncoding, decode_tagged, encode};
@@ -269,7 +269,7 @@ impl crate::Client {
         // No caller, and there is no case where there could be one: a client is not a workflow, so
         // unlike `DBOS::get_event` there is no ambient context to reconcile with this handle's
         // executor and no `WrongInstance` to refuse.
-        self.connection()
+        self.db_connection()
             .get_event(workflow_id, key, timeout, None)
             .await
     }
@@ -310,14 +310,14 @@ where
                         owner_xid: caller.owner_xid,
                     });
             executor
-                .connection()
+                .db_connection()
                 .get_event(workflow_id, key, timeout, caller)
                 .await
         },
     )
 }
 
-impl Connection {
+impl DbConnection {
     /// The read itself, shared by every surface that has one.
     ///
     /// `sysdb` owns the blocking wait and the replay skip, so what is left here is decoding what it
@@ -327,7 +327,7 @@ impl Connection {
     /// On the connection because a read is all it is: the free [`get_event`] reaches it through the
     /// ambient context's, [`DBOS::get_event`] through its executor's, and
     /// [`Client::get_event`](crate::Client::get_event) through the only one it has. Named as they
-    /// are, which is what this crate's other shared internals do — `Connection::register_queue`,
+    /// are, which is what this crate's other shared internals do — `DbConnection::register_queue`,
     /// `queue`, `list_queues`, `update_queue`, `delete_queue` all carry their surface's name. What
     /// each surface adds is the *caller*: which ambient context to read, whether the read is
     /// checkpointed, and whether a handle's executor has to be reconciled with it.

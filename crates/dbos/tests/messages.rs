@@ -484,9 +484,9 @@ async fn a_step_may_send_but_may_not_receive() {
 /// forked from its destination, and with the default it does not.
 ///
 /// The fan-out itself is `sysdb`'s and is tested there. What this pins is the engine mapping —
-/// `SendOptions::send_to_forks` becoming the flag `sysdb` takes — which `Connection::send_encoded`
+/// `SendOptions::send_to_forks` becoming the flag `sysdb` takes — which `DbConnection::send_encoded`
 /// does identically for all three single-send surfaces, so exercising it through one covers them
-/// all. `Connection::send_all_encoded` maps it the same way for the batch, which
+/// all. `DbConnection::send_all_encoded` maps it the same way for the batch, which
 /// [`a_workflows_batch_is_one_checkpoint`] reaches.
 #[dbos_test_support::test]
 async fn a_send_may_fan_out_to_the_destinations_forks() {

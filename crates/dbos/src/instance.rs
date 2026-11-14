@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
-use crate::connection::Connection;
+use crate::db_connection::DbConnection;
 use crate::identity::{Environment, Identity};
 use crate::registry::{Registry, Snapshot};
 use crate::serialization::Serializer;
@@ -26,7 +26,7 @@ use crate::{Error, Result};
 /// connection alone, and everything both surfaces do is a method on that rather than on this
 /// type.
 pub struct Executor {
-    conn: Arc<Connection>,
+    db_conn: Arc<DbConnection>,
     executor_id: String,
     app_version: String,
     app_name: String,
@@ -73,17 +73,17 @@ impl Executor {
             app_id,
         } = crate::identity::resolve(config, &Environment::read())?;
 
-        let conn = Connection::for_application(config, &executor_id, &app_name).await?;
+        let db_conn = DbConnection::for_application(config, &executor_id, &app_name).await?;
 
         // Everything that can fail after the connect goes through one call, so there is one error
         // path and it closes the handle. `connect` has already spawned the listener and the
         // notifier, and the listener's only way out of its loop is the pool closing — so a handle
         // dropped without `close` leaves both tasks and every connection alive for the life of the
         // process, with each retried `launch` adding another set.
-        let recovered = match prepare(conn.sysdb(), &executor_id, &app_version).await {
+        let recovered = match prepare(db_conn.sysdb(), &executor_id, &app_version).await {
             Ok(recovered) => recovered,
             Err(error) => {
-                conn.close().await;
+                db_conn.close().await;
                 return Err(error);
             }
         };
@@ -91,7 +91,7 @@ impl Executor {
         tracing::info!(app_name, executor_id, app_version, "DBOS launched");
 
         let executor = Self {
-            conn: Arc::new(conn),
+            db_conn: Arc::new(db_conn),
             executor_id,
             app_version,
             app_id,
@@ -114,13 +114,13 @@ impl Executor {
     ///
     /// Handed out rather than proxied so that everything both surfaces do can be a method on the
     /// connection and be called by a [`Client`](crate::Client) too — see that module.
-    pub(crate) fn connection(&self) -> &Arc<Connection> {
-        &self.conn
+    pub(crate) fn db_connection(&self) -> &Arc<DbConnection> {
+        &self.db_conn
     }
 
     /// The system database this executor is running against.
     pub(crate) fn sysdb(&self) -> &dyn SystemDatabase {
-        self.conn.sysdb()
+        self.db_conn.sysdb()
     }
 
     /// Identifies this process among the executors sharing the database.
@@ -182,7 +182,7 @@ impl Executor {
 
     /// How often an adopting caller asks whether the run that won has finished.
     pub(crate) fn outcome_poll_interval(&self) -> std::time::Duration {
-        self.conn.outcome_poll_interval()
+        self.db_conn.outcome_poll_interval()
     }
 
     /// The version of the application's code, as workflow rows record it.
@@ -210,7 +210,7 @@ impl Executor {
 
     /// How payloads are encoded.
     pub(crate) fn serializer(&self) -> &Serializer {
-        self.conn.serializer()
+        self.db_conn.serializer()
     }
 
     /// The workflows this executor was launched with.
@@ -334,7 +334,7 @@ impl Executor {
     /// before the pool, which it reads through.
     pub(crate) async fn close(&self) {
         self.monitor_tasks.abort_all().await;
-        self.conn.close().await;
+        self.db_conn.close().await;
     }
 }
 

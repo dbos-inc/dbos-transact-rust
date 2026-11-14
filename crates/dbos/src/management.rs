@@ -165,7 +165,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::checkpoint::{Built, PendingStep, StepPlacement, StepWriter};
-use crate::connection::Connection;
+use crate::db_connection::DbConnection;
 use crate::error::{DurableError, Error, Result};
 use crate::handle::WorkflowHandle;
 use crate::instance::{DBOS, Executor};
@@ -487,7 +487,7 @@ impl Default for ListWorkflowStepsOptions {
 /// ```
 pub fn cancel_workflow<'a, E: DurableError + 'a>(workflow_id: &'a str) -> PendingStep<'a, (), E> {
     pending_cancel(
-        StepPlacement::ambient_connection("cancel_workflow"),
+        StepPlacement::ambient_db_connection("cancel_workflow"),
         workflow_id,
     )
 }
@@ -516,7 +516,7 @@ pub fn cancel_workflows<'a, E: DurableError + 'a>(
     children: Children,
 ) -> PendingStep<'a, Vec<String>, E> {
     pending_cancel_all(
-        StepPlacement::ambient_connection("cancel_workflows"),
+        StepPlacement::ambient_db_connection("cancel_workflows"),
         workflow_ids,
         children,
     )
@@ -548,7 +548,7 @@ pub fn cancel_workflows<'a, E: DurableError + 'a>(
 /// ```
 pub fn resume_workflow<'a, R: 'a, E: 'a>(workflow_id: &'a str) -> PendingStart<'a, R, E> {
     PendingStart::from_step(pending_resume(
-        StepPlacement::ambient_connection("resume_workflow"),
+        StepPlacement::ambient_db_connection("resume_workflow"),
         workflow_id,
         ResumeOptions::default(),
     ))
@@ -562,7 +562,7 @@ pub fn resume_workflow_with<'a, R: 'a, E: 'a>(
     options: ResumeOptions<'a>,
 ) -> PendingStart<'a, R, E> {
     PendingStart::from_step(pending_resume(
-        StepPlacement::ambient_connection("resume_workflow_with"),
+        StepPlacement::ambient_db_connection("resume_workflow_with"),
         workflow_id,
         options,
     ))
@@ -583,7 +583,7 @@ pub fn resume_workflows<'a, R: 'a, E: 'a>(
     options: ResumeOptions<'a>,
 ) -> PendingStep<'a, Vec<WorkflowHandle<R, E>>> {
     pending_resume_all(
-        StepPlacement::ambient_connection("resume_workflows"),
+        StepPlacement::ambient_db_connection("resume_workflows"),
         workflow_ids,
         options,
     )
@@ -617,7 +617,7 @@ pub fn fork_workflow<'a, R: 'a, E: 'a>(
     start_step: i32,
 ) -> PendingStart<'a, R, E> {
     PendingStart::from_step(pending_fork(
-        StepPlacement::ambient_connection("fork_workflow"),
+        StepPlacement::ambient_db_connection("fork_workflow"),
         Fork::new(workflow_id, start_step),
         ForkOptions::default(),
     ))
@@ -632,7 +632,7 @@ pub fn fork_workflow_with<'a, R: 'a, E: 'a>(
     options: ForkOptions<'a>,
 ) -> PendingStart<'a, R, E> {
     PendingStart::from_step(pending_fork(
-        StepPlacement::ambient_connection("fork_workflow_with"),
+        StepPlacement::ambient_db_connection("fork_workflow_with"),
         fork,
         options,
     ))
@@ -653,7 +653,7 @@ pub fn fork_workflows<'a, R: 'a, E: 'a>(
     options: ForkOptions<'a>,
 ) -> PendingStep<'a, Vec<WorkflowHandle<R, E>>> {
     pending_fork_all(
-        StepPlacement::ambient_connection("fork_workflows"),
+        StepPlacement::ambient_db_connection("fork_workflows"),
         forks,
         options,
     )
@@ -682,7 +682,7 @@ pub fn fork_workflows<'a, R: 'a, E: 'a>(
 /// ```
 pub fn rewind_workflow<'a, R: 'a, E: 'a>(workflow_id: &'a str) -> PendingStart<'a, R, E> {
     PendingStart::from_step(pending_rewind(
-        StepPlacement::ambient_connection("rewind_workflow"),
+        StepPlacement::ambient_db_connection("rewind_workflow"),
         workflow_id,
         RewindOptions::default(),
     ))
@@ -697,7 +697,7 @@ pub fn rewind_workflow_with<'a, R: 'a, E: 'a>(
     options: RewindOptions<'a>,
 ) -> PendingStart<'a, R, E> {
     PendingStart::from_step(pending_rewind(
-        StepPlacement::ambient_connection("rewind_workflow_with"),
+        StepPlacement::ambient_db_connection("rewind_workflow_with"),
         workflow_id,
         options,
     ))
@@ -724,7 +724,7 @@ pub fn rewind_workflow_with<'a, R: 'a, E: 'a>(
 /// ```
 pub fn delete_workflow<'a, E: DurableError + 'a>(workflow_id: &'a str) -> PendingStep<'a, (), E> {
     pending_delete(
-        StepPlacement::ambient_connection("delete_workflow"),
+        StepPlacement::ambient_db_connection("delete_workflow"),
         workflow_id,
     )
 }
@@ -742,7 +742,7 @@ pub fn delete_workflows<'a, E: DurableError + 'a>(
     children: Children,
 ) -> PendingStep<'a, u64, E> {
     pending_delete_all(
-        StepPlacement::ambient_connection("delete_workflows"),
+        StepPlacement::ambient_db_connection("delete_workflows"),
         workflow_ids,
         children,
     )
@@ -762,7 +762,7 @@ pub fn set_workflow_delay<'a, E: DurableError + 'a>(
     delay: WorkflowDelay,
 ) -> PendingStep<'a, (), E> {
     pending_set_workflow_delay(
-        StepPlacement::ambient_connection("set_workflow_delay"),
+        StepPlacement::ambient_db_connection("set_workflow_delay"),
         workflow_id,
         delay,
     )
@@ -783,7 +783,7 @@ pub fn update_workflow_attributes<'a, E: DurableError + 'a>(
     attributes: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> PendingStep<'a, (), E> {
     pending_update_workflow_attributes(
-        StepPlacement::ambient_connection("update_workflow_attributes"),
+        StepPlacement::ambient_db_connection("update_workflow_attributes"),
         workflow_id,
         attributes,
     )
@@ -802,7 +802,7 @@ pub fn merge_workflow_attributes<'a, E: DurableError + 'a>(
     attributes: &serde_json::Map<String, serde_json::Value>,
 ) -> PendingStep<'a, (), E> {
     pending_merge_workflow_attributes(
-        StepPlacement::ambient_connection("merge_workflow_attributes"),
+        StepPlacement::ambient_db_connection("merge_workflow_attributes"),
         workflow_id,
         attributes,
     )
@@ -836,7 +836,10 @@ pub fn merge_workflow_attributes<'a, E: DurableError + 'a>(
 pub fn list_workflows<'a, E: DurableError + 'a>(
     filter: &'a WorkflowFilter<'a>,
 ) -> PendingStep<'a, Vec<WorkflowRecord>, E> {
-    pending_list_workflows(StepPlacement::ambient_connection("list_workflows"), filter)
+    pending_list_workflows(
+        StepPlacement::ambient_db_connection("list_workflows"),
+        filter,
+    )
 }
 
 /// Reads one workflow's steps, in execution order, from inside a workflow.
@@ -853,7 +856,7 @@ pub fn list_workflow_steps<'a, E: DurableError + 'a>(
     workflow_id: &'a str,
 ) -> PendingStep<'a, Vec<StepRecord>, E> {
     pending_list_workflow_steps(
-        StepPlacement::ambient_connection("list_workflow_steps"),
+        StepPlacement::ambient_db_connection("list_workflow_steps"),
         workflow_id,
         ListWorkflowStepsOptions::default(),
     )
@@ -869,7 +872,7 @@ pub fn list_workflow_steps_with<'a, E: DurableError + 'a>(
     options: ListWorkflowStepsOptions,
 ) -> PendingStep<'a, Vec<StepRecord>, E> {
     pending_list_workflow_steps(
-        StepPlacement::ambient_connection("list_workflow_steps_with"),
+        StepPlacement::ambient_db_connection("list_workflow_steps_with"),
         workflow_id,
         options,
     )
@@ -899,8 +902,8 @@ pub fn list_workflow_steps_with<'a, E: DurableError + 'a>(
 /// # }
 /// ```
 pub fn retrieve_workflow<R, E: DurableError>(workflow_id: &str) -> Result<WorkflowHandle<R, E>, E> {
-    let conn = StepPlacement::ambient_connection("retrieve_workflow").map_err(Error::lift)?;
-    Ok(retrieved(conn, workflow_id))
+    let db_conn = StepPlacement::ambient_db_connection("retrieve_workflow").map_err(Error::lift)?;
+    Ok(retrieved(db_conn, workflow_id))
 }
 
 impl DBOS {
@@ -953,8 +956,8 @@ impl DBOS {
     /// argument checks that must refuse before an id is spent. Whether the ambient workflow is
     /// this instance's is decided there, by [`StepPlacement::of`], which is where
     /// [`Error::WrongInstance`] comes from.
-    fn connection(&self, operation: &'static str) -> Result<Arc<Connection>> {
-        Ok(Arc::clone(self.executor(operation)?.connection()))
+    fn db_connection(&self, operation: &'static str) -> Result<Arc<DbConnection>> {
+        Ok(Arc::clone(self.executor(operation)?.db_connection()))
     }
 
     /// A handle to a workflow this process did not start.
@@ -998,7 +1001,7 @@ impl DBOS {
     /// ```
     pub fn retrieve_workflow<R, E>(&self, workflow_id: &str) -> Result<WorkflowHandle<R, E>> {
         Ok(retrieved(
-            Arc::clone(self.executor("retrieve a workflow")?.connection()),
+            Arc::clone(self.executor("retrieve a workflow")?.db_connection()),
             workflow_id,
         ))
     }
@@ -1038,7 +1041,7 @@ impl DBOS {
     /// # Ok(()) }
     /// ```
     pub fn cancel<'a>(&self, workflow_id: &'a str) -> PendingStep<'a, ()> {
-        pending_cancel(self.connection("cancel a workflow"), workflow_id)
+        pending_cancel(self.db_connection("cancel a workflow"), workflow_id)
     }
 
     /// Cancels workflows, and optionally everything descended from them.
@@ -1073,7 +1076,11 @@ impl DBOS {
         workflow_ids: &'a [&'a str],
         children: Children,
     ) -> PendingStep<'a, Vec<String>> {
-        pending_cancel_all(self.connection("cancel a workflow"), workflow_ids, children)
+        pending_cancel_all(
+            self.db_connection("cancel a workflow"),
+            workflow_ids,
+            children,
+        )
     }
 
     /// Puts a workflow back on a queue, and hands back a handle to watch it.
@@ -1159,7 +1166,7 @@ impl DBOS {
         options: ResumeOptions<'a>,
     ) -> PendingStart<'a, R, E, crate::EngineOnly> {
         PendingStart::from_step(pending_resume(
-            self.connection("resume a workflow"),
+            self.db_connection("resume a workflow"),
             workflow_id,
             options,
         ))
@@ -1185,7 +1192,11 @@ impl DBOS {
         workflow_ids: &'a [&'a str],
         options: ResumeOptions<'a>,
     ) -> PendingStep<'a, Vec<WorkflowHandle<R, E>>> {
-        pending_resume_all(self.connection("resume a workflow"), workflow_ids, options)
+        pending_resume_all(
+            self.db_connection("resume a workflow"),
+            workflow_ids,
+            options,
+        )
     }
 
     /// Forks a workflow from `start_step`, enqueueing the fork and handing back a handle to it.
@@ -1256,7 +1267,11 @@ impl DBOS {
         fork: Fork<'a>,
         options: ForkOptions<'a>,
     ) -> PendingStart<'a, R, E, crate::EngineOnly> {
-        PendingStart::from_step(pending_fork(self.connection(FORK_OPERATION), fork, options))
+        PendingStart::from_step(pending_fork(
+            self.db_connection(FORK_OPERATION),
+            fork,
+            options,
+        ))
     }
 
     /// Forks workflows, handing back a handle to each fork in the order given.
@@ -1297,7 +1312,7 @@ impl DBOS {
         forks: &'a [Fork<'a>],
         options: ForkOptions<'a>,
     ) -> PendingStep<'a, Vec<WorkflowHandle<R, E>>> {
-        pending_fork_all(self.connection(FORK_OPERATION), forks, options)
+        pending_fork_all(self.db_connection(FORK_OPERATION), forks, options)
     }
 
     /// Re-runs a finished workflow from its first step, under the same id.
@@ -1389,7 +1404,7 @@ impl DBOS {
         options: RewindOptions<'a>,
     ) -> PendingStart<'a, R, E, crate::EngineOnly> {
         PendingStart::from_step(pending_rewind(
-            self.connection("rewind a workflow"),
+            self.db_connection("rewind a workflow"),
             workflow_id,
             options,
         ))
@@ -1419,7 +1434,7 @@ impl DBOS {
     /// with [`Error::SystemDatabase`] carrying `InvalidInput` and nothing is deleted; see
     /// [`delete_all`](Self::delete_all) for why.
     pub fn delete<'a>(&self, workflow_id: &'a str) -> PendingStep<'a, ()> {
-        pending_delete(self.connection("delete a workflow"), workflow_id)
+        pending_delete(self.db_connection("delete a workflow"), workflow_id)
     }
 
     /// Deletes workflows, and optionally everything descended from them.
@@ -1452,7 +1467,11 @@ impl DBOS {
         workflow_ids: &'a [&'a str],
         children: Children,
     ) -> PendingStep<'a, u64> {
-        pending_delete_all(self.connection("delete a workflow"), workflow_ids, children)
+        pending_delete_all(
+            self.db_connection("delete a workflow"),
+            workflow_ids,
+            children,
+        )
     }
 
     /// Holds a queued workflow back, or lets it go sooner.
@@ -1490,7 +1509,7 @@ impl DBOS {
         workflow_id: &'a str,
         delay: WorkflowDelay,
     ) -> PendingStep<'a, ()> {
-        pending_set_workflow_delay(self.connection(DELAY_OPERATION), workflow_id, delay)
+        pending_set_workflow_delay(self.db_connection(DELAY_OPERATION), workflow_id, delay)
     }
 
     /// Replaces a workflow's attributes, or clears them with `None`.
@@ -1536,7 +1555,7 @@ impl DBOS {
         attributes: Option<&serde_json::Map<String, serde_json::Value>>,
     ) -> PendingStep<'a, ()> {
         pending_update_workflow_attributes(
-            self.connection("update a workflow's attributes"),
+            self.db_connection("update a workflow's attributes"),
             workflow_id,
             attributes,
         )
@@ -1573,7 +1592,7 @@ impl DBOS {
         attributes: &serde_json::Map<String, serde_json::Value>,
     ) -> PendingStep<'a, ()> {
         pending_merge_workflow_attributes(
-            self.connection("merge a workflow's attributes"),
+            self.db_connection("merge a workflow's attributes"),
             workflow_id,
             attributes,
         )
@@ -1616,7 +1635,7 @@ impl DBOS {
         &self,
         filter: &'a WorkflowFilter<'a>,
     ) -> PendingStep<'a, Vec<WorkflowRecord>> {
-        pending_list_workflows(self.connection("list workflows"), filter)
+        pending_list_workflows(self.db_connection("list workflows"), filter)
     }
 
     /// Reads one workflow's steps, in execution order.
@@ -1659,7 +1678,7 @@ impl DBOS {
         options: ListWorkflowStepsOptions,
     ) -> PendingStep<'a, Vec<StepRecord>> {
         pending_list_workflow_steps(
-            self.connection("list a workflow's steps"),
+            self.db_connection("list a workflow's steps"),
             workflow_id,
             options,
         )
@@ -1706,7 +1725,7 @@ impl crate::Client {
         workflow_ids: &[&str],
         children: Children,
     ) -> Result<Vec<String>> {
-        self.connection()
+        self.db_connection()
             .cancel_all(workflow_ids, children, None, None)
             .await
     }
@@ -1737,7 +1756,7 @@ impl crate::Client {
         workflow_ids: &[&str],
         options: ResumeOptions<'_>,
     ) -> Result<Vec<WorkflowHandle<R, E>>> {
-        self.connection()
+        self.db_connection()
             .resume_all(workflow_ids, options, None, None)
             .await
     }
@@ -1777,7 +1796,7 @@ impl crate::Client {
         options: ForkOptions<'_>,
     ) -> Result<WorkflowHandle<R, E>> {
         refuse_invalid_forks(std::slice::from_ref(&fork), &options)?;
-        self.connection()
+        self.db_connection()
             .fork_one(fork.to_sys(), &options.to_sys(), None)
             .await
     }
@@ -1794,7 +1813,7 @@ impl crate::Client {
     ) -> Result<Vec<WorkflowHandle<R, E>>> {
         refuse_invalid_forks(forks, &options)?;
         let forks: Vec<SysFork<'_>> = forks.iter().map(|fork| fork.to_sys()).collect();
-        self.connection()
+        self.db_connection()
             .fork_all(&forks, &options.to_sys(), None)
             .await
     }
@@ -1827,7 +1846,9 @@ impl crate::Client {
         options: RewindOptions<'_>,
     ) -> Result<WorkflowHandle<R, E>> {
         refuse_invalid_rewind_options(&options)?;
-        self.connection().rewind(workflow_id, options, None).await
+        self.db_connection()
+            .rewind(workflow_id, options, None)
+            .await
     }
 
     /// Removes a workflow and everything recorded against it.
@@ -1842,7 +1863,7 @@ impl crate::Client {
 
     /// Deletes workflows, and optionally everything descended from them. Returns the rows removed.
     pub async fn delete_all(&self, workflow_ids: &[&str], children: Children) -> Result<u64> {
-        self.connection()
+        self.db_connection()
             .delete_all(workflow_ids, children, None)
             .await
     }
@@ -1852,7 +1873,7 @@ impl crate::Client {
     /// See [`DBOS::set_workflow_delay`]. Only a `DELAYED` row moves: a workflow already released is
     /// running or queued, and pushing its delay out would not recall it.
     pub async fn set_workflow_delay(&self, workflow_id: &str, delay: WorkflowDelay) -> Result<()> {
-        self.connection()
+        self.db_connection()
             .set_workflow_delay(workflow_id, delay, None)
             .await
     }
@@ -1866,7 +1887,7 @@ impl crate::Client {
         attributes: Option<&serde_json::Map<String, serde_json::Value>>,
     ) -> Result<()> {
         let encoded = crate::workflow::encode_attributes(attributes)?;
-        self.connection()
+        self.db_connection()
             .update_workflow_attributes(
                 workflow_id,
                 AttributeUpdate::Replace(encoded.as_deref()),
@@ -1884,7 +1905,7 @@ impl crate::Client {
         attributes: &serde_json::Map<String, serde_json::Value>,
     ) -> Result<()> {
         let encoded = crate::workflow::encode_attribute_map(attributes)?;
-        self.connection()
+        self.db_connection()
             .update_workflow_attributes(workflow_id, AttributeUpdate::Merge(&encoded), None)
             .await
     }
@@ -1907,7 +1928,7 @@ impl crate::Client {
     /// # Ok(()) }
     /// ```
     pub async fn list_workflows(&self, filter: &WorkflowFilter<'_>) -> Result<Vec<WorkflowRecord>> {
-        self.connection().list_workflows(filter, None).await
+        self.db_connection().list_workflows(filter, None).await
     }
 
     /// Reads the steps a workflow has recorded, in the order it recorded them, each with its output
@@ -1929,7 +1950,7 @@ impl crate::Client {
         workflow_id: &str,
         options: ListWorkflowStepsOptions,
     ) -> Result<Vec<StepRecord>> {
-        self.connection()
+        self.db_connection()
             .list_workflow_steps(workflow_id, options, None)
             .await
     }
@@ -1943,13 +1964,13 @@ impl crate::Client {
 /// replay does not run it twice; [`Client`](crate::Client) always passes `None`, because a client
 /// has no step counter of its own to agree with a workflow's. That is the same line
 /// [`WorkflowHandle::result`](crate::WorkflowHandle::result) draws for a client's handle awaited
-/// inside a workflow, and `Connection::get_event` for a client's read.
+/// inside a workflow, and `DbConnection::get_event` for a client's read.
 ///
 /// Cancel and resume also take `from_workflow`, the workflow making the call, which they refuse to
 /// target. It is not `caller` with the step dropped: inside a step body the call records nothing
 /// and `caller` is `None`, but the workflow is still the one calling. A client passes `None` for
 /// both.
-impl Connection {
+impl DbConnection {
     /// Cancels workflows, optionally cascading, and reports which ones moved.
     pub(crate) async fn cancel_all(
         &self,
@@ -2190,7 +2211,7 @@ impl Connection {
 //
 // Each `pending_*` below is the whole of an operation as a step: its recorded name, the argument
 // checks that must refuse before an id is spent, the placement, and the run. The method on `DBOS`
-// and the free function are each one line over it, and differ only in what they hand it as `conn`
+// and the free function are each one line over it, and differ only in what they hand it as `db_conn`
 // — the handle's executor's connection, refused as `NotLaunched` before launch, or the ambient
 // workflow's, refused as `NotInWorkflow` outside one — and in the error channel they ask for. That
 // is what makes a workflow that switches from one to the other replay the history it recorded:
@@ -2201,69 +2222,71 @@ impl Connection {
 // that error.
 
 /// Where a management call stands: the connection refused first, then the id.
-fn place(conn: Result<Arc<Connection>>, operation: &'static str) -> Built<Arc<Connection>> {
-    conn.and_then(|conn| Connection::placed(&conn, operation))
+fn place(db_conn: Result<Arc<DbConnection>>, operation: &'static str) -> Built<Arc<DbConnection>> {
+    db_conn.and_then(|db_conn| DbConnection::placed(&db_conn, operation))
 }
 
 /// [`place`] with a check between the connection and the id, for the calls with arguments they
 /// can refuse — or a payload they must encode — before a step id is spent. What the check produces
 /// travels beside the connection into the run.
 fn place_after<C>(
-    conn: Result<Arc<Connection>>,
+    db_conn: Result<Arc<DbConnection>>,
     operation: &'static str,
     check: impl FnOnce() -> Result<C>,
-) -> Built<(Arc<Connection>, C)> {
-    let conn = conn?;
+) -> Built<(Arc<DbConnection>, C)> {
+    let db_conn = db_conn?;
     let checked = check()?;
-    let placement = StepPlacement::of(&conn, operation)?;
-    Ok(((conn, checked), placement))
+    let placement = StepPlacement::of(&db_conn, operation)?;
+    Ok(((db_conn, checked), placement))
 }
 
 /// A handle to a workflow by id, taken on faith: the body of both `retrieve_workflow`s.
-fn retrieved<R, E>(conn: Arc<Connection>, workflow_id: &str) -> WorkflowHandle<R, E> {
+fn retrieved<R, E>(db_conn: Arc<DbConnection>, workflow_id: &str) -> WorkflowHandle<R, E> {
     // Nothing here has seen the row: the id is the caller's, taken on faith, which is the one
     // handle shape that waits for a row to appear rather than reporting it missing.
-    WorkflowHandle::polling(conn, workflow_id.to_owned(), false)
+    WorkflowHandle::polling(db_conn, workflow_id.to_owned(), false)
 }
 
 fn pending_cancel<'a, E: 'a>(
-    conn: Result<Arc<Connection>>,
+    db_conn: Result<Arc<DbConnection>>,
     workflow_id: &'a str,
 ) -> PendingStep<'a, (), E> {
     PendingStep::placed(
         step_names::CANCEL_WORKFLOW,
-        place(conn, "cancel a workflow"),
-        move |conn, placement| async move {
-            conn.cancel_all(
-                &[workflow_id],
-                Children::Skip,
-                placement.workflow_id(),
-                placement.step_writer(),
-            )
-            .await
-            .map_err(Error::lift)?;
+        place(db_conn, "cancel a workflow"),
+        move |db_conn, placement| async move {
+            db_conn
+                .cancel_all(
+                    &[workflow_id],
+                    Children::Skip,
+                    placement.workflow_id(),
+                    placement.step_writer(),
+                )
+                .await
+                .map_err(Error::lift)?;
             Ok(())
         },
     )
 }
 
 fn pending_cancel_all<'a, E: 'a>(
-    conn: Result<Arc<Connection>>,
+    db_conn: Result<Arc<DbConnection>>,
     workflow_ids: &'a [&'a str],
     children: Children,
 ) -> PendingStep<'a, Vec<String>, E> {
     PendingStep::placed(
         step_names::CANCEL_WORKFLOW,
-        place(conn, "cancel a workflow"),
-        move |conn, placement| async move {
-            conn.cancel_all(
-                workflow_ids,
-                children,
-                placement.workflow_id(),
-                placement.step_writer(),
-            )
-            .await
-            .map_err(Error::lift)
+        place(db_conn, "cancel a workflow"),
+        move |db_conn, placement| async move {
+            db_conn
+                .cancel_all(
+                    workflow_ids,
+                    children,
+                    placement.workflow_id(),
+                    placement.step_writer(),
+                )
+                .await
+                .map_err(Error::lift)
         },
     )
 }
@@ -2271,45 +2294,49 @@ fn pending_cancel_all<'a, E: 'a>(
 /// `R` and `E` are the handle's; the call answers in the engine's channel, which the surfaces
 /// re-declare.
 fn pending_resume<'a, R: 'a, E: 'a>(
-    conn: Result<Arc<Connection>>,
+    db_conn: Result<Arc<DbConnection>>,
     workflow_id: &'a str,
     options: ResumeOptions<'a>,
 ) -> PendingStep<'a, WorkflowHandle<R, E>> {
     PendingStep::placed(
         step_names::RESUME_WORKFLOW,
-        place(conn, "resume a workflow"),
-        move |conn, placement| async move {
-            conn.resume_all(
-                &[workflow_id],
-                options,
-                placement.workflow_id(),
-                placement.step_writer(),
-            )
-            .await
-            .map_err(Error::lift)?
-            .pop()
-            .ok_or_else(|| Error::Config(format!("resuming `{workflow_id}` produced no handle")))
+        place(db_conn, "resume a workflow"),
+        move |db_conn, placement| async move {
+            db_conn
+                .resume_all(
+                    &[workflow_id],
+                    options,
+                    placement.workflow_id(),
+                    placement.step_writer(),
+                )
+                .await
+                .map_err(Error::lift)?
+                .pop()
+                .ok_or_else(|| {
+                    Error::Config(format!("resuming `{workflow_id}` produced no handle"))
+                })
         },
     )
 }
 
 fn pending_resume_all<'a, R: 'a, E: 'a>(
-    conn: Result<Arc<Connection>>,
+    db_conn: Result<Arc<DbConnection>>,
     workflow_ids: &'a [&'a str],
     options: ResumeOptions<'a>,
 ) -> PendingStep<'a, Vec<WorkflowHandle<R, E>>> {
     PendingStep::placed(
         step_names::RESUME_WORKFLOW,
-        place(conn, "resume a workflow"),
-        move |conn, placement| async move {
-            conn.resume_all(
-                workflow_ids,
-                options,
-                placement.workflow_id(),
-                placement.step_writer(),
-            )
-            .await
-            .map_err(Error::lift)
+        place(db_conn, "resume a workflow"),
+        move |db_conn, placement| async move {
+            db_conn
+                .resume_all(
+                    workflow_ids,
+                    options,
+                    placement.workflow_id(),
+                    placement.step_writer(),
+                )
+                .await
+                .map_err(Error::lift)
         },
     )
 }
@@ -2317,19 +2344,20 @@ fn pending_resume_all<'a, R: 'a, E: 'a>(
 /// The fork is checked whole before the id is taken, so a refused fork moves the workflow's
 /// counter no more than an unlaunched instance does.
 fn pending_fork<'a, R: 'a, E: 'a>(
-    conn: Result<Arc<Connection>>,
+    db_conn: Result<Arc<DbConnection>>,
     fork: Fork<'a>,
     options: ForkOptions<'a>,
 ) -> PendingStep<'a, WorkflowHandle<R, E>> {
-    let built = place_after(conn, FORK_OPERATION, || {
+    let built = place_after(db_conn, FORK_OPERATION, || {
         refuse_invalid_forks(std::slice::from_ref(&fork), &options)
     })
-    .map(|((conn, ()), placement)| (conn, placement));
+    .map(|((db_conn, ()), placement)| (db_conn, placement));
     PendingStep::placed(
         step_names::FORK_WORKFLOW,
         built,
-        move |conn, placement| async move {
-            conn.fork_one(fork.to_sys(), &options.to_sys(), placement.step_writer())
+        move |db_conn, placement| async move {
+            db_conn
+                .fork_one(fork.to_sys(), &options.to_sys(), placement.step_writer())
                 .await
                 .map_err(Error::lift)
         },
@@ -2337,20 +2365,21 @@ fn pending_fork<'a, R: 'a, E: 'a>(
 }
 
 fn pending_fork_all<'a, R: 'a, E: 'a>(
-    conn: Result<Arc<Connection>>,
+    db_conn: Result<Arc<DbConnection>>,
     forks: &'a [Fork<'a>],
     options: ForkOptions<'a>,
 ) -> PendingStep<'a, Vec<WorkflowHandle<R, E>>> {
-    let built = place_after(conn, FORK_OPERATION, || {
+    let built = place_after(db_conn, FORK_OPERATION, || {
         refuse_invalid_forks(forks, &options)
     })
-    .map(|((conn, ()), placement)| (conn, placement));
+    .map(|((db_conn, ()), placement)| (db_conn, placement));
     PendingStep::placed(
         step_names::FORK_WORKFLOW,
         built,
-        move |conn, placement| async move {
+        move |db_conn, placement| async move {
             let forks: Vec<SysFork<'_>> = forks.iter().map(|fork| fork.to_sys()).collect();
-            conn.fork_all(&forks, &options.to_sys(), placement.step_writer())
+            db_conn
+                .fork_all(&forks, &options.to_sys(), placement.step_writer())
                 .await
                 .map_err(Error::lift)
         },
@@ -2358,19 +2387,20 @@ fn pending_fork_all<'a, R: 'a, E: 'a>(
 }
 
 fn pending_rewind<'a, R: 'a, E: 'a>(
-    conn: Result<Arc<Connection>>,
+    db_conn: Result<Arc<DbConnection>>,
     workflow_id: &'a str,
     options: RewindOptions<'a>,
 ) -> PendingStep<'a, WorkflowHandle<R, E>> {
-    let built = place_after(conn, "rewind a workflow", || {
+    let built = place_after(db_conn, "rewind a workflow", || {
         refuse_invalid_rewind_options(&options)
     })
-    .map(|((conn, ()), placement)| (conn, placement));
+    .map(|((db_conn, ()), placement)| (db_conn, placement));
     PendingStep::placed(
         step_names::REWIND_WORKFLOW,
         built,
-        move |conn, placement| async move {
-            conn.rewind(workflow_id, options, placement.step_writer())
+        move |db_conn, placement| async move {
+            db_conn
+                .rewind(workflow_id, options, placement.step_writer())
                 .await
                 .map_err(Error::lift)
         },
@@ -2378,14 +2408,15 @@ fn pending_rewind<'a, R: 'a, E: 'a>(
 }
 
 fn pending_delete<'a, E: 'a>(
-    conn: Result<Arc<Connection>>,
+    db_conn: Result<Arc<DbConnection>>,
     workflow_id: &'a str,
 ) -> PendingStep<'a, (), E> {
     PendingStep::placed(
         step_names::DELETE_WORKFLOW,
-        place(conn, "delete a workflow"),
-        move |conn, placement| async move {
-            conn.delete_all(&[workflow_id], Children::Skip, placement.step_writer())
+        place(db_conn, "delete a workflow"),
+        move |db_conn, placement| async move {
+            db_conn
+                .delete_all(&[workflow_id], Children::Skip, placement.step_writer())
                 .await
                 .map_err(Error::lift)?;
             Ok(())
@@ -2394,15 +2425,16 @@ fn pending_delete<'a, E: 'a>(
 }
 
 fn pending_delete_all<'a, E: 'a>(
-    conn: Result<Arc<Connection>>,
+    db_conn: Result<Arc<DbConnection>>,
     workflow_ids: &'a [&'a str],
     children: Children,
 ) -> PendingStep<'a, u64, E> {
     PendingStep::placed(
         step_names::DELETE_WORKFLOW,
-        place(conn, "delete a workflow"),
-        move |conn, placement| async move {
-            conn.delete_all(workflow_ids, children, placement.step_writer())
+        place(db_conn, "delete a workflow"),
+        move |db_conn, placement| async move {
+            db_conn
+                .delete_all(workflow_ids, children, placement.step_writer())
                 .await
                 .map_err(Error::lift)
         },
@@ -2411,17 +2443,18 @@ fn pending_delete_all<'a, E: 'a>(
 
 /// A delay too long to store refuses the call without moving the workflow's step counter.
 fn pending_set_workflow_delay<'a, E: 'a>(
-    conn: Result<Arc<Connection>>,
+    db_conn: Result<Arc<DbConnection>>,
     workflow_id: &'a str,
     delay: WorkflowDelay,
 ) -> PendingStep<'a, (), E> {
-    let built = place_after(conn, DELAY_OPERATION, || refuse_unstorable_delay(delay))
-        .map(|((conn, ()), placement)| (conn, placement));
+    let built = place_after(db_conn, DELAY_OPERATION, || refuse_unstorable_delay(delay))
+        .map(|((db_conn, ()), placement)| (db_conn, placement));
     PendingStep::placed(
         step_names::SET_WORKFLOW_DELAY,
         built,
-        move |conn, placement| async move {
-            conn.set_workflow_delay(workflow_id, delay, placement.step_writer())
+        move |db_conn, placement| async move {
+            db_conn
+                .set_workflow_delay(workflow_id, delay, placement.step_writer())
                 .await
                 .map_err(Error::lift)
         },
@@ -2432,59 +2465,62 @@ fn pending_set_workflow_delay<'a, E: 'a>(
 /// attributes that cannot be encoded are a call that never happens, and a call that never happens
 /// must not move the workflow's counter.
 fn pending_update_workflow_attributes<'a, E: 'a>(
-    conn: Result<Arc<Connection>>,
+    db_conn: Result<Arc<DbConnection>>,
     workflow_id: &'a str,
     attributes: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> PendingStep<'a, (), E> {
     PendingStep::placed(
         step_names::UPDATE_WORKFLOW_ATTRIBUTES,
-        place_after(conn, "update a workflow's attributes", || {
+        place_after(db_conn, "update a workflow's attributes", || {
             crate::workflow::encode_attributes(attributes)
         }),
-        move |(conn, encoded), placement| async move {
-            conn.update_workflow_attributes(
-                workflow_id,
-                AttributeUpdate::Replace(encoded.as_deref()),
-                placement.step_writer(),
-            )
-            .await
-            .map_err(Error::lift)
+        move |(db_conn, encoded), placement| async move {
+            db_conn
+                .update_workflow_attributes(
+                    workflow_id,
+                    AttributeUpdate::Replace(encoded.as_deref()),
+                    placement.step_writer(),
+                )
+                .await
+                .map_err(Error::lift)
         },
     )
 }
 
 /// Encoded before the id is taken, as in [`pending_update_workflow_attributes`].
 fn pending_merge_workflow_attributes<'a, E: 'a>(
-    conn: Result<Arc<Connection>>,
+    db_conn: Result<Arc<DbConnection>>,
     workflow_id: &'a str,
     attributes: &serde_json::Map<String, serde_json::Value>,
 ) -> PendingStep<'a, (), E> {
     PendingStep::placed(
         step_names::UPDATE_WORKFLOW_ATTRIBUTES,
-        place_after(conn, "merge a workflow's attributes", || {
+        place_after(db_conn, "merge a workflow's attributes", || {
             crate::workflow::encode_attribute_map(attributes)
         }),
-        move |(conn, encoded), placement| async move {
-            conn.update_workflow_attributes(
-                workflow_id,
-                AttributeUpdate::Merge(&encoded),
-                placement.step_writer(),
-            )
-            .await
-            .map_err(Error::lift)
+        move |(db_conn, encoded), placement| async move {
+            db_conn
+                .update_workflow_attributes(
+                    workflow_id,
+                    AttributeUpdate::Merge(&encoded),
+                    placement.step_writer(),
+                )
+                .await
+                .map_err(Error::lift)
         },
     )
 }
 
 fn pending_list_workflows<'a, E: 'a>(
-    conn: Result<Arc<Connection>>,
+    db_conn: Result<Arc<DbConnection>>,
     filter: &'a WorkflowFilter<'a>,
 ) -> PendingStep<'a, Vec<WorkflowRecord>, E> {
     PendingStep::placed(
         step_names::LIST_WORKFLOWS,
-        place(conn, "list workflows"),
-        move |conn, placement| async move {
-            conn.list_workflows(filter, placement.step_writer())
+        place(db_conn, "list workflows"),
+        move |db_conn, placement| async move {
+            db_conn
+                .list_workflows(filter, placement.step_writer())
                 .await
                 .map_err(Error::lift)
         },
@@ -2492,15 +2528,16 @@ fn pending_list_workflows<'a, E: 'a>(
 }
 
 fn pending_list_workflow_steps<'a, E: 'a>(
-    conn: Result<Arc<Connection>>,
+    db_conn: Result<Arc<DbConnection>>,
     workflow_id: &'a str,
     options: ListWorkflowStepsOptions,
 ) -> PendingStep<'a, Vec<StepRecord>, E> {
     PendingStep::placed(
         step_names::LIST_WORKFLOW_STEPS,
-        place(conn, "list a workflow's steps"),
-        move |conn, placement| async move {
-            conn.list_workflow_steps(workflow_id, options, placement.step_writer())
+        place(db_conn, "list a workflow's steps"),
+        move |db_conn, placement| async move {
+            db_conn
+                .list_workflow_steps(workflow_id, options, placement.step_writer())
                 .await
                 .map_err(Error::lift)
         },

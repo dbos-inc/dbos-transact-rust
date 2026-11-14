@@ -12,7 +12,7 @@
 //! take what they use rather than a whole executor, so a client calls them with no executor in
 //! sight.
 //!
-//! # `Connection`, not `Database`
+//! # `DbConnection`, not `Database`
 //!
 //! [`SystemDatabase`] is already a type here — the trait a backend implements, which exists so a
 //! second one can be dropped in without its callers changing. A second name a word away from it
@@ -31,7 +31,7 @@
 //!
 //! It is also what keeps [`WorkflowHandle`](crate::WorkflowHandle) one type. A handle needs the
 //! connection, the serializer and the poll interval, and none of the executing half — so it holds
-//! an `Arc<Connection>`, and a handle from a client and a handle from a running application are the
+//! an `Arc<DbConnection>`, and a handle from a client and a handle from a running application are the
 //! same thing rather than two types a caller has to tell apart.
 
 use std::time::Duration;
@@ -44,7 +44,7 @@ use crate::sysdb::{SystemDatabase, postgres};
 use crate::{ClientConfig, Error, Result};
 
 /// A connection to the system database, and the settings every call through it carries.
-pub(crate) struct Connection {
+pub(crate) struct DbConnection {
     sysdb: Box<dyn SystemDatabase>,
     serializer: Serializer,
     app_name: Option<String>,
@@ -73,7 +73,7 @@ pub(crate) enum Owner {
     Client,
 }
 
-impl Connection {
+impl DbConnection {
     /// Connects for an application, migrating unless it was told not to.
     ///
     /// The executor's half of the connect: it takes an id, because an application's every
@@ -232,13 +232,13 @@ impl Connection {
     }
 }
 
-impl std::fmt::Debug for Connection {
+impl std::fmt::Debug for DbConnection {
     /// Hand-written because a `dyn SystemDatabase` is not `Debug` and should not become so: the
     /// trait exists to keep a driver type out of the engine, and a `Debug` bound would put one back
     /// in through the derive. The connection URL is deliberately not among the fields — see
     /// [`DBOS`](crate::DBOS)'s own `Debug`.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Connection")
+        f.debug_struct("DbConnection")
             .field("app_name", &self.app_name)
             .field("serializer", &self.serializer)
             .finish_non_exhaustive()
