@@ -370,7 +370,7 @@ impl Default for Settings<'_> {
 }
 
 /// How to reach and set up the system database.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Config<'a> {
     /// Connection URL for the system database.
     pub url: &'a str,
@@ -401,6 +401,28 @@ pub struct Config<'a> {
     pub migrate: bool,
     /// How the resulting handle behaves.
     pub settings: Settings<'a>,
+}
+
+/// Hand-written rather than derived, so that the URL's passwords are never printed.
+impl std::fmt::Debug for Config<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            url,
+            max_connections,
+            use_listen_notify,
+            idle_transaction_timeout,
+            migrate,
+            settings,
+        } = self;
+        f.debug_struct("Config")
+            .field("url", &crate::sysdb::masked_url(url))
+            .field("max_connections", max_connections)
+            .field("use_listen_notify", use_listen_notify)
+            .field("idle_transaction_timeout", idle_transaction_timeout)
+            .field("migrate", migrate)
+            .field("settings", settings)
+            .finish()
+    }
 }
 
 impl<'a> Config<'a> {

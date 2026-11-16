@@ -85,6 +85,8 @@ serde_json = { version = "1", features = ["raw_value"] }
 # wire format — a step is replayed by the SDK that wrote it — so the derived shape is ours to
 # choose.
 serde = { version = "1", features = ["derive"] }
+# Parsing a database URL to print it with its passwords masked. Already in the tree through `sqlx`.
+url = "2"
 # `sync` for the semaphore capping concurrent polling reads, and the primitives `rt` builds a
 # task handle from. `rt` arrives with the `engine` feature, for `task_local!`, and `time` with
 # `runtime-tokio`: a build on another runtime leaves it out, so a stray `tokio::time` call fails to
