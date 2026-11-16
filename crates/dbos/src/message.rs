@@ -33,15 +33,14 @@
 //! order to send a message would have made that the documented way to write one.
 //!
 //! **Every send in the crate is here, and they meet at one place per surface.**
-//! `DbConnection::send_encoded` and `DbConnection::send_all_encoded` are the shared paths — each takes
-//! the payloads its caller encoded, names the encoding, and hands `sysdb` the matching call — so
-//! the surfaces above them differ only in what they can say before they reach one: which ambient
+//! `DbConnection::send_encoded` and `DbConnection::send_all_encoded` are the shared paths — each
+//! takes the payloads its caller encoded, names the encoding, and hands `sysdb` the matching call —
+//! so the surfaces above them differ only in what they can say before they reach one: which ambient
 //! context to read, whether the send is checkpointed, and whether a handle's executor has to be
-//! reconciled with it.
-//! That is [`event`](crate::event)'s shape too, where `DbConnection::get_event` is the one read under
-//! three callers. The single send and the batch stay separate all the way down, because which one
-//! is called is what chooses the recorded step name — `sysdb` takes it from the method rather than
-//! deriving it from a count.
+//! reconciled with it. That is [`event`](crate::event)'s shape too, where `DbConnection::get_event`
+//! is the one read under three callers. The single send and the batch stay separate all the way
+//! down, because which one is called is what chooses the recorded step name — `sysdb` takes it from
+//! the method rather than deriving it from a count.
 //!
 //! **What is sent, and how the call behaves, are two different things.** The plain forms read
 //! `send(destination_id, message)` and `send_bulk(messages)`. The `_with` forms take a

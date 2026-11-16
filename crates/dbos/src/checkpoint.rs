@@ -525,7 +525,8 @@ pub(crate) enum StepPlacement {
 }
 
 impl StepPlacement {
-    /// Where a call reached through `db_conn` stands, allocating the step id if it is to be recorded.
+    /// Where a call reached through `db_conn` stands, allocating the step id if it is to be
+    /// recorded.
     ///
     /// **Allocating is the point, and it happens here rather than at the write**: the position of
     /// this call in the workflow has to be the same on the replay as it was on the run, so the id

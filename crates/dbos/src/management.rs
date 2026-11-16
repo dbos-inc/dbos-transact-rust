@@ -943,8 +943,8 @@ impl DBOS {
     ///
     /// The schedule surface places through this. The management methods below do not: each shares
     /// its body with a free form that has no `self`, so they hand that body a connection through
-    /// [`connection`](Self::connection) and the body places for itself, the same way, after the
-    /// argument checks that must refuse before an id is spent.
+    /// [`db_connection`](Self::db_connection) and the body places for itself, the same way, after
+    /// the argument checks that must refuse before an id is spent.
     pub(crate) fn placed(&self, operation: &'static str) -> Result<(Arc<Executor>, StepPlacement)> {
         StepPlacement::taken(self.executor(operation), operation)
     }
@@ -2211,11 +2211,11 @@ impl DbConnection {
 //
 // Each `pending_*` below is the whole of an operation as a step: its recorded name, the argument
 // checks that must refuse before an id is spent, the placement, and the run. The method on `DBOS`
-// and the free function are each one line over it, and differ only in what they hand it as `db_conn`
-// — the handle's executor's connection, refused as `NotLaunched` before launch, or the ambient
-// workflow's, refused as `NotInWorkflow` outside one — and in the error channel they ask for. That
-// is what makes a workflow that switches from one to the other replay the history it recorded:
-// there is no second copy of the step name or of the order of refusals to drift.
+// and the free function are each one expression over it, and differ only in what they hand it as
+// `db_conn` — the handle's executor's connection, refused as `NotLaunched` before launch, or the
+// ambient workflow's, refused as `NotInWorkflow` outside one — and in the error channel they ask
+// for. That is what makes a workflow that switches from one to the other replay the history it
+// recorded: there is no second copy of the step name or of the order of refusals to drift.
 //
 // The ambient connection is the context's own, so `StepPlacement::of` never sees two instances
 // there and `WrongInstance` is the method's alone; the `operation` passed to it names the call for

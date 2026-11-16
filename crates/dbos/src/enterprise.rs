@@ -125,8 +125,8 @@ impl std::fmt::Debug for ConductorOptions {
 
 /// The running executor, as the Conductor client sees it.
 ///
-/// Holds the executor's database connection, not the executor: the executor owns the client, so that would
-/// be a cycle.
+/// Holds the executor's database connection, not the executor: the executor owns the client, so
+/// that would be a cycle.
 pub struct ConductorEngine {
     db_conn: Arc<DbConnection>,
     executor_id: String,

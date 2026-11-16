@@ -31,8 +31,8 @@
 //!
 //! It is also what keeps [`WorkflowHandle`](crate::WorkflowHandle) one type. A handle needs the
 //! connection, the serializer and the poll interval, and none of the executing half — so it holds
-//! an `Arc<DbConnection>`, and a handle from a client and a handle from a running application are the
-//! same thing rather than two types a caller has to tell apart.
+//! an `Arc<DbConnection>`, and a handle from a client and a handle from a running application are
+//! the same thing rather than two types a caller has to tell apart.
 
 use std::time::Duration;
 

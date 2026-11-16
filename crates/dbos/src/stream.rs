@@ -188,8 +188,9 @@ where
         name,
         built,
         move |(db_conn, encoded), placement| async move {
-            // A step id of the workflow's own when written from its body; the enclosing step's id when
-            // written from inside one, where the write records nothing and the column is all it gets.
+            // A step id of the workflow's own when written from its body; the enclosing step's id
+            // when written from inside one, where the write records nothing and the column is all
+            // it gets.
             let (workflow_id, step_id, owner_xid, written_by) = match &placement {
                 StepPlacement::Recorded { ctx, step_id } => (
                     ctx.workflow_id(),

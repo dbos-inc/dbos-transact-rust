@@ -327,10 +327,11 @@ impl DbConnection {
     /// On the connection because a read is all it is: the free [`get_event`] reaches it through the
     /// ambient context's, [`DBOS::get_event`] through its executor's, and
     /// [`Client::get_event`](crate::Client::get_event) through the only one it has. Named as they
-    /// are, which is what this crate's other shared internals do — `DbConnection::register_queue`,
-    /// `queue`, `list_queues`, `update_queue`, `delete_queue` all carry their surface's name. What
-    /// each surface adds is the *caller*: which ambient context to read, whether the read is
-    /// checkpointed, and whether a handle's executor has to be reconciled with it.
+    /// are, which is what this crate's other shared internals do —
+    /// `DbConnection::register_queue`, `queue`, `list_queues`, `update_queue`, `delete_queue` all
+    /// carry their surface's name. What each surface adds is the *caller*: which ambient context to
+    /// read, whether the read is checkpointed, and whether a handle's executor has to be reconciled
+    /// with it.
     pub(crate) async fn get_event<T: DeserializeOwned, E>(
         &self,
         workflow_id: &str,
