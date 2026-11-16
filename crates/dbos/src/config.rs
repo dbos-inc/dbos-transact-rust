@@ -22,7 +22,7 @@ pub const SYSTEM_DATABASE_URL_ENV: &str = "DBOS_SYSTEM_DATABASE_URL";
 /// from other crates entirely, functional update included, which is exactly the form above. Adding
 /// a field stays source-compatible for every caller who wrote `..Config::new(..)`, so the
 /// convention is documented rather than enforced.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Config {
     /// Names this application among those sharing the system database.
     ///
@@ -141,6 +141,82 @@ pub struct Config {
     /// once a second whatever this says, so a schedule created at startup starts promptly. Zero is
     /// rejected: it would re-read the table continuously.
     pub scheduler_polling_interval: Option<Duration>,
+
+    /// The key to connect to DBOS Conductor with, or `None` not to connect.
+    ///
+    /// With a key, each launch runs under a fresh UUID executor id, replacing a configured one with
+    /// a warning, and leaves recovery to Conductor. A blank key is no key. Not read on DBOS Cloud,
+    /// which supplies its own Conductor settings.
+    pub conductor_key: Option<String>,
+
+    /// Conductor's websocket URL. `None` is the hosted Conductor,
+    /// `wss://cloud.dbos.dev/conductor/v1alpha1`, on `DBOS_DOMAIN` if that is set. A blank URL is
+    /// no URL.
+    pub conductor_url: Option<String>,
+
+    /// What this executor reports about itself to Conductor, shown beside it in the Console.
+    pub conductor_executor_metadata: Option<serde_json::Map<String, serde_json::Value>>,
+
+    /// Whether Conductor is sent workflow metadata only: no inputs, outputs, events, messages,
+    /// stream values or error messages.
+    pub conductor_metadata_only_mode: bool,
+
+    /// The enterprise crate, as `Some(dbos_enterprise::enterprise())`. Launch fails without it
+    /// when Conductor is configured.
+    pub enterprise: Option<crate::Enterprise>,
+}
+
+/// Hand-written so that no password or Conductor key is printed.
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            app_name,
+            database_url,
+            max_connections,
+            schema,
+            executor_id,
+            app_version,
+            serializer,
+            use_listen_notify,
+            migrate,
+            polling_concurrency,
+            outcome_poll_interval,
+            listen_queues,
+            notification_coalesce,
+            idle_transaction_timeout,
+            scheduler_polling_interval,
+            conductor_key,
+            conductor_url,
+            conductor_executor_metadata,
+            conductor_metadata_only_mode,
+            enterprise,
+        } = self;
+        f.debug_struct("Config")
+            .field("app_name", app_name)
+            .field("database_url", &crate::sysdb::masked_url(database_url))
+            .field("max_connections", max_connections)
+            .field("schema", schema)
+            .field("executor_id", executor_id)
+            .field("app_version", app_version)
+            .field("serializer", serializer)
+            .field("use_listen_notify", use_listen_notify)
+            .field("migrate", migrate)
+            .field("polling_concurrency", polling_concurrency)
+            .field("outcome_poll_interval", outcome_poll_interval)
+            .field("listen_queues", listen_queues)
+            .field("notification_coalesce", notification_coalesce)
+            .field("idle_transaction_timeout", idle_transaction_timeout)
+            .field("scheduler_polling_interval", scheduler_polling_interval)
+            .field(
+                "conductor_key",
+                &crate::identity::redacted(conductor_key.as_deref()),
+            )
+            .field("conductor_url", conductor_url)
+            .field("conductor_executor_metadata", conductor_executor_metadata)
+            .field("conductor_metadata_only_mode", conductor_metadata_only_mode)
+            .field("enterprise", enterprise)
+            .finish()
+    }
 }
 
 impl Config {
@@ -166,6 +242,11 @@ impl Config {
             notification_coalesce: None,
             idle_transaction_timeout: crate::IdleTransactionTimeout::Default,
             scheduler_polling_interval: None,
+            conductor_key: None,
+            conductor_url: None,
+            conductor_executor_metadata: None,
+            conductor_metadata_only_mode: false,
+            enterprise: None,
         }
     }
 
@@ -309,6 +390,19 @@ mod tests {
                 "{err}"
             );
         }
+    }
+
+    #[test]
+    fn debug_masks_the_database_password_and_hides_the_conductor_key() {
+        let config = Config {
+            conductor_key: Some("conductor-secret".to_owned()),
+            ..Config::new("app", "postgres://user:db-secret@host/db")
+        };
+        let printed = format!("{config:?}");
+        assert!(!printed.contains("db-secret"), "{printed}");
+        assert!(!printed.contains("conductor-secret"), "{printed}");
+        // Where the connection goes is kept: it is what a log reader needs.
+        assert!(printed.contains("postgres://user:***@host/db"), "{printed}");
     }
 
     #[test]

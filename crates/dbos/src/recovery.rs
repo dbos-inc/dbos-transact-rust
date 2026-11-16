@@ -26,17 +26,18 @@
 use crate::error::{Error, Result};
 use crate::sysdb::{INTERNAL_QUEUE, SystemDatabase};
 
-/// Returns this executor's abandoned workflows to their queues.
+/// Returns the abandoned workflows of `executor_ids` on `app_version` to their queues.
 ///
-/// Called by [`Executor::start`](crate::instance::Executor) before `launch` returns, and reports what
-/// moved rather than handles: this process may run none of them.
+/// Called by [`Executor::start`](crate::instance::Executor) for its own id, and by the Conductor
+/// client for the executors Conductor names. Returns ids, not handles: this process may run none
+/// of them.
 pub(crate) async fn reenqueue(
     sysdb: &dyn SystemDatabase,
-    executor_id: &str,
+    executor_ids: &[&str],
     app_version: &str,
 ) -> Result<Vec<String>> {
     let recovered = sysdb
-        .reenqueue_for_recovery(&[executor_id], app_version, INTERNAL_QUEUE)
+        .reenqueue_for_recovery(executor_ids, app_version, INTERNAL_QUEUE)
         .await
         .map_err(Error::SystemDatabase)?;
     if recovered.is_empty() {
