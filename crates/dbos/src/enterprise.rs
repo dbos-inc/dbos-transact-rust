@@ -11,7 +11,7 @@
 use std::sync::Arc;
 
 use crate::config::Config;
-use crate::connection::Connection;
+use crate::db_connection::DbConnection;
 use crate::identity::ConductorTarget;
 use crate::sysdb::SystemDatabase;
 use crate::{Error, Result};
@@ -125,10 +125,10 @@ impl std::fmt::Debug for ConductorOptions {
 
 /// The running executor, as the Conductor client sees it.
 ///
-/// Holds the executor's connection, not the executor: the executor owns the client, so that would
-/// be a cycle.
+/// Holds the executor's database connection, not the executor: the executor owns the client, so
+/// that would be a cycle.
 pub struct ConductorEngine {
-    conn: Arc<Connection>,
+    db_conn: Arc<DbConnection>,
     executor_id: String,
     app_name: String,
     app_version: String,
@@ -136,13 +136,13 @@ pub struct ConductorEngine {
 
 impl ConductorEngine {
     pub(crate) fn new(
-        conn: &Arc<Connection>,
+        db_conn: &Arc<DbConnection>,
         executor_id: &str,
         app_name: &str,
         app_version: &str,
     ) -> Self {
         Self {
-            conn: Arc::clone(conn),
+            db_conn: Arc::clone(db_conn),
             executor_id: executor_id.to_owned(),
             app_name: app_name.to_owned(),
             app_version: app_version.to_owned(),
@@ -151,7 +151,7 @@ impl ConductorEngine {
 
     /// The executor's system database.
     pub fn sysdb(&self) -> &dyn SystemDatabase {
-        self.conn.sysdb()
+        self.db_conn.sysdb()
     }
 
     /// This executor's id, as Conductor knows it.
@@ -181,7 +181,7 @@ impl ConductorEngine {
     /// to a queue, so naming a running executor, this one included, hands work it is still running
     /// to another runner.
     pub async fn recover(&self, executor_ids: &[&str]) -> Result<Vec<String>> {
-        crate::recovery::reenqueue(self.conn.sysdb(), executor_ids, &self.app_version).await
+        crate::recovery::reenqueue(self.db_conn.sysdb(), executor_ids, &self.app_version).await
     }
 }
 

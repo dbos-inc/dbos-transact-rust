@@ -457,13 +457,13 @@ where
         )?;
         refuse_durations(period, self.debounce_timeout)?;
         refuse_app_name(DEBOUNCE_OPERATION, self.app_name)?;
-        let bounce = StepPlacement::of(executor.connection(), DEBOUNCE_OPERATION)?;
+        let bounce = StepPlacement::of(executor.db_connection(), DEBOUNCE_OPERATION)?;
         if matches!(bounce, StepPlacement::InsideStep { .. }) {
             return Err(Error::InsideStep {
                 operation: "debouncing a workflow".into(),
             });
         }
-        let start = StepPlacement::of(executor.connection(), DEBOUNCE_OPERATION)?;
+        let start = StepPlacement::of(executor.db_connection(), DEBOUNCE_OPERATION)?;
         Ok((executor, bounce, start))
     }
 
@@ -479,7 +479,7 @@ where
         input: P,
         call: DebounceOptions<'_>,
     ) -> Result<WorkflowHandle<R, E>> {
-        let conn = executor.connection();
+        let db_conn = executor.db_connection();
         let name: &QualifiedWorkflowName = self.workflow.qualified_name();
         let queue = self.queue_request();
         // The registration's encoding unless the queue asks for its own, as a start's is. A bounce
@@ -506,11 +506,11 @@ where
         let timeout = self.timeout.map_or(Timeout::None, Timeout::Explicit);
 
         loop {
-            let outcome = conn
+            let outcome = db_conn
                 .sysdb()
                 .debounce_delayed_workflow(
                     &bounce.request(),
-                    conn.step_caller(bounce_at.step_writer()),
+                    db_conn.step_caller(bounce_at.step_writer()),
                 )
                 .await
                 .map_err(|error| Error::refused_argument(DEBOUNCE_OPERATION, error))?;
@@ -518,7 +518,11 @@ where
             match bounce.action(outcome) {
                 // The bounce matched the row, so a later absence is a deletion.
                 BounceAction::Coalesce(workflow_id) => {
-                    return Ok(WorkflowHandle::polling(Arc::clone(conn), workflow_id, true));
+                    return Ok(WorkflowHandle::polling(
+                        Arc::clone(db_conn),
+                        workflow_id,
+                        true,
+                    ));
                 }
                 BounceAction::Refuse(holder) => return Err(bounce.deduplicated(holder)),
                 BounceAction::Retry => crate::rt::sleep(RETRY_PAUSE).await,
@@ -563,8 +567,8 @@ where
             }
 
             // A further attempt, which takes ids of its own where it runs.
-            bounce_at = StepPlacement::of(conn, DEBOUNCE_OPERATION)?;
-            start = StepPlacement::of(conn, DEBOUNCE_OPERATION)?;
+            bounce_at = StepPlacement::of(db_conn, DEBOUNCE_OPERATION)?;
+            start = StepPlacement::of(db_conn, DEBOUNCE_OPERATION)?;
         }
     }
 
@@ -749,8 +753,9 @@ impl<'a> DebouncerClient<'a> {
         options.validate(&self.workflow)?;
         refuse_durations(period, self.debounce_timeout)?;
 
-        let conn = self.client.connection();
-        let encoding = PayloadEncoding::resolve(self.serialization, conn.serializer().encoding());
+        let db_conn = self.client.db_connection();
+        let encoding =
+            PayloadEncoding::resolve(self.serialization, db_conn.serializer().encoding());
         let bounce = Bounce {
             workflow: &self.workflow,
             queue_name: self.queue,
@@ -758,10 +763,10 @@ impl<'a> DebouncerClient<'a> {
             period,
             input: encode_input(&input, &encoding)?,
             encoding,
-            target_app: self.app_name.or(conn.app_name()),
+            target_app: self.app_name.or(db_conn.app_name()),
         };
         loop {
-            let outcome = conn
+            let outcome = db_conn
                 .sysdb()
                 .debounce_delayed_workflow(&bounce.request(), None)
                 .await
@@ -769,7 +774,11 @@ impl<'a> DebouncerClient<'a> {
 
             match bounce.action(outcome) {
                 BounceAction::Coalesce(workflow_id) => {
-                    return Ok(WorkflowHandle::polling(Arc::clone(conn), workflow_id, true));
+                    return Ok(WorkflowHandle::polling(
+                        Arc::clone(db_conn),
+                        workflow_id,
+                        true,
+                    ));
                 }
                 BounceAction::Refuse(holder) => return Err(bounce.deduplicated(holder)),
                 BounceAction::Retry => crate::rt::sleep(RETRY_PAUSE).await,

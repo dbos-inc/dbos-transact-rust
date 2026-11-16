@@ -6,14 +6,14 @@
 //! its timestamp past every other's, so promoting an older one is a rollback. Both an application
 //! and a [`Client`] can read the registry and promote a version.
 
-use crate::connection::Connection;
+use crate::db_connection::DbConnection;
 use crate::error::{Error, Result};
 use crate::sysdb::types::VersionInfo;
 use crate::{Client, DBOS};
 
 /// What both surfaces do, against the connection each holds. An application's connection carries
 /// its name, so its reads and promotions are scoped as a client's named for it would be.
-impl Connection {
+impl DbConnection {
     pub(crate) async fn list_app_versions(&self) -> Result<Vec<VersionInfo>> {
         self.sysdb()
             .list_application_versions()
@@ -55,7 +55,7 @@ impl Client {
     /// the listing, and nothing here reads them, which is why a tool that has to see every
     /// application leaves [`app_name`](crate::ClientConfig::app_name) unset.
     pub async fn list_app_versions(&self) -> Result<Vec<VersionInfo>> {
-        self.connection().list_app_versions().await
+        self.db_connection().list_app_versions().await
     }
 
     /// The version a rolling deploy currently prefers, or `None` if none is registered.
@@ -63,7 +63,7 @@ impl Client {
     /// Scoped to this client's application, or across all of them when it is nameless. Latest by
     /// its registered timestamp rather than by creation, which is how a rollback is expressed.
     pub async fn latest_app_version(&self) -> Result<Option<VersionInfo>> {
-        self.connection().latest_app_version().await
+        self.db_connection().latest_app_version().await
     }
 
     /// Promotes an already-registered version to be the latest, by moving its timestamp to now on
@@ -97,7 +97,7 @@ impl Client {
     /// # Ok(()) }
     /// ```
     pub async fn set_latest_app_version(&self, version_name: &str) -> Result<()> {
-        self.connection()
+        self.db_connection()
             .set_latest_app_version(version_name, None)
             .await
     }
@@ -127,7 +127,7 @@ impl Client {
         version_name: &str,
         app_name: &str,
     ) -> Result<()> {
-        self.connection()
+        self.db_connection()
             .set_latest_app_version(version_name, Some(app_name))
             .await
     }
@@ -139,7 +139,7 @@ impl DBOS {
     /// this application.
     pub async fn list_app_versions(&self) -> Result<Vec<VersionInfo>> {
         self.executor("list application versions")?
-            .connection()
+            .db_connection()
             .list_app_versions()
             .await
     }
@@ -149,7 +149,7 @@ impl DBOS {
     /// expressed. Not necessarily [`app_version`](Self::app_version), this executor's own.
     pub async fn latest_app_version(&self) -> Result<Option<VersionInfo>> {
         self.executor("read the latest application version")?
-            .connection()
+            .db_connection()
             .latest_app_version()
             .await
     }
@@ -170,7 +170,7 @@ impl DBOS {
     /// ```
     pub async fn set_latest_app_version(&self, version_name: &str) -> Result<()> {
         self.executor("set the latest application version")?
-            .connection()
+            .db_connection()
             .set_latest_app_version(version_name, None)
             .await
     }
@@ -184,7 +184,7 @@ impl DBOS {
         app_name: &str,
     ) -> Result<()> {
         self.executor("set the latest application version")?
-            .connection()
+            .db_connection()
             .set_latest_app_version(version_name, Some(app_name))
             .await
     }

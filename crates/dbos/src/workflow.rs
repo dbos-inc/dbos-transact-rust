@@ -12,8 +12,8 @@ use serde::de::DeserializeOwned;
 use tracing::Instrument;
 
 use crate::checkpoint::{PendingStep, StepPlacement};
-use crate::connection::Connection;
 use crate::context::Ctx;
+use crate::db_connection::DbConnection;
 use crate::error::{DurableError, EncodedError, Error, Failure, Result, refusal_detail};
 use crate::handle::{ChildResultPlacement, WorkflowHandle};
 use crate::instance::Executor;
@@ -874,14 +874,18 @@ pub(crate) enum Submitted {
 /// answer and not in how they get it: [`create`] has a parent's launch to record and may have a
 /// body to spawn, a client has neither.
 pub(crate) async fn init_or_join(
-    conn: &Connection,
+    db_conn: &DbConnection,
     new: &NewWorkflow<'_>,
     policy: DuplicationPolicy,
     reuse_policy: WorkflowIdReusePolicy,
     caller: Option<InitWorkflowCaller<'_>>,
 ) -> Result<Submitted> {
     loop {
-        match conn.sysdb().init_workflow(new, caller, reuse_policy).await {
+        match db_conn
+            .sysdb()
+            .init_workflow(new, caller, reuse_policy)
+            .await
+        {
             Ok(initialized) => return Ok(Submitted::Created(initialized)),
             // **A key another workflow holds, and a caller who asked to join it.** The insert lost
             // on the partial unique index over `(queue_name, deduplication_id)`; the holder's id is
@@ -892,7 +896,7 @@ pub(crate) async fn init_or_join(
                 deduplication_id,
                 ..
             }) if policy == DuplicationPolicy::ReturnExisting => {
-                match conn
+                match db_conn
                     .sysdb()
                     .get_deduplication_key_holder(&queue_name, &deduplication_id)
                     .await
@@ -1055,7 +1059,7 @@ where
         let awaiting = built
             .as_ref()
             .ok()
-            .map(|(executor, _)| ChildResultPlacement::of(executor.connection()));
+            .map(|(executor, _)| ChildResultPlacement::of(executor.db_connection()));
         // The start's placement stands for both halves, which is sound because the two differ
         // only in the id they hold: `check_here` decides on the execution and the step marker,
         // and the await was placed in the same context an instant later. Holding the start's is
@@ -1124,7 +1128,7 @@ where
             options.workflow_id,
             options.workflow_id_reuse_policy,
         )?;
-        let placement = StepPlacement::of(executor.connection(), "starting a workflow")?;
+        let placement = StepPlacement::of(executor.db_connection(), "starting a workflow")?;
         if matches!(placement, StepPlacement::InsideStep { .. }) {
             return Err(Error::InsideStep {
                 operation: "starting a workflow".into(),
@@ -1462,7 +1466,7 @@ pub(crate) async fn create<R, E>(
         // run that made it, and was never in front of this one. So an absent row is left as
         // "not yet", the same answer an id from outside the process gets.
         return Ok(WorkflowHandle::polling(
-            Arc::clone(executor.connection()),
+            Arc::clone(executor.db_connection()),
             child,
             false,
         ));
@@ -1528,7 +1532,7 @@ pub(crate) async fn create<R, E>(
     };
 
     let initialized = match init_or_join(
-        executor.connection(),
+        executor.db_connection(),
         &new,
         enqueue.map_or(DuplicationPolicy::Reject, |enqueue| {
             enqueue.duplication_policy
@@ -1588,7 +1592,7 @@ pub(crate) async fn create<R, E>(
             // The holder's row was just read to find it, so a missing one from here is a
             // deletion rather than a row still to come.
             return Ok(WorkflowHandle::polling(
-                Arc::clone(executor.connection()),
+                Arc::clone(executor.db_connection()),
                 holder,
                 true,
             ));
@@ -1611,7 +1615,7 @@ pub(crate) async fn create<R, E>(
         // This call wrote the row, so the handle it hands back can say what an id from
         // outside cannot: a row that goes missing was deleted.
         return Ok(WorkflowHandle::polling(
-            Arc::clone(executor.connection()),
+            Arc::clone(executor.db_connection()),
             workflow_id,
             true,
         ));
@@ -1627,7 +1631,7 @@ pub(crate) async fn create<R, E>(
         // Park-and-adopt, one frame out from the one in `execute`: `init_workflow` just read this
         // row, so a row that goes missing afterwards was deleted.
         return Ok(WorkflowHandle::polling(
-            Arc::clone(executor.connection()),
+            Arc::clone(executor.db_connection()),
             workflow_id,
             true,
         ));
@@ -1651,7 +1655,7 @@ pub(crate) async fn create<R, E>(
         None,
     );
     Ok(WorkflowHandle::local(
-        Arc::clone(executor.connection()),
+        Arc::clone(executor.db_connection()),
         workflow_id,
         task,
     ))
@@ -2326,7 +2330,7 @@ async fn time_out(
         }
     }
     // This execution read the row to run it, so an absence now is a delete, not a race.
-    executor.connection().adopt(workflow_id, true).await
+    executor.db_connection().adopt(workflow_id, true).await
 }
 
 /// Runs the body with a context ambient and records what it did.
@@ -2484,10 +2488,10 @@ async fn adopt_superseded(
     drop(slot);
     // Park-and-adopt: this execution has read the row, whether it created it, recovered it or
     // dequeued it, so a missing one has been deleted.
-    executor.connection().adopt(workflow_id, true).await
+    executor.db_connection().adopt(workflow_id, true).await
 }
 
-impl Connection {
+impl DbConnection {
     /// Reads back the outcome of a workflow this caller does not own.
     ///
     /// On the connection rather than on an executor because that is all it needs — a row read and

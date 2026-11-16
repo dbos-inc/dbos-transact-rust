@@ -19,7 +19,7 @@ use std::borrow::Cow;
 use std::result::Result as StdResult;
 use std::time::Duration;
 
-use crate::connection::Connection;
+use crate::db_connection::DbConnection;
 use crate::error::{Error, Result};
 use crate::instance::DBOS;
 use crate::sysdb::types::{
@@ -572,7 +572,7 @@ impl DBOS {
     ) -> Result<Queue> {
         let executor = self.executor("register a queue")?;
         executor
-            .connection()
+            .db_connection()
             .register_queue(name, options, on_conflict, Some(executor.app_version()))
             .await
     }
@@ -583,7 +583,7 @@ impl DBOS {
     /// changes a peer made since this process registered it.
     pub async fn queue(&self, name: &str) -> Result<Option<Queue>> {
         self.executor("read a queue")?
-            .connection()
+            .db_connection()
             .queue(name)
             .await
     }
@@ -597,7 +597,7 @@ impl DBOS {
     /// queue anybody registered.
     pub async fn list_queues(&self) -> Result<Vec<Queue>> {
         self.executor("list queues")?
-            .connection()
+            .db_connection()
             .list_queues()
             .await
     }
@@ -619,7 +619,7 @@ impl DBOS {
     /// validates against what it actually wrote.
     pub async fn update_queue(&self, name: &str, change: QueueChange) -> Result<Queue> {
         self.executor("update a queue")?
-            .connection()
+            .db_connection()
             .update_queue(name, change)
             .await
     }
@@ -634,13 +634,13 @@ impl DBOS {
     /// again. That is why deleting is not how you pause a queue.
     pub async fn delete_queue(&self, name: &str) -> Result<()> {
         self.executor("delete a queue")?
-            .connection()
+            .db_connection()
             .delete_queue(name)
             .await
     }
 }
 
-// The five operations below are methods on `Connection` rather than on a `DBOS` instance, because
+// The five operations below are methods on `DbConnection` rather than on a `DBOS` instance, because
 // a queue is a row and both handles that can reach the database may write it: a launched instance
 // through `DBOS::register_queue` and the rest, and a `Client` through the same five names. The
 // impl block lives here, next to the types it speaks in, which is where this crate already puts
@@ -661,7 +661,7 @@ fn warn_partitioned(name: &str) {
     );
 }
 
-impl Connection {
+impl DbConnection {
     /// Registers a queue, or reports the one already registered under this name.
     ///
     /// `app_version` is the caller's own, and `None` says it has none — which is what a
