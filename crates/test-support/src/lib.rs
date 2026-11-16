@@ -404,19 +404,32 @@ mod baseline_cache {
     }
 
     /// Where the dump for this corpus lives, or `None` if caching is off or the path is unknown.
-    ///
-    /// Derived from the running test binary — `target/<profile>/deps/<name>` — rather than from
-    /// `CARGO_TARGET_TMPDIR`, which cargo sets for integration tests but not for the unit tests
-    /// compiled into `src/`, and those are a third of the binaries this needs to serve. Living
-    /// under the target directory means it is already ignored, already per-workspace, and
-    /// already removed by `cargo clean`.
     pub(super) fn path(image: (&str, &str)) -> Option<PathBuf> {
         if std::env::var_os(super::NO_BASELINE_CACHE_ENV).is_some() {
             return None;
         }
         let exe = std::env::current_exe().ok()?;
-        let dir = exe.parent()?.parent()?;
-        Some(dir.join(format!("dbos-baseline-{:016x}.sql", key(image))))
+        Some(target_dir(&exe)?.join(format!("dbos-baseline-{:016x}.sql", key(image))))
+    }
+
+    /// The cargo target directory the running test binary was built into.
+    ///
+    /// **Found by the tag cargo writes there, not by counting directories up from the binary.**
+    /// The binary's place under the target directory is cargo's to change, and it has: it used to
+    /// be `target/<profile>/deps/<name>`, and is now `target/<profile>/build/<package>/<hash>/out/
+    /// <name>`, with a hash that differs for every binary. Two parents up from that is a directory
+    /// of the binary's own, so every binary wrote its dump where no other would look, and the
+    /// cache spared nothing: each of them migrated a baseline from scratch, about 20s apiece on
+    /// CockroachDB. The target directory is the one place all of them share whatever the layout
+    /// below it, and `CACHEDIR.TAG` is what cargo puts at the top of it — so it is found by name,
+    /// and a layout that moves things again cannot break this quietly.
+    ///
+    /// `None` when no ancestor carries the tag, which turns the cache off rather than guessing
+    /// somewhere to write.
+    pub(super) fn target_dir(exe: &Path) -> Option<&Path> {
+        exe.ancestors()
+            .skip(1)
+            .find(|dir| dir.join("CACHEDIR.TAG").is_file())
     }
 
     /// The cached dump, if one is there and readable.
@@ -1197,7 +1210,9 @@ impl TestDatabase {
 
 #[cfg(test)]
 mod baseline_cache_tests {
-    use super::baseline_cache::{key, load, store};
+    use std::path::Path;
+
+    use super::baseline_cache::{key, load, store, target_dir};
 
     const IMAGE: (&str, &str) = ("cockroachdb/cockroach", "latest-v26.2");
 
@@ -1241,6 +1256,38 @@ mod baseline_cache_tests {
         assert_eq!(load(&path), None);
 
         std::fs::remove_dir_all(&dir).expect("failed to clean up the test directory");
+    }
+
+    /// **Every test binary finds the same directory, whichever layout cargo puts it in.**
+    ///
+    /// The old `target/<profile>/deps/` layout and the current one with a hash directory per
+    /// binary, side by side: a path built by counting parents gave the second one a directory of
+    /// the binary's own, which is how the cache stopped working without anything failing.
+    #[test]
+    fn the_target_directory_is_the_same_for_every_binary_layout() {
+        let root = std::env::temp_dir().join(format!("dbos-target-test-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("failed to create the test directory");
+        std::fs::write(
+            root.join("CACHEDIR.TAG"),
+            "Signature: 8a477f597d28d172789f06886806bc55\n",
+        )
+        .expect("failed to write the tag");
+
+        let old = root.join("debug/deps/queues-0123456789abcdef");
+        let new_a = root.join("debug/build/dbos/aaaaaaaaaaaaaaaa/out/queues-aaaaaaaaaaaaaaaa");
+        let new_b = root.join("debug/build/dbos/bbbbbbbbbbbbbbbb/out/events-bbbbbbbbbbbbbbbb");
+        let triple = root.join("x86_64-unknown-linux-gnu/release/deps/queues-0123456789abcdef");
+        for exe in [&old, &new_a, &new_b, &triple] {
+            assert_eq!(target_dir(exe), Some(root.as_path()), "{}", exe.display());
+        }
+
+        // Nothing tagged above it: no cache, rather than a guess at where to write.
+        assert_eq!(
+            target_dir(Path::new("/definitely/not/a/target/queues")),
+            None
+        );
+
+        std::fs::remove_dir_all(&root).expect("failed to clean up the test directory");
     }
 
     /// Writing must not leave the temporary file behind, or the target directory accumulates
