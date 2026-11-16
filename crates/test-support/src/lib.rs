@@ -263,6 +263,31 @@ struct Timings {
     /// Databases handed out, and what emptying them on acquire cost.
     leases: AtomicU64,
     reset_nanos: AtomicU64,
+    /// What became of the baseline cache, as one of the `CACHE_*` constants below.
+    cache_state: std::sync::atomic::AtomicU8,
+}
+
+/// The baseline cache was not consulted: PostgreSQL has none, or no baseline was ever built.
+const CACHE_UNUSED: u8 = 0;
+/// A dump an earlier process left on disk was replayed, so this binary ran no migrations.
+const CACHE_HIT: u8 = 1;
+/// The disk cache had no dump, so this binary migrated one and stored it for the next.
+const CACHE_MISS: u8 = 2;
+/// **No cache directory was found**, so caching is off and every binary migrates from scratch.
+/// A suite that reports this is paying a corpus run per binary, and nothing else says so.
+const CACHE_OFF: u8 = 3;
+/// A dump an earlier server of this same process built was replayed.
+const CACHE_PROCESS: u8 = 4;
+
+/// The name a cache state is written under in a timings record.
+fn cache_state_name(state: u8) -> &'static str {
+    match state {
+        CACHE_HIT => "hit",
+        CACHE_MISS => "miss",
+        CACHE_OFF => "off",
+        CACHE_PROCESS => "process",
+        _ => "unused",
+    }
 }
 
 impl Timings {
@@ -278,6 +303,7 @@ impl Timings {
             pooled_build_nanos: AtomicU64::new(0),
             leases: AtomicU64::new(0),
             reset_nanos: AtomicU64::new(0),
+            cache_state: std::sync::atomic::AtomicU8::new(CACHE_UNUSED),
         }
     }
 
@@ -312,7 +338,7 @@ impl Timings {
 
         let ms = |counter: &AtomicU64| counter.load(Ordering::Relaxed) as f64 / 1e6;
         let line = format!(
-            r#"{{"binary":"{binary}","backend":"{backend:?}","lifetime_ms":{:.1},"boot_ms":{:.1},"ready_ms":{:.1},"baseline_ms":{:.1},"migrate_ms":{:.1},"dump_ms":{:.1},"pooled_builds":{},"pooled_build_ms":{:.1},"leases":{},"reset_ms":{:.1}}}"#,
+            r#"{{"binary":"{binary}","backend":"{backend:?}","lifetime_ms":{:.1},"boot_ms":{:.1},"ready_ms":{:.1},"baseline_ms":{:.1},"migrate_ms":{:.1},"dump_ms":{:.1},"pooled_builds":{},"pooled_build_ms":{:.1},"leases":{},"reset_ms":{:.1},"baseline_cache":"{}"}}"#,
             self.created.elapsed().as_secs_f64() * 1e3,
             ms(&self.boot_nanos),
             ms(&self.ready_nanos),
@@ -323,6 +349,7 @@ impl Timings {
             ms(&self.pooled_build_nanos),
             self.leases.load(Ordering::Relaxed),
             ms(&self.reset_nanos),
+            cache_state_name(self.cache_state.load(Ordering::Relaxed)),
         );
 
         // Appending, because every test binary of a run writes to the same file and they are
@@ -404,32 +431,47 @@ mod baseline_cache {
     }
 
     /// Where the dump for this corpus lives, or `None` if caching is off or the path is unknown.
+    ///
+    /// **Not `CARGO_TARGET_TMPDIR`**, which cargo sets for integration tests but not for the unit
+    /// tests compiled into `src/`, and those are a third of the binaries this needs to serve.
     pub(super) fn path(image: (&str, &str)) -> Option<PathBuf> {
         if std::env::var_os(super::NO_BASELINE_CACHE_ENV).is_some() {
             return None;
         }
-        let exe = std::env::current_exe().ok()?;
-        Some(target_dir(&exe)?.join(format!("dbos-baseline-{:016x}.sql", key(image))))
+        path_for(&std::env::current_exe().ok()?, image)
     }
 
-    /// The cargo target directory the running test binary was built into.
+    /// [`path`] for a given test binary, with the environment left out so a test can ask it.
+    pub(super) fn path_for(exe: &Path, image: (&str, &str)) -> Option<PathBuf> {
+        Some(target_dir(exe)?.join(format!("dbos-baseline-{:016x}.sql", key(image))))
+    }
+
+    /// The directory cargo built the running test binary under, which every binary of a run
+    /// shares.
     ///
-    /// **Found by the tag cargo writes there, not by counting directories up from the binary.**
-    /// The binary's place under the target directory is cargo's to change, and it has: it used to
-    /// be `target/<profile>/deps/<name>`, and is now `target/<profile>/build/<package>/<hash>/out/
-    /// <name>`, with a hash that differs for every binary. Two parents up from that is a directory
-    /// of the binary's own, so every binary wrote its dump where no other would look, and the
-    /// cache spared nothing: each of them migrated a baseline from scratch, about 20s apiece on
-    /// CockroachDB. The target directory is the one place all of them share whatever the layout
-    /// below it, and `CACHEDIR.TAG` is what cargo puts at the top of it — so it is found by name,
-    /// and a layout that moves things again cannot break this quietly.
+    /// **Found by what cargo leaves at the top of it, not by counting directories up from the
+    /// binary.** The binary's place under the target directory is cargo's to change, and it has:
+    /// it used to be `target/<profile>/deps/<name>`, and is now
+    /// `target/<profile>/build/<package>/<hash>/out/<name>`, with a hash that differs for every
+    /// binary. Two parents up from that is a directory of the binary's own, so every binary wrote
+    /// its dump where no other would look, and the cache spared nothing: each of them migrated a
+    /// baseline from scratch, about 20s apiece on CockroachDB.
     ///
-    /// `None` when no ancestor carries the tag, which turns the cache off rather than guessing
-    /// somewhere to write.
+    /// Two markers, because neither is always there. `CACHEDIR.TAG` is the one cargo documents,
+    /// but cargo writes it only when it creates the directory itself, so a `target/` that
+    /// rust-analyzer or an editor made first has none. `.rustc_info.json` is cargo's own cache of
+    /// the compiler's answers: it is rewritten at the top on every build, whoever made the
+    /// directory, and is not written below it. It is an internal file, which is why it is the
+    /// second choice. With a split `build.build-dir` this is the build directory rather than the
+    /// target directory, which is just as shared.
+    ///
+    /// `None` when no ancestor carries either, which turns the cache off rather than guessing
+    /// somewhere to write. [`Timings`](super::Timings) records that as `baseline_cache: off`, so
+    /// it shows up in a run's artifacts instead of as a suite that is just slow.
     pub(super) fn target_dir(exe: &Path) -> Option<&Path> {
-        exe.ancestors()
-            .skip(1)
-            .find(|dir| dir.join("CACHEDIR.TAG").is_file())
+        exe.ancestors().skip(1).find(|dir| {
+            dir.join("CACHEDIR.TAG").is_file() || dir.join(".rustc_info.json").is_file()
+        })
     }
 
     /// The cached dump, if one is there and readable.
@@ -915,6 +957,9 @@ impl TestServer {
                 if self.backend == Backend::Cockroach
                     && let Some(sql) = CACHED_DUMP.get()
                 {
+                    self.timings
+                        .cache_state
+                        .store(CACHE_PROCESS, Ordering::Relaxed);
                     Timings::add(&self.timings.baseline_nanos, building.elapsed());
                     return Baseline::Replay(sql.clone());
                 }
@@ -928,8 +973,17 @@ impl TestServer {
                     && let Some(sql) = baseline_cache::load(path)
                 {
                     let sql = CACHED_DUMP.get_or_init(|| sql).clone();
+                    self.timings.cache_state.store(CACHE_HIT, Ordering::Relaxed);
                     Timings::add(&self.timings.baseline_nanos, building.elapsed());
                     return Baseline::Replay(sql);
+                }
+                if self.backend == Backend::Cockroach {
+                    let state = if cache.is_some() {
+                        CACHE_MISS
+                    } else {
+                        CACHE_OFF
+                    };
+                    self.timings.cache_state.store(state, Ordering::Relaxed);
                 }
                 let db = self.create_database().await;
                 let pool = db.pool().await;
@@ -1210,11 +1264,43 @@ impl TestDatabase {
 
 #[cfg(test)]
 mod baseline_cache_tests {
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
-    use super::baseline_cache::{key, load, store, target_dir};
+    use super::baseline_cache::{key, load, path_for, store, target_dir};
 
     const IMAGE: (&str, &str) = ("cockroachdb/cockroach", "latest-v26.2");
+
+    /// A scratch directory removed when it drops, so a failed assertion does not leave one behind.
+    ///
+    /// Named by the test as well as the process, because tests of one process run side by side.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(test: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("dbos-{test}-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).expect("failed to create the test directory");
+            Self(dir)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+
+        /// Makes a file, and the directories above it.
+        fn touch(&self, relative: &str) -> PathBuf {
+            let path = self.0.join(relative);
+            std::fs::create_dir_all(path.parent().expect("a file has a parent"))
+                .expect("failed to create the directory");
+            std::fs::write(&path, "x").expect("failed to write the file");
+            path
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     /// The key must be a function of its inputs and nothing else, or two binaries in one run
     /// disagree about which file to read.
@@ -1236,9 +1322,8 @@ mod baseline_cache_tests {
     /// is a schema that silently differs from the one the migrations build.
     #[test]
     fn a_stored_dump_loads_back_unchanged() {
-        let dir = std::env::temp_dir().join(format!("dbos-cache-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("failed to create the test directory");
-        let path = dir.join("baseline.sql");
+        let scratch = Scratch::new("cache-test");
+        let path = scratch.path().join("baseline.sql");
         let sql = "CREATE TABLE dbos.t (a INT8);\nINSERT INTO dbos.dbos_migrations VALUES (107);\n";
 
         assert_eq!(
@@ -1254,58 +1339,84 @@ mod baseline_cache_tests {
         // that fails much later and much less clearly.
         store(&path, "   \n");
         assert_eq!(load(&path), None);
-
-        std::fs::remove_dir_all(&dir).expect("failed to clean up the test directory");
     }
 
-    /// **Every test binary finds the same directory, whichever layout cargo puts it in.**
+    /// **Every test binary of a run is given the same cache file, whatever layout cargo builds
+    /// them in.**
     ///
-    /// The old `target/<profile>/deps/` layout and the current one with a hash directory per
-    /// binary, side by side: a path built by counting parents gave the second one a directory of
-    /// the binary's own, which is how the cache stopped working without anything failing.
+    /// This is the regression the cache had: the layout with a hash directory per binary, next to
+    /// the old `deps/` one. A path built by counting parents gave each of those binaries a
+    /// directory of its own, so no binary ever found another's dump and nothing failed.
     #[test]
-    fn the_target_directory_is_the_same_for_every_binary_layout() {
-        let root = std::env::temp_dir().join(format!("dbos-target-test-{}", std::process::id()));
-        std::fs::create_dir_all(&root).expect("failed to create the test directory");
-        std::fs::write(
-            root.join("CACHEDIR.TAG"),
-            "Signature: 8a477f597d28d172789f06886806bc55\n",
-        )
-        .expect("failed to write the tag");
+    fn every_binary_of_a_run_gets_the_same_cache_file() {
+        let scratch = Scratch::new("cache-layout");
+        scratch.touch("CACHEDIR.TAG");
+        let root = scratch.path();
 
         let old = root.join("debug/deps/queues-0123456789abcdef");
         let new_a = root.join("debug/build/dbos/aaaaaaaaaaaaaaaa/out/queues-aaaaaaaaaaaaaaaa");
         let new_b = root.join("debug/build/dbos/bbbbbbbbbbbbbbbb/out/events-bbbbbbbbbbbbbbbb");
-        let triple = root.join("x86_64-unknown-linux-gnu/release/deps/queues-0123456789abcdef");
-        for exe in [&old, &new_a, &new_b, &triple] {
-            assert_eq!(target_dir(exe), Some(root.as_path()), "{}", exe.display());
+        let release = root.join("release/build/dbos/cccccccccccccccc/out/queues-cccccccccccccccc");
+        let expected = root.join(format!("dbos-baseline-{:016x}.sql", key(IMAGE)));
+        for exe in [&old, &new_a, &new_b, &release] {
+            assert_eq!(
+                path_for(exe, IMAGE).as_deref(),
+                Some(expected.as_path()),
+                "{}",
+                exe.display()
+            );
         }
+    }
 
-        // Nothing tagged above it: no cache, rather than a guess at where to write.
-        assert_eq!(
-            target_dir(Path::new("/definitely/not/a/target/queues")),
-            None
-        );
+    /// Cargo tags a target directory only when it creates it, so one an editor made first has no
+    /// tag. Its `.rustc_info.json` is there all the same, and is what finds it.
+    #[test]
+    fn a_target_directory_cargo_did_not_create_is_found_by_its_rustc_info() {
+        let scratch = Scratch::new("cache-untagged");
+        scratch.touch(".rustc_info.json");
+        let exe = scratch
+            .path()
+            .join("debug/build/dbos/aaaaaaaaaaaaaaaa/out/queues-aaaaaaaaaaaaaaaa");
+        assert_eq!(target_dir(&exe), Some(scratch.path()));
+    }
 
-        std::fs::remove_dir_all(&root).expect("failed to clean up the test directory");
+    /// With `--target`, cargo makes a tagged directory per triple under the tagged target
+    /// directory. Binaries of one run are all under the same triple, so the nearest one is as
+    /// shared as the outer one — what matters is that every binary picks the same.
+    #[test]
+    fn a_cross_target_run_shares_the_triple_directory() {
+        let scratch = Scratch::new("cache-triple");
+        scratch.touch("CACHEDIR.TAG");
+        scratch.touch("x86_64-unknown-linux-gnu/CACHEDIR.TAG");
+        let triple = scratch.path().join("x86_64-unknown-linux-gnu");
+        for hash in ["aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb"] {
+            let exe = triple.join(format!("debug/build/dbos/{hash}/out/queues-{hash}"));
+            assert_eq!(target_dir(&exe), Some(triple.as_path()));
+        }
+    }
+
+    /// With no marker above the binary there is nowhere to put a cache, and none is guessed at.
+    #[test]
+    fn a_binary_outside_any_target_directory_gets_no_cache() {
+        let scratch = Scratch::new("cache-none");
+        let exe = scratch.path().join("somewhere/queues");
+        assert_eq!(target_dir(&exe), None);
+        assert_eq!(path_for(&exe, IMAGE), None);
     }
 
     /// Writing must not leave the temporary file behind, or the target directory accumulates
     /// one per process for the life of the checkout.
     #[test]
     fn storing_leaves_only_the_cache_file() {
-        let dir = std::env::temp_dir().join(format!("dbos-cache-tidy-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("failed to create the test directory");
-        let path = dir.join("baseline.sql");
+        let scratch = Scratch::new("cache-tidy");
+        let path = scratch.path().join("baseline.sql");
         store(&path, "CREATE TABLE dbos.t (a INT8);\n");
 
-        let left: Vec<_> = std::fs::read_dir(&dir)
+        let left: Vec<_> = std::fs::read_dir(scratch.path())
             .expect("failed to list the test directory")
             .filter_map(|entry| Some(entry.ok()?.file_name().to_string_lossy().into_owned()))
             .collect();
         assert_eq!(left, vec!["baseline.sql".to_owned()]);
-
-        std::fs::remove_dir_all(&dir).expect("failed to clean up the test directory");
     }
 }
 
