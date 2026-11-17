@@ -9,7 +9,7 @@ use crate::config::Config;
 use crate::db_connection::DbConnection;
 use crate::enterprise::{ConductorConnection, ConductorEngine};
 use crate::identity::{Environment, Identity};
-use crate::registry::{Registry, Snapshot};
+use crate::registry::{Registry, RegistrySnapshot};
 use crate::serialization::Serializer;
 use crate::sysdb::SystemDatabase;
 use crate::workflow::{Role, Tasks};
@@ -33,7 +33,7 @@ pub struct Executor {
     app_name: String,
     app_id: String,
     runtime: crate::rt::Spawner,
-    workflows: Snapshot,
+    workflows: RegistrySnapshot,
     listen_queues: Option<Vec<String>>,
     /// One set per [`Role`], because shutdown stops them in turn: see [`stop`](Self::stop).
     producer_tasks: Tasks,
@@ -58,7 +58,7 @@ impl Executor {
     /// a workflow started the instant launch returns is `PENDING` under this executor's id too,
     /// and a sweep running any later would tear it off its runner and offer it to the fleet. It is
     /// one write rather than a list of workflows to run, so nothing about it is backgrounded.
-    async fn start(config: &Config, workflows: Snapshot) -> Result<(Self, Vec<String>)> {
+    async fn start(config: &Config, workflows: RegistrySnapshot) -> Result<(Self, Vec<String>)> {
         config.validate()?;
 
         if workflows.is_empty() {
@@ -266,7 +266,7 @@ impl Executor {
     /// A snapshot, frozen at launch. Recovery reads it while the application may still be calling
     /// into the instance, and a map that could grow underneath a recovery pass is a recovery pass
     /// that may or may not find a workflow depending on timing.
-    pub(crate) fn workflows(&self) -> &Snapshot {
+    pub(crate) fn workflows(&self) -> &RegistrySnapshot {
         &self.workflows
     }
 

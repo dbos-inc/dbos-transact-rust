@@ -121,7 +121,7 @@ fn refuse_unregistrable(name: &QualifiedWorkflowName) -> Result<()> {
 }
 
 /// A registry frozen at launch.
-pub(crate) type Snapshot = Arc<HashMap<QualifiedWorkflowName, RegisteredWorkflow>>;
+pub(crate) type RegistrySnapshot = Arc<HashMap<QualifiedWorkflowName, RegisteredWorkflow>>;
 
 impl Registry {
     /// Registers `workflow` under `name`, refusing a second registration of the same identity.
@@ -153,7 +153,7 @@ impl Registry {
     ///
     /// Taking the copy and closing the door are one act, which is the whole point of the shared
     /// lock: between them there is no moment for a registration to slip through.
-    pub(crate) fn snapshot(&self) -> Snapshot {
+    pub(crate) fn snapshot(&self) -> RegistrySnapshot {
         let mut state = self.write();
         state.frozen = true;
         Arc::new(state.workflows.clone())

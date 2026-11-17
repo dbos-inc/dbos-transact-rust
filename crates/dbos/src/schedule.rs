@@ -59,7 +59,7 @@ use crate::db_connection::DbConnection;
 use crate::error::{Error, Result};
 use crate::handle::WorkflowHandle;
 use crate::instance::DBOS;
-use crate::registry::{QualifiedWorkflowName, Snapshot, WorkflowRef};
+use crate::registry::{QualifiedWorkflowName, RegistrySnapshot, WorkflowRef};
 use crate::serialization::{
     Floats, NonFinite, PayloadEncoding, SerializationFormat, Serializer, decode, encode,
     encode_input,
@@ -1025,7 +1025,7 @@ impl DbConnection {
         name: &str,
         start: SystemTime,
         end: SystemTime,
-        workflows: Option<&Snapshot>,
+        workflows: Option<&RegistrySnapshot>,
     ) -> Result<Vec<WorkflowHandle<R, E>>> {
         let record = self.get_schedule_or_not_found(name).await?;
         let cron = CronSchedule::parse(&record.schedule, record.cron_timezone.as_deref()).map_err(
@@ -1076,7 +1076,7 @@ impl DbConnection {
     pub(crate) async fn trigger_schedule<R, E>(
         self: &Arc<Self>,
         name: &str,
-        workflows: Option<&Snapshot>,
+        workflows: Option<&RegistrySnapshot>,
     ) -> Result<WorkflowHandle<R, E>> {
         let record = self.get_schedule_or_not_found(name).await?;
         let now = jiff::Timestamp::now();
@@ -1215,7 +1215,7 @@ impl DbConnection {
     pub(crate) async fn prepare_firing(
         &self,
         record: &ScheduleRecord,
-        workflows: Option<&Snapshot>,
+        workflows: Option<&RegistrySnapshot>,
     ) -> Result<Firing> {
         let owner = record
             .application_name
