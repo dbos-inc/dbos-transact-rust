@@ -478,6 +478,105 @@ async fn management_keeps_the_queue_through_an_instance_and_a_client() {
     dbos.shutdown().await;
 }
 
+/// **The free resume forms refuse an empty option and keep or change the partition key**, as the
+/// methods do.
+///
+/// A workflow body calls them, so the test runs one: the empty options come back refused with
+/// nothing moved, a plain resume leaves the key where it was, and a key given replaces only the
+/// key.
+#[tokio::test]
+async fn the_free_resume_forms_refuse_empty_options_and_keep_or_change_the_key() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("free-resume-app", &db));
+    let echo = dbos
+        .register_workflow("echo", |x: u32| async move { Ok::<u32, Error>(x) })
+        .unwrap();
+    let keeper = dbos
+        .register_workflow("keeper", |(kept, moved): (String, String)| async move {
+            let empty_queue = dbos::resume_workflow_with::<u32, EngineOnly>(
+                &kept,
+                ResumeOptions {
+                    queue_name: Some(""),
+                    ..ResumeOptions::default()
+                },
+            )
+            .await;
+            let ids = [kept.as_str(), moved.as_str()];
+            let empty_key = dbos::resume_workflows::<u32, EngineOnly>(
+                &ids,
+                ResumeOptions {
+                    queue_partition_key: Some(""),
+                    ..ResumeOptions::default()
+                },
+            )
+            .lift::<EngineOnly>()
+            .await;
+            let refused = matches!(empty_queue, Err(Error::InvalidArgument { .. }))
+                && matches!(empty_key, Err(Error::InvalidArgument { .. }));
+
+            let kept_handle = dbos::resume_workflow::<u32, EngineOnly>(&kept).await?;
+            let moved_handle = dbos::resume_workflow_with::<u32, EngineOnly>(
+                &moved,
+                ResumeOptions {
+                    queue_partition_key: Some("moved-to"),
+                    ..ResumeOptions::default()
+                },
+            )
+            .await?;
+            let results = (kept_handle.result().await?, moved_handle.result().await?);
+            Ok::<_, Error>((refused, results))
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+    dbos.register_queue(
+        "free-keep",
+        dbos::QueueOptions {
+            partition_concurrency: Some(2),
+            ..dbos::QueueOptions::default()
+        },
+        dbos::QueueConflict::UpdateIfLatestVersion,
+    )
+    .await
+    .expect("registration failed");
+    for (id, value) in [("free-kept", 1), ("free-moved", 2)] {
+        echo.start_with(
+            value,
+            StartOptions {
+                workflow_id: Some(id),
+                queue: Some(QueueRequest {
+                    partition_key: Some("p0"),
+                    priority: Some(3),
+                    delay: Some(Duration::from_secs(3600)),
+                    ..QueueRequest::new("free-keep")
+                }),
+                ..StartOptions::default()
+            },
+        )
+        .await
+        .expect("enqueue failed");
+        dbos.cancel(id).await.expect("cancel failed");
+    }
+
+    let (refused, results) = keeper
+        .run(("free-kept".to_owned(), "free-moved".to_owned()))
+        .await
+        .expect("the keeper failed");
+
+    assert!(refused, "an empty option was accepted by a free form");
+    assert_eq!(results, (1, 2));
+    assert_eq!(
+        queue_columns(&db, "free-kept").await,
+        columns("free-keep", "p0", 3),
+        "a plain resume moved the key"
+    );
+    assert_eq!(
+        queue_columns(&db, "free-moved").await,
+        columns("free-keep", "moved-to", 3),
+        "a key given changed more than the key"
+    );
+    dbos.shutdown().await;
+}
+
 /// **A resume refuses an empty queue name or partition key**, as a fork and a rewind do, from an
 /// instance and from a client, and moves nothing.
 #[tokio::test]
@@ -532,6 +631,23 @@ async fn a_resume_refuses_an_empty_queue_or_partition_key() {
         assert!(
             matches!(by_client, Error::InvalidArgument { .. }),
             "got {by_client:?}"
+        );
+        // The bulk forms refuse it too, whatever the batch.
+        let bulk_by_instance = dbos
+            .resume_all::<u32, EngineOnly>(&["parked"], options)
+            .await
+            .expect_err("an empty option was accepted in bulk");
+        assert!(
+            matches!(bulk_by_instance, Error::InvalidArgument { .. }),
+            "got {bulk_by_instance:?}"
+        );
+        let bulk_by_client = client
+            .resume_all::<u32, EngineOnly>(&["parked"], options)
+            .await
+            .expect_err("an empty option was accepted in bulk");
+        assert!(
+            matches!(bulk_by_client, Error::InvalidArgument { .. }),
+            "got {bulk_by_client:?}"
         );
     }
     let row = reader(&db)

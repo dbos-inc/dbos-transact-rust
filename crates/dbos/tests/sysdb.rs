@@ -11488,6 +11488,19 @@ fn skip_dequeue_completeness(db: &support::TestDatabase) -> bool {
     skipping
 }
 
+/// The claim race cannot be made on CockroachDB, so its test skips there.
+///
+/// Under `SERIALIZABLE` a resume that commits between the sweep's candidate query and its locking
+/// read makes that read fail with a retry error, which the sweep returns instead of dropping the
+/// head. It is the database refusing the race, not a place the sweep is exposed.
+fn skip_on_cockroach_for_the_claim_race(db: &support::TestDatabase) -> bool {
+    let skipping = matches!(db.backend(), Backend::Cockroach);
+    if skipping {
+        eprintln!("skipped on CockroachDB: a serializable read refuses the race");
+    }
+    skipping
+}
+
 /// Enqueues a workflow on `queue`, optionally with a priority and a timeout.
 async fn enqueue(
     sys: &PostgresSystemDatabase,
@@ -12520,45 +12533,45 @@ async fn a_head_resumed_into_another_partition_mid_sweep_is_not_claimed() {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     let (sys, db) = sysdb().await;
-    if skip_dequeue_completeness(&db) {
+    if skip_on_cockroach_for_the_claim_race(&db) {
         return;
     }
-    let queue = partitioned_queue(&sys, "race-orders").await;
+    // Hooks are keyed by queue name across the whole binary, so this one is not shared. The helper
+    // wants a `'static` name, and a test that leaks one string loses nothing.
+    let orders: &'static str =
+        Box::leak(format!("race-orders-{}", uuid::Uuid::new_v4()).into_boxed_str());
+    let queue = partitioned_queue(&sys, orders).await;
 
     // `k1` already has a running workflow, which is what makes it full.
-    enqueue_partitioned(&sys, "wf-k1-running", "race-orders", "k1").await;
+    enqueue_partitioned(&sys, "wf-k1-running", orders, "k1").await;
     assert_eq!(
         sys.start_queued_partitioned_workflows(&queue, "exec-1", "v1", "claim", None)
             .await
             .unwrap(),
         ["wf-k1-running"],
     );
-    enqueue_partitioned(&sys, "wf-moving", "race-orders", "p0").await;
+    enqueue_partitioned(&sys, "wf-moving", orders, "p0").await;
 
     let other = Arc::new(PostgresSystemDatabase::from_pool(
         db.pool().await,
         &Settings::default(),
     ));
     let moved = Arc::new(AtomicBool::new(false));
-    let hook = dbos::__test_hooks::on(
-        dbos::__test_hooks::points::PARTITION_CLAIM,
-        "race-orders",
-        {
+    let hook = dbos::__test_hooks::on(dbos::__test_hooks::points::PARTITION_CLAIM, orders, {
+        let (other, moved) = (Arc::clone(&other), Arc::clone(&moved));
+        move || {
             let (other, moved) = (Arc::clone(&other), Arc::clone(&moved));
-            move || {
-                let (other, moved) = (Arc::clone(&other), Arc::clone(&moved));
-                async move {
-                    // Once: the sweep may be replayed, and the move has happened by then.
-                    if !moved.swap(true, Ordering::SeqCst) {
-                        other
-                            .resume_workflows(&["wf-moving"], None, Some("k1"), None, None)
-                            .await?;
-                    }
-                    Ok(())
+            async move {
+                // Once: the sweep may be replayed, and the move has happened by then.
+                if !moved.swap(true, Ordering::SeqCst) {
+                    other
+                        .resume_workflows(&["wf-moving"], None, Some("k1"), None, None)
+                        .await?;
                 }
+                Ok(())
             }
-        },
-    );
+        }
+    });
 
     let started = sys
         .start_queued_partitioned_workflows(&queue, "exec-1", "v1", "claim", None)
@@ -12576,7 +12589,7 @@ async fn a_head_resumed_into_another_partition_mid_sweep_is_not_claimed() {
     let running: Vec<_> = sys
         .list_workflows(
             &WorkflowFilter {
-                queue_names: vec!["race-orders"],
+                queue_names: vec![orders],
                 status: vec![WorkflowStatus::Pending],
                 ..Default::default()
             },

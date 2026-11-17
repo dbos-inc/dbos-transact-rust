@@ -4741,6 +4741,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                         requested = workflow_ids.len(),
                         resumed = resumed.len(),
                         queue_name,
+                        queue_partition_key,
                         "resumed workflows"
                     );
                     Ok((tx, resumed))

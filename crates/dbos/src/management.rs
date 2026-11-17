@@ -202,22 +202,24 @@ pub enum Children {
 
 /// Where a resumed workflow goes.
 ///
-/// A struct for one field, so that options can be added without changing every call site — and
-/// because `resume_all(&ids, None)` says nothing at a call site about what was declined.
+/// A struct, so that options can be added without changing every call site — and because
+/// `resume_all(&ids, None)` says nothing at a call site about what was declined.
 ///
-/// **Only what is given changes.** A resumed workflow goes back to the queue and partition it was
-/// on, so resuming a bulk of partitioned-queue rows puts each one back in its own partition. Name
-/// a queue to move them, and a partition key to place them on a partitioned queue.
+/// **Only the queue columns given change.** A resumed workflow goes back to the queue and
+/// partition it was on, so resuming a bulk of partitioned-queue rows puts each one back in its own
+/// partition. Name a queue to move them, and a partition key to place them on a partitioned queue.
+/// The rest of the row is reset as ever: the attempt count, the deadline and the deduplication id.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ResumeOptions<'a> {
     /// The queue the workflow is re-enqueued on. `None` keeps the queue it has, or the engine's
     /// internal queue for a workflow that has none.
     ///
     /// A named queue is how a resumed workflow is made to wait its turn: the internal queue takes
-    /// no limits, so resuming a large backlog onto it re-enqueues everything and then dequeues
-    /// everything. Sending it to a queue with a concurrency limit is the way to resume a backlog
-    /// without flooding the fleet — and, with an `app_version`-eligible executor pool, the
-    /// way to steer resumed work at a particular deployment.
+    /// no limits, so resuming a large backlog of workflows that have no queue onto it re-enqueues
+    /// everything and then dequeues everything. Workflows that were on a queue go back to its
+    /// limits on their own; naming a queue with a concurrency limit is how to give the others
+    /// limits — and, with an `app_version`-eligible executor pool, the way to steer resumed work
+    /// at a particular deployment.
     pub queue_name: Option<&'a str>,
     /// The partition of that queue. `None` keeps the key the workflow has.
     ///
@@ -332,7 +334,7 @@ pub struct ForkOptions<'a> {
     /// forked onto the fixed deployment, and only executors running that version will dequeue it.
     pub app_version: Option<&'a str>,
     /// The queue the fork is enqueued on. `None` inherits the source's queue, or the engine's
-    /// internal queue for a source that has none.
+    /// internal queue for a source that has none. The fork also inherits the source's priority.
     pub queue_name: Option<&'a str>,
     /// The partition of that queue, which a partitioned [`queue_name`](Self::queue_name) requires.
     /// `None` inherits the source's key.

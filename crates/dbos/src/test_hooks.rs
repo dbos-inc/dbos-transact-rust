@@ -62,6 +62,9 @@ pub mod points {
     ///
     /// The window a resume can land in: it can change an `ENQUEUED` head's partition key, and the
     /// claim must drop a head that is no longer in the partition it was chosen for.
+    ///
+    /// The sweep's transaction is open here, and holds a pool connection, but it has locked no
+    /// row yet, so a hook may write the heads it chose without waiting on the sweep.
     pub const PARTITION_CLAIM: &str = "partition_claim";
 }
 
