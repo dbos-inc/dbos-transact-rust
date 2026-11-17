@@ -3749,12 +3749,23 @@ impl SystemDatabase for PostgresSystemDatabase {
     ) -> Result<Vec<WorkflowRecord>, Error> {
         let workflow_table = &self.tables.workflow_status;
         // `status` is the one filter whose values are not already strings.
-        let status: Vec<&str> = filter
-            .status
-            .iter()
-            .copied()
-            .map(WorkflowStatus::as_str)
-            .collect();
+        let status: Vec<&str> = if filter.queues_only && filter.status.is_empty() {
+            // A queue listing with no status is the queue's live work, not every row that ever
+            // went through one: a finished or cancelled workflow keeps its queue name, and
+            // listing it here would bury the work still waiting.
+            vec![
+                WorkflowStatus::Enqueued.as_str(),
+                WorkflowStatus::Pending.as_str(),
+                WorkflowStatus::Delayed.as_str(),
+            ]
+        } else {
+            filter
+                .status
+                .iter()
+                .copied()
+                .map(WorkflowStatus::as_str)
+                .collect()
+        };
         // `LIKE ANY(...)` needs the wildcard appended to each pattern, and `%` and `_` in a
         // caller's prefix would otherwise be wildcards themselves. Escaped out here because it
         // allocates, and nothing about it depends on the attempt.

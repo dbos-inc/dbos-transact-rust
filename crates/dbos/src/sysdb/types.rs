@@ -1408,7 +1408,13 @@ pub struct WorkflowFilter<'a> {
 
     /// Queues the workflow was submitted to.
     pub queue_names: Vec<&'a str>,
-    /// Only workflows that went through a queue at all.
+    /// Only queued workflows: with no [`status`](Self::status), only the queue's live work.
+    ///
+    /// **With no status given, that is `ENQUEUED`, `PENDING` and `DELAYED`.** A workflow keeps its
+    /// queue after it finishes, is cancelled or dead-letters, so without this a queue listing
+    /// would be every workflow that ever went through one. Name the statuses to see the rest: with
+    /// a status given, this filters on the queue only. `SUSPENDED` belongs in this set once this
+    /// SDK reads it.
     pub queues_only: bool,
     /// Schedules that triggered the workflow.
     pub schedule_names: Vec<&'a str>,

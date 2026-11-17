@@ -1814,6 +1814,78 @@ async fn every_filter_narrows() {
     }
 }
 
+/// **A queue listing with no status is the queue's live work.**
+///
+/// A workflow keeps its queue once it is cancelled or has finished, so `queues_only` alone would
+/// list it beside the work still waiting. Naming a status brings the others back.
+#[tokio::test]
+async fn a_queue_listing_with_no_status_is_the_live_work() {
+    use dbos::sysdb::types::WorkflowFilter as F;
+    let (sys, db) = seeded().await;
+    // `wf-b` becomes `PENDING`, `wf-c` stays `DELAYED`, `wf-d` is cancelled, a queued row that
+    // has succeeded is added, and `wf-waiting` is `ENQUEUED`: the cancelled and the finished rows
+    // are not live, and both keep their queue.
+    sqlx::query(
+        r#"UPDATE "dbos"."workflow_status" SET status = 'PENDING' WHERE workflow_uuid = 'wf-b'"#,
+    )
+    .execute(&db.pool().await)
+    .await
+    .unwrap();
+    sys.cancel_workflows(&["wf-d"], false, None, None)
+        .await
+        .unwrap();
+    sys.init_workflow(
+        &NewWorkflow {
+            queue_name: Some("orders"),
+            ..NewWorkflow::new("wf-done")
+        },
+        None,
+        WorkflowIdReusePolicy::ReturnExisting,
+    )
+    .await
+    .unwrap();
+    sys.init_workflow(
+        &NewWorkflow {
+            queue_name: Some("orders"),
+            ..NewWorkflow::new("wf-waiting")
+        },
+        None,
+        WorkflowIdReusePolicy::ReturnExisting,
+    )
+    .await
+    .unwrap();
+    sqlx::query(
+        r#"UPDATE "dbos"."workflow_status" SET status = 'SUCCESS' WHERE workflow_uuid = 'wf-done'"#,
+    )
+    .execute(&db.pool().await)
+    .await
+    .unwrap();
+
+    let queued = F {
+        queues_only: true,
+        ..F::default()
+    };
+    let mut live = ids(&sys, &queued).await;
+    live.sort();
+    assert_eq!(
+        live,
+        ["wf-b", "wf-c", "wf-waiting"],
+        "a finished or cancelled row was listed"
+    );
+
+    for (status, expected) in [
+        (WorkflowStatus::Cancelled, "wf-d"),
+        (WorkflowStatus::Success, "wf-done"),
+    ] {
+        let named = F {
+            queues_only: true,
+            status: vec![status],
+            ..F::default()
+        };
+        assert_eq!(ids(&sys, &named).await, [expected], "{status:?}");
+    }
+}
+
 /// Ordering, limit, and offset page through the results.
 #[tokio::test]
 async fn results_are_ordered_and_pageable() {
