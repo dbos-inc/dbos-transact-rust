@@ -12750,6 +12750,10 @@ enum MissedHead {
     /// `partition_concurrency = 1` with a partition rate limit, which keeps the queue off the
     /// batched sweep, and the new head outranks the paused claimer's in the same partition.
     PartitionHigherPriority,
+    /// A partitioned queue with `concurrency = 1`, and the new head is in another partition: two
+    /// claimers on different keys still spend one queue-wide budget, so they must take the same
+    /// lock, the queue's.
+    CrossPartition,
 }
 
 /// **Two claimers that pick different heads do not both spend one budget.**
@@ -12765,13 +12769,23 @@ async fn a_claimer_missing_a_new_head_does_not_overspend(case: MissedHead) {
 
     let (sys, db) = sysdb().await;
     let name = unique_queue("claim-lock");
-    let (queue, partition) = match case {
+    let (queue, partition, partition_a) = match case {
         MissedHead::HigherPriority | MissedHead::OtherVersion => (
             NewQueue {
                 concurrency: Some(1),
                 ..NewQueue::new(name)
             },
             None,
+            None,
+        ),
+        MissedHead::CrossPartition => (
+            NewQueue {
+                concurrency: Some(1),
+                partition_concurrency: Some(1),
+                ..NewQueue::new(name)
+            },
+            Some("p0"),
+            Some("p1"),
         ),
         MissedHead::PartitionHigherPriority => (
             NewQueue {
@@ -12782,6 +12796,7 @@ async fn a_claimer_missing_a_new_head_does_not_overspend(case: MissedHead) {
                 }),
                 ..NewQueue::new(name)
             },
+            Some("p"),
             Some("p"),
         ),
     };
@@ -12812,9 +12827,17 @@ async fn a_claimer_missing_a_new_head_does_not_overspend(case: MissedHead) {
                     return Ok(());
                 }
                 *claimed_a.lock().unwrap() = Some(Ok(Default::default()));
-                enqueue_row(&other, "wf-head-a", name, partition, 1, version_a).await;
+                enqueue_row(&other, "wf-head-a", name, partition_a, 1, version_a).await;
                 let result = other
-                    .start_queued_workflows(&queue, "exec-a", version_a, "claim-a", partition, 0, 0)
+                    .start_queued_workflows(
+                        &queue,
+                        "exec-a",
+                        version_a,
+                        "claim-a",
+                        partition_a,
+                        0,
+                        0,
+                    )
                     .await;
                 *claimed_a.lock().unwrap() = Some(result);
                 Ok(())
@@ -12843,7 +12866,7 @@ async fn a_claimer_missing_a_new_head_does_not_overspend(case: MissedHead) {
             }
         }
         assert!(
-            pending.get(&partition).copied().unwrap_or(0) <= 1,
+            pending.values().sum::<i64>() <= 1,
             "a limit of one admitted {pending:?}"
         );
         return;
@@ -12886,6 +12909,11 @@ async fn a_claimer_missing_another_versions_head_does_not_overspend() {
 #[tokio::test]
 async fn a_partition_claimer_missing_a_higher_priority_head_does_not_overspend() {
     a_claimer_missing_a_new_head_does_not_overspend(MissedHead::PartitionHigherPriority).await;
+}
+
+#[tokio::test]
+async fn claimers_on_different_partitions_share_the_queue_wide_lock() {
+    a_claimer_missing_a_new_head_does_not_overspend(MissedHead::CrossPartition).await;
 }
 
 /// **Two sweeps that pick different heads in one partition do not both start them.**
@@ -13071,6 +13099,65 @@ async fn a_failed_batch_keeps_the_claims_of_the_batches_before_it() {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     assert_eq!(next, [last.as_str()]);
+}
+
+/// **A later batch does not wait out a lost connection while earlier claims wait to be
+/// dispatched.**
+///
+/// A connection failure is otherwise retried until the database comes back. That is right for the
+/// first batch, which has claimed nothing, but a later one would hold back the claims the batches
+/// before it committed, `PENDING` and undispatched, for as long as the database is away. So a
+/// later batch reports the failure, and the sweep returns what it has.
+#[tokio::test]
+async fn a_later_batch_does_not_wait_out_a_lost_connection() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let (sys, db) = sysdb().await;
+    if skip_dequeue_completeness(&db) {
+        return;
+    }
+    let name = unique_queue("sweep-batch-loses-connection");
+    let queue = partitioned_queue(&sys, name).await;
+    let ids = enqueue_across_partitions(&sys, name, PARTITIONED_DEQUEUE_BATCH_SIZE + 1).await;
+
+    // The second batch loses its connection once; retried, it would claim the last partition.
+    let batches = Arc::new(AtomicUsize::new(0));
+    let hook = dbos::__test_hooks::on(dbos::__test_hooks::points::PARTITION_CLAIM, name, {
+        let batches = Arc::clone(&batches);
+        move || {
+            let second = batches.fetch_add(1, Ordering::SeqCst) == 1;
+            async move {
+                if second {
+                    return Err(Error::Backend(BackendError {
+                        message: "connection lost, injected by a test hook".to_owned(),
+                        sqlstate: None,
+                        kind: BackendErrorKind::Connection,
+                    }));
+                }
+                Ok(())
+            }
+        }
+    });
+    let started = sys
+        .start_queued_partitioned_workflows(&queue, "exec-1", "v1", "claim", None)
+        .await
+        .expect("the first batch's claims should be returned");
+    assert_eq!(
+        hook.fired(),
+        2,
+        "the failed batch should not have been retried"
+    );
+    drop(hook);
+    assert_eq!(started, ids[..PARTITIONED_DEQUEUE_BATCH_SIZE]);
+    assert_eq!(
+        sys.get_workflow(ids.last().unwrap())
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        WorkflowStatus::Enqueued
+    );
 }
 
 /// A batch that fails before any batch committed fails the sweep, which claimed nothing, and the

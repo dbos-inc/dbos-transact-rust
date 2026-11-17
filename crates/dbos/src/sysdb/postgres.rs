@@ -793,12 +793,13 @@ impl PostgresSystemDatabase {
     }
 }
 
-/// A claim lock's name: its parts as a compact JSON array, exactly as `JSON.stringify` writes one.
+/// A claim lock's name: its parts as a compact JSON array.
 ///
-/// **Every SDK derives its claim locks from the same name**, so a Rust claimer and a Python or
-/// TypeScript one on the same queue take the same lock and exclude each other. `serde_json` writes
-/// these parts as `JSON.stringify` does: no whitespace, `null` for a missing part, and non-ASCII
-/// characters unescaped.
+/// **Every SDK derives its claim locks from the same name**, so claimers in any language on the
+/// same queue take the same lock and exclude each other. That makes the exact text part of the
+/// protocol: no whitespace, `null` for a missing part, quotes, backslashes and control characters
+/// escaped, and every other character, non-ASCII included, written as itself — which is what
+/// `serde_json` writes.
 fn lock_name(parts: &[Option<&str>]) -> String {
     serde_json::to_string(parts).expect("a list of strings always serializes")
 }
@@ -6925,8 +6926,8 @@ impl SystemDatabase for PostgresSystemDatabase {
         //
         // So the claim first takes a transaction-scoped advisory lock on the budget's scope: the
         // partition when every shared limit it spends is the partition's, and the whole queue when
-        // any is queue-wide. Every SDK names the lock alike, so claimers in other languages are
-        // excluded too, provided they are recent enough to take it.
+        // any is queue-wide. Every SDK names the lock alike, so claimers in any language on the
+        // same queue exclude each other, provided they are recent enough to take it.
         //
         // Not on CockroachDB, which grants every advisory lock: there the claim runs at
         // `SERIALIZABLE` instead, and the loser of a race is aborted.
@@ -6946,17 +6947,31 @@ impl SystemDatabase for PostgresSystemDatabase {
             None
         };
 
-        // Conflicts are not replayed here. A dequeue raised above read committed expects to lose
-        // races to its peers, and its caller's answer to a lost one — poll again later, or skip
-        // this partition — is the right one, which a replay underneath it would hide.
+        // **The isolation level is pinned, never left to the server's default.** Under the claim
+        // lock it has to be read committed: each statement then sees what the lock's previous
+        // holder committed, where a snapshot taken any earlier — at repeatable read, when the
+        // lock statement starts, before the lock is granted — would count a stale total and admit
+        // past the budget. A database, role or connection defaulting to repeatable read is
+        // ordinary configuration, so the claim does not trust the default. Without the lock, a
+        // shared budget runs at serializable (CockroachDB, which can default to read committed);
+        // without a shared budget nothing here reads a total, and the default does.
+        let begin = match claim_lock {
+            Some(_) => Some("BEGIN ISOLATION LEVEL READ COMMITTED"),
+            None if has_shared_budget => Some("BEGIN ISOLATION LEVEL SERIALIZABLE"),
+            None => None,
+        };
+
+        // Conflicts are not replayed here. A claim expects to lose races to its peers — a `NOWAIT`
+        // row lock a peer holds, or on CockroachDB a serialization failure — and its caller's
+        // answer to a lost one, poll again later or skip this partition, is the right one, which a
+        // replay underneath it would hide.
         let retry = self.retry.without_conflict_replay();
         with_retry(&retry, "start_queued_workflows", move || async move {
-            let mut tx = pool.begin().await?;
+            let mut tx = match begin {
+                Some(statement) => pool.begin_with(statement).await?,
+                None => pool.begin().await?,
+            };
 
-            // **Read committed under the claim lock**, and it has to be: each statement then sees
-            // what the lock's previous holder committed, which a snapshot taken any earlier — at
-            // repeatable read, the lock statement's own — would not. Without a shared budget
-            // nothing here reads a total, so read committed is enough there too.
             if let Some((key, stop)) = claim_lock {
                 let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
                     .bind(key)
@@ -6969,10 +6984,6 @@ impl SystemDatabase for PostgresSystemDatabase {
                     tracing::debug!(queue = %queue.name, ?stop, "a peer holds the claim lock");
                     return Ok(stopped(stop));
                 }
-            } else if has_shared_budget {
-                sqlx::raw_sql("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
-                    .execute(&mut *tx)
-                    .await?;
             }
 
             let mut max_tasks = worker_max_tasks;
@@ -7350,12 +7361,21 @@ impl SystemDatabase for PostgresSystemDatabase {
         //
         // Two `int` keys rather than the claim lock's one `bigint`: the queue's, then the
         // partition's, which lets one statement lock a batch. Every SDK computes the same pair.
-        // Not on CockroachDB, which grants every advisory lock: there each batch relies on the
-        // `SERIALIZABLE` it runs at by default, which aborts the sweep that would co-admit.
+        // Not on CockroachDB, which grants every advisory lock: there each batch runs at
+        // `SERIALIZABLE`, which aborts the sweep that would co-admit.
         let partition_locks = if self.claims_take_locks().await? {
             Some(partition_claim_queue_id(&self.schema, &queue.name))
         } else {
             None
+        };
+        // **Pinned, never the server's default**, for the reason `start_queued_workflows` gives:
+        // under the locks, read committed is what lets the heads picked again see what the locks'
+        // previous holders committed. Without them, serializable is the whole of the protection,
+        // and a CockroachDB cluster can default to read committed.
+        let begin_batch = if partition_locks.is_some() {
+            "BEGIN ISOLATION LEVEL READ COMMITTED"
+        } else {
+            "BEGIN ISOLATION LEVEL SERIALIZABLE"
         };
 
         // Conflicts are not replayed, as in `start_queued_workflows`: losing a race is the caller's
@@ -7439,15 +7459,28 @@ impl SystemDatabase for PostgresSystemDatabase {
 
         // **One short transaction per batch**, so a sweep holds at most a batch's locks, and only
         // while it claims that batch: a peer's sweep waits for none of them, it passes them by.
+        //
+        // **Only the first batch waits out a lost connection.** Once a batch has committed, its
+        // claims are `PENDING` and reach dispatch only when this sweep returns, so a later batch
+        // that blocked on a connection failure would hold them back for as long as the database
+        // is away. A later batch reports the failure instead, and the sweep returns what it has.
+        let later_batch_retry = RetryPolicy {
+            retry_connection_errors: false,
+            ..retry
+        };
         let mut started: Vec<String> = Vec::new();
         for batch in partitions.chunks(PARTITIONED_DEQUEUE_BATCH_SIZE) {
             let lock_ids: Vec<i32> = batch.iter().map(|pk| partition_claim_lock_id(pk)).collect();
             let (version_predicate, lock_ids) = (version_predicate.as_str(), lock_ids.as_slice());
             let claimed = with_retry(
-                &retry,
+                if started.is_empty() {
+                    &retry
+                } else {
+                    &later_batch_retry
+                },
                 "start_queued_partitioned_workflows",
                 move || async move {
-                    let mut tx = pool.begin().await?;
+                    let mut tx = pool.begin_with(begin_batch).await?;
                     test_hook!(crate::test_hooks::points::PARTITION_LOCKS, &queue.name)?;
 
                     // The partitions of this batch no peer is claiming from. One a peer holds is
@@ -10060,16 +10093,15 @@ mod tests {
         );
     }
 
-    /// **The claim lock keys are byte-identical to every other SDK's**, or a Rust claimer and a
-    /// Python or TypeScript one on the same queue would take different locks and both spend the
-    /// budget.
+    /// **The claim lock keys follow the formula every SDK shares**, or claimers in different
+    /// languages on the same queue would take different locks and both spend the budget.
     ///
-    /// The expected values were computed with Python's `advisory_lock_key(lock_name(...))` from
-    /// `dbos/_sys_db.py`, and cross-checked against TypeScript's `JSON.stringify` and
-    /// `readBigInt64BE` / `readInt32BE` over the same SHA-256.
+    /// The expected values pin that formula: the name as compact JSON, then the SHA-256 of its
+    /// UTF-8 bytes read big-endian — its first eight bytes for a claim lock, bytes 4–7 of the
+    /// partition-claim name and bytes 0–3 of the partition key's own hash for the sweep's pair.
     #[test]
-    fn claim_lock_keys_match_the_other_sdks() {
-        // The name itself, character for character: what `JSON.stringify` writes.
+    fn claim_lock_keys_follow_the_shared_formula() {
+        // The name itself, character for character.
         assert_eq!(
             lock_name(&[Some("dbos.queue_claim"), Some("dbos"), Some("orders"), None]),
             r#"["dbos.queue_claim","dbos","orders",null]"#
@@ -10077,7 +10109,7 @@ mod tests {
         assert_eq!(
             lock_name(&[Some("q\"\u{1}\u{8}\u{c}\u{7f}\u{2028}é😀")]),
             "[\"q\\\"\\u0001\\b\\f\u{7f}\u{2028}é😀\"]",
-            "quotes and control characters escaped as JSON.stringify does, nothing else"
+            "quotes and control characters escaped, nothing else"
         );
 
         for (schema, queue, partition, key) in [

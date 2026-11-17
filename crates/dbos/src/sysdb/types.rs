@@ -2505,7 +2505,10 @@ pub struct Dequeued {
 /// worker concurrency, then the rate limits, then the concurrency limits, the queue-wide one ahead
 /// of the per-partition one at each step. A claim lock is met between the worker limits and the
 /// rest, since the limits counted in the database are counted only once it is held.
+///
+/// Non-exhaustive: a new way for a claim to stop is not a breaking change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DequeueStop {
     /// This process is already running as many of the queue's workflows as it may.
     WorkerConcurrency,

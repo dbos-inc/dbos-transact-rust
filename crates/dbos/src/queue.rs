@@ -167,9 +167,8 @@ impl Queue {
 /// queue carrying either serialize its claims on a lock over the budget; the per-process pair is
 /// answered from a local tally without a round trip, which is why it is the cheap limit.
 ///
-/// **Exact only once every claimer on the queue takes that lock**: this crate from 0.7, Python
-/// from 3.5.0 and TypeScript from v5.5. An older claimer sharing the queue can still admit a
-/// workflow beside one of these.
+/// **Exact only once every claimer on the queue takes that lock.** An older claimer sharing the
+/// queue that does not take it can still admit a workflow past the budget.
 ///
 /// **Every limit set is enforced, and the tightest wins.** They are not alternatives: a queue can
 /// say "sixty at a time overall, four per customer, and no more than two of those in any one

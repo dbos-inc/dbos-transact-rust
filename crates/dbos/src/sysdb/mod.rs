@@ -67,7 +67,7 @@ pub const PARTITIONED_DEQUEUE_SWEEP_CAP: u32 = 8192;
 ///
 /// Bounds how many partition locks a sweep holds at once, and for how long: each batch is its own
 /// short transaction, so a peer's sweep meets at most this many held partitions, and only while
-/// this one claims them. The same size as the other SDKs' sweeps.
+/// this one claims them.
 pub const PARTITIONED_DEQUEUE_BATCH_SIZE: usize = 64;
 
 pub mod error;
@@ -1381,7 +1381,7 @@ pub trait SystemDatabase: Send + Sync {
     /// alone would not do, because two claimers whose candidates differ pick different heads and
     /// lock different rows. The claim then counts, selects and claims at `READ COMMITTED`, so it
     /// sees what the lock's previous holder committed, and locks its rows with `NOWAIT`. The lock
-    /// is named alike in every SDK, so claimers in other languages take turns too.
+    /// is named alike in every SDK, so claimers in any language on the same queue take turns.
     ///
     /// **A claim that finds the lock held claims nothing** and reports
     /// [`DequeueStop::ClaimLock`] or [`DequeueStop::PartitionClaimLock`]: a peer is claiming
