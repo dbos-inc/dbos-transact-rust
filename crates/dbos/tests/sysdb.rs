@@ -12514,7 +12514,6 @@ async fn queue_partitions_are_the_keys_with_work() {
 /// it. The claim matches each head with the key it was chosen under, so the moved one is dropped.
 ///
 /// The resume is made by a hook at the point between the two, so the window is exactly that one.
-#[cfg(feature = "test-hooks")]
 #[tokio::test]
 async fn a_head_resumed_into_another_partition_mid_sweep_is_not_claimed() {
     use std::sync::Arc;
