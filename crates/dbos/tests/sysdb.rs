@@ -4657,7 +4657,8 @@ async fn the_bulk_readers_return_notifications_events_and_streams() {
         "INSERT INTO dbos.notifications (message_uuid, destination_uuid, topic, message, \
          serialization, created_at_epoch_ms, consumed) \
          VALUES ('msg-2', 'wf-bulk', 'orders', '\"second\"', 'portable_json', 2000, false), \
-                ('msg-1', 'wf-bulk', NULL, '\"first\"', NULL, 1000, true)",
+                ('msg-1', 'wf-bulk', NULL, '\"first\"', NULL, 1000, true), \
+                ('msg-3', 'wf-bulk', '__null__topic__', '\"third\"', NULL, 3000, false)",
         "INSERT INTO dbos.workflow_events (workflow_uuid, key, value, serialization) \
          VALUES ('wf-bulk', 'progress', '50', 'portable_json'), ('wf-bulk', 'answer', '42', NULL)",
         "INSERT INTO dbos.streams (workflow_uuid, key, \"offset\", value, serialization, \
@@ -4674,10 +4675,13 @@ async fn the_bulk_readers_return_notifications_events_and_streams() {
 
     // Oldest first, and a consumed message is still reported.
     let notifications = sys.get_all_notifications("wf-bulk").await.unwrap();
-    assert_eq!(notifications.len(), 2);
+    assert_eq!(notifications.len(), 3);
     assert_eq!(notifications[0].message_uuid, "msg-1");
     assert_eq!(notifications[0].message, "\"first\"");
-    assert_eq!(notifications[0].topic, None, "the default topic is NULL");
+    // A NULL topic and the sentinel every SDK writes for the default topic both read as none.
+    assert_eq!(notifications[0].topic, None, "a NULL topic");
+    assert_eq!(notifications[2].message_uuid, "msg-3");
+    assert_eq!(notifications[2].topic, None, "the default topic's sentinel");
     assert!(
         notifications[0].consumed,
         "receiving marks rather than deletes, so this must still be visible",

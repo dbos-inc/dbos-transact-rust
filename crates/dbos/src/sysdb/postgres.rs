@@ -6177,7 +6177,11 @@ impl SystemDatabase for PostgresSystemDatabase {
                 .map(|row| {
                     Ok(NotificationRecord {
                         message_uuid: row.try_get("message_uuid")?,
-                        topic: row.try_get("topic")?,
+                        // The default topic is stored as a sentinel every SDK writes and
+                        // recognises, and read back as the absence of a topic it stands for.
+                        topic: row
+                            .try_get::<Option<String>, _>("topic")?
+                            .filter(|topic| topic != NULL_TOPIC),
                         message: row.try_get("message")?,
                         serialization: row.try_get("serialization")?,
                         created_at: Timestamp::from_epoch_ms(row.try_get("created_at_epoch_ms")?),

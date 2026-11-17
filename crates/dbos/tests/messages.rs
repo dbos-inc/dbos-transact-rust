@@ -238,6 +238,62 @@ async fn topics_do_not_cross_and_absence_is_a_value() {
     dbos.shutdown().await;
 }
 
+/// **The default topic reads back as no topic, not as the sentinel it is stored under.**
+///
+/// A message sent with no topic is written under a name every SDK recognises. Listing what a
+/// workflow was sent reports it as the absence of a topic, as the record's documentation says, so
+/// a caller such as Conductor does not show the sentinel to anyone.
+#[dbos_test_support::test]
+async fn the_default_topic_reads_back_as_no_topic() {
+    let release_gate = Arc::new(tokio::sync::Notify::new());
+    let db = test_database().await;
+    let dbos = DBOS::new(config("default-topic-app", &db));
+    let waiting = {
+        let release = Arc::clone(&release_gate);
+        dbos.register_workflow("waiting", move |()| {
+            let release = Arc::clone(&release);
+            async move {
+                release.notified().await;
+                Ok::<_, dbos::Error>(())
+            }
+        })
+        .unwrap()
+    };
+    dbos.launch().await.expect("launch failed");
+    let handle = waiting.start(()).await.expect("start failed");
+    let workflow_id = handle.workflow_id().to_owned();
+
+    for topic in [None, Some("approvals")] {
+        dbos.send_with(
+            SendMessage {
+                topic,
+                ..SendMessage::new(&workflow_id, &"hello")
+            },
+            SendOptions::default(),
+        )
+        .await
+        .expect("send failed");
+    }
+
+    let mut topics: Vec<Option<String>> = reader(&db)
+        .await
+        .get_all_notifications(&workflow_id)
+        .await
+        .expect("read failed")
+        .into_iter()
+        .map(|notification| notification.topic)
+        .collect();
+    topics.sort();
+    assert_eq!(topics, [None, Some("approvals".to_owned())]);
+
+    release_gate.notify_one();
+    dbos::__rt::timeout(DEADLINE, handle.result())
+        .await
+        .expect("the workflow never finished")
+        .expect("the workflow failed");
+    dbos.shutdown().await;
+}
+
 /// A replay returns the message the first run took and does not consume a second one.
 ///
 /// The property the whole checkpoint exists for: a message taken but forgotten would be gone with

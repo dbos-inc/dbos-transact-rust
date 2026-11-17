@@ -2565,6 +2565,11 @@ pub struct NotificationRecord {
     /// the same topic.
     pub message_uuid: String,
     /// The topic it was sent on, or `None` for the default topic.
+    ///
+    /// The default topic is stored as the sentinel [`NULL_TOPIC`](super::NULL_TOPIC), which every
+    /// SDK writes and `recv` looks for, and is read back as `None`. **A writer that stores a record
+    /// again, such as an import, must write [`NULL_TOPIC`](super::NULL_TOPIC) for `None`**: a row
+    /// with a NULL topic is one no receive ever finds.
     pub topic: Option<String>,
     /// Encoded payload.
     pub message: String,
