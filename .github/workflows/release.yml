@@ -21,7 +21,7 @@ permissions:
 jobs:
   verify:
     name: Verify the tag
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
@@ -60,7 +60,7 @@ jobs:
 
   docs-rs:
     name: Documentation as docs.rs will build it
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # On the latest nightly rather than CI's dated one, because that is what docs.rs builds the
     # published crate with. Without `-D warnings`, as docs.rs builds: this is here to catch a build
     # docs.rs would fail, such as a change to the unstable `doc_cfg`, not a new lint.
@@ -75,7 +75,7 @@ jobs:
 
   package:
     name: Package and verify both crates
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Verifying builds the crates, which runs their dependencies' build scripts and proc macros. So
     # it runs here, in a job that can't request an OIDC token, rather than in the publish job, where
     # any step could request one and trade it for a crates.io publish token.
@@ -91,7 +91,7 @@ jobs:
   publish:
     name: Publish to crates.io
     needs: [verify, docs-rs, package]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # The environment is what limits publishing to release tags. crates.io's trusted publisher for
     # each crate names it, and its deployment policy admits only `v*` tags, which only admins can
     # push. Without it, a run of an edited copy of this file on any branch could publish.
@@ -119,7 +119,7 @@ jobs:
   github-release:
     name: Draft the GitHub release
     needs: [verify, publish]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:

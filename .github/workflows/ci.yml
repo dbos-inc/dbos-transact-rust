@@ -18,12 +18,19 @@ concurrency:
   # record you actually want when a merge turns the suite red.
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
+# Runners are pinned to `ubuntu-24.04` rather than `ubuntu-latest`, which GitHub is moving to
+# Ubuntu 26.04 (actions/runner-images#14748) and warns about on every job until it has. The suite
+# starts its databases in Docker and pulls their images on every run, and 26.04's Docker 29
+# defaults to the containerd image store, which users of the new image report leaving images
+# incomplete after a pull. Move to `ubuntu-26.04` deliberately, with a green run, when that is
+# settled; `release.yml` pins the same way.
+#
 # Third-party actions are pinned by tag here for readability. Pin them by commit SHA
 # before this repository goes public.
 jobs:
   lint:
     name: Format and lint
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -35,7 +42,7 @@ jobs:
 
   deny:
     name: Licenses and advisories
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - uses: EmbarkStudios/cargo-deny-action@v2
@@ -44,7 +51,7 @@ jobs:
 
   msrv:
     name: Minimum supported Rust version
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Keep in step with `rust-version` in the workspace manifest: latest stable minus two.
     # This job is the only thing that makes that number true.
     env:
@@ -60,7 +67,7 @@ jobs:
 
   docs:
     name: Documentation
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Catches broken intra-doc links, which are how documentation goes stale without anyone
     # noticing: a renamed type leaves every `[`OldName`]` reference pointing at nothing, and
     # nothing else in the build complains.
@@ -74,7 +81,7 @@ jobs:
 
   docs-rs:
     name: Documentation as docs.rs builds it
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # On nightly, as docs.rs is, because the feature badges need it. A dated one, so that a new
     # nightly lint can't fail an unrelated pull request. The Release workflow repeats this build on
     # the latest nightly, which is what docs.rs uses, before it publishes. Bump the date when you
@@ -92,7 +99,7 @@ jobs:
 
   core-only:
     name: Core-only build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # The library must compile with the engine feature off. This is the boundary between
     # the system database / Conductor layers and everything built on top of them, and a
     # compile failure here is the only thing that catches a stray dependency across it.
@@ -111,7 +118,7 @@ jobs:
 
   runtimes:
     name: Builds on ${{ matrix.runtime }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # The non-tokio runtimes, each alone, with and without the engine. Alone is the point: tokio
     # leaves the build with `tokio/time`, so a `tokio::time` call that bypassed `crate::rt` fails to
     # compile here, where everywhere else it would compile and only panic at run time on another
@@ -129,7 +136,7 @@ jobs:
 
   test-runtimes:
     name: Test on ${{ matrix.runtime }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 25
     # A subset of the suite, against Postgres only, on each non-tokio runtime. What varies by
     # runtime is spawning, timers and the task handles built over them, so the subset is the
@@ -179,7 +186,7 @@ jobs:
 
   test:
     name: Test (${{ matrix.backend }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Both legs run in well under ten minutes, so this is a hang guard rather than a budget.
     # Without it a single stuck test burns GitHub's six-hour default before saying anything:
     # `with_retry` has no attempt limit by design, so any error it classes as transient or
