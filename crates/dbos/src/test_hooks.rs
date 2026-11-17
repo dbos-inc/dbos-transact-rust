@@ -103,13 +103,20 @@ impl Guard {
 
 impl Drop for Guard {
     fn drop(&mut self) {
-        let mut registry = registry();
-        if let Some(map) = registry.as_mut()
-            && map.get(&self.key).is_some_and(|entry| entry.id == self.id)
-        {
-            map.remove(&self.key);
-            REGISTERED.fetch_sub(1, Ordering::SeqCst);
-        }
+        // The removed entry is dropped *after* the lock is released. Dropping it drops the hook's
+        // closure, and one that owns another hook's guard would drop that guard here, which locks
+        // the registry again: a deadlock, on a mutex that is not reentrant.
+        let removed = {
+            let mut registry = registry();
+            match registry.as_mut() {
+                Some(map) if map.get(&self.key).is_some_and(|entry| entry.id == self.id) => {
+                    REGISTERED.fetch_sub(1, Ordering::SeqCst);
+                    map.remove(&self.key)
+                }
+                _ => None,
+            }
+        };
+        drop(removed);
     }
 }
 

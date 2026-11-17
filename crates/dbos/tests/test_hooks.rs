@@ -225,3 +225,26 @@ fn two_hooks_on_one_point_and_scope_are_refused() {
     let _first = on(points::STEP_COMMIT, &scope, || async { Ok(()) });
     let _second = on(points::STEP_COMMIT, &scope, || async { Ok(()) });
 }
+
+/// **Dropping a guard whose hook owns another guard does not deadlock.**
+///
+/// Removing a hook drops its closure, and a closure that captured another hook's guard drops that
+/// guard too, which takes the registry's lock again. The drop has to happen after the lock is
+/// released. A deadlock would hang the test, so the drop runs on a thread the test waits on.
+#[test]
+fn dropping_a_guard_whose_hook_owns_another_guard_does_not_hang() {
+    let inner = on(points::STEP_COMMIT, unique("wf-inner"), || async { Ok(()) });
+    let outer = on(points::STEP_COMMIT, unique("wf-outer"), move || {
+        let _owned = &inner;
+        async { Ok(()) }
+    });
+
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        drop(outer);
+        let _ = done.send(());
+    });
+    finished
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("dropping the outer guard deadlocked on the registry lock");
+}
