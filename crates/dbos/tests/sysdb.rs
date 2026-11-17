@@ -299,7 +299,8 @@ async fn queued_workflows_do_not_accrue_attempts() {
 }
 
 /// **Dead-lettering parks a workflow**, clearing its owner but keeping its queue, but only a
-/// `PENDING` row with at least the attempts its caller read: a row a resume reset meanwhile is left alone.
+/// `PENDING` row with at least the attempts its caller read: a row a resume reset meanwhile is
+/// left alone.
 ///
 /// The limit is what stops a workflow that crashes its executor from taking down every executor
 /// in turn. Parking is deliberate rather than an error state: the row stays, and can be resumed
@@ -2073,13 +2074,15 @@ async fn cancelling_children_descends_the_whole_tree() {
                 started_at: Timestamp::now(),
                 owner_xid,
             });
-        sys.init_workflow(
-            &NewWorkflow::new(id),
-            caller,
-            WorkflowIdReusePolicy::ReturnExisting,
-        )
-        .await
-        .unwrap();
+        // The last generation is queued, to see the cascade leave it there. The others cannot
+        // be: a generation's owner token is what the next one is seeded under.
+        let queued = NewWorkflow {
+            queue_name: (id == "wf-grandchild").then_some("tree-queue"),
+            ..NewWorkflow::new(id)
+        };
+        sys.init_workflow(&queued, caller, WorkflowIdReusePolicy::ReturnExisting)
+            .await
+            .unwrap();
     }
 
     let mut cancelled = sys
@@ -2088,6 +2091,16 @@ async fn cancelling_children_descends_the_whole_tree() {
         .unwrap();
     cancelled.sort();
     assert_eq!(cancelled, ["wf-child", "wf-grandchild", "wf-root"]);
+    assert_eq!(
+        sys.get_workflow("wf-grandchild")
+            .await
+            .unwrap()
+            .unwrap()
+            .queue_name
+            .as_deref(),
+        Some("tree-queue"),
+        "a cascade keeps the queue of the descendants it cancels",
+    );
 
     let untouched = sys.get_workflow("wf-unrelated").await.unwrap().unwrap();
     assert_eq!(
@@ -2389,6 +2402,41 @@ async fn a_fork_inherits_the_queue_columns_of_its_source() {
     let fork = sys.get_workflow("wf-direct-fork").await.unwrap().unwrap();
     assert_eq!(fork.queue_name.as_deref(), Some(INTERNAL_QUEUE));
     assert_eq!(fork.queue_partition_key, None);
+}
+
+/// **A resume refuses an empty queue name or partition key** rather than writing one: an empty
+/// partition key is one the partitioned sweep refuses on every poll, so the row would sit
+/// `ENQUEUED` with an error logged each time.
+#[tokio::test]
+async fn a_resume_refuses_an_empty_queue_or_partition_key() {
+    let (sys, _db) = sysdb().await;
+    enqueue_delayed(&sys, "wf-empty").await;
+    sys.cancel_workflows(&["wf-empty"], false, None, None)
+        .await
+        .unwrap();
+
+    for (queue, key, field) in [
+        (Some(""), None, "queue_name"),
+        (None, Some(""), "queue_partition_key"),
+    ] {
+        match sys
+            .resume_workflows(&["wf-empty"], queue, key, None, None)
+            .await
+        {
+            Err(Error::InvalidInput { field: named, .. }) => assert_eq!(named, field),
+            other => panic!("expected {field} to be refused, got {other:?}"),
+        }
+    }
+    let read = sys.get_workflow("wf-empty").await.unwrap().unwrap();
+    assert_eq!(
+        read.status,
+        WorkflowStatus::Cancelled,
+        "a refusal moves nothing"
+    );
+    assert_eq!(
+        queue_columns(&sys, "wf-empty").await,
+        columns("keep-queue", "p0", 3)
+    );
 }
 
 /// Resuming an id that does not exist says so; cancelling one does not.
@@ -15474,7 +15522,7 @@ async fn the_timeout_sweep_takes_the_oldest_deadlines_first_up_to_its_limit() {
 /// owner's cancel goes through once the database's clock is past the deadline.
 #[tokio::test]
 async fn a_timeout_cancel_lands_only_for_the_owner() {
-    let (sys, _db) = sysdb().await;
+    let (sys, db) = sysdb().await;
     let past = NewWorkflow {
         deadline: Some(Timestamp::from_epoch_ms(1_000)),
         ..workflow("wf-expired")
@@ -15482,6 +15530,13 @@ async fn a_timeout_cancel_lands_only_for_the_owner() {
     sys.init_workflow(&past, None, WorkflowIdReusePolicy::ReturnExisting)
         .await
         .unwrap();
+    // As a claimed queue row is: running, and still named for its queue.
+    sqlx::query(
+        r#"UPDATE "dbos"."workflow_status" SET queue_name = 'q' WHERE workflow_uuid = 'wf-expired'"#,
+    )
+    .execute(&db.pool().await)
+    .await
+    .unwrap();
     let row = sys.get_workflow("wf-expired").await.unwrap().unwrap();
     let owner = row.owner_xid.expect("a started row is owned");
 
@@ -15498,6 +15553,7 @@ async fn a_timeout_cancel_lands_only_for_the_owner() {
     let row = sys.get_workflow("wf-expired").await.unwrap().unwrap();
     assert_eq!(row.status, WorkflowStatus::Cancelled);
     assert_eq!(row.owner_xid, None, "the cancel clears the owner");
+    assert_eq!(row.queue_name.as_deref(), Some("q"), "and keeps the queue");
 }
 
 /// **The owner token through a workflow's life.** A claim writes its own token, a different one

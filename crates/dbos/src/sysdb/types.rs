@@ -2965,8 +2965,9 @@ pub enum ForkPoint<'a> {
 
 /// How forked workflows are created.
 ///
-/// The defaults are what happens when the caller says nothing: the fork is enqueued on the internal
-/// queue, inherits its source's version, and carries no timeout.
+/// The defaults are what happens when the caller says nothing: the fork is enqueued on its
+/// source's queue, or the internal queue for a source that has none, and inherits its source's
+/// version, partition key and priority. It carries no timeout.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ForkOptions<'a> {
     /// The version the fork runs under. `None` inherits the source's.

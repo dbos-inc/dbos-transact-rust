@@ -1389,7 +1389,7 @@ impl PostgresSystemDatabase {
                 COALESCE($4, w.application_version), w.application_id, w.authenticated_user, \
                 w.authenticated_roles, w.assumed_role, w.serialization, w.request, \
                 COALESCE($5, NULLIF(w.queue_name, ''), $9), \
-                COALESCE($6, w.queue_partition_key), COALESCE(w.priority, 0), \
+                COALESCE($6, NULLIF(w.queue_partition_key, '')), COALESCE(w.priority, 0), \
                 w.workflow_uuid, w.attributes, $7, \
                 COALESCE(w.application_name, $8) \
              FROM unnest($1::text[], $2::text[], $3::int4[]) \
@@ -1526,7 +1526,8 @@ impl PostgresSystemDatabase {
         tracing::info!(
             count = original_ids.len(),
             queue = options.queue_name,
-            "forked workflows onto the queue"
+            partition_key = options.queue_partition_key,
+            "forked workflows; a queue or partition not named is the source's"
         );
         Ok(tx)
     }
@@ -4664,6 +4665,19 @@ impl SystemDatabase for PostgresSystemDatabase {
         from_workflow: Option<&str>,
         caller: Option<StepCaller<'_>>,
     ) -> Result<Vec<String>, Error> {
+        // Refused rather than written: an empty queue name is no queue, and an empty partition
+        // key is one the partitioned sweep refuses on every poll, which would strand the row.
+        for (field, value) in [
+            ("queue_name", queue_name),
+            ("queue_partition_key", queue_partition_key),
+        ] {
+            if value == Some("") {
+                return Err(Error::InvalidInput {
+                    field: field.into(),
+                    detail: "must be absent rather than empty".to_owned(),
+                });
+            }
+        }
         // Empty and uncheckpointed, so there is nothing to record and nothing to run: see
         // `cancel_workflows` for why the caller decides this.
         if workflow_ids.is_empty() && caller.is_none() {
@@ -4710,7 +4724,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                     let resumed: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
                         "UPDATE {workflow_table} SET status = 'ENQUEUED', \
                          queue_name = COALESCE($2, NULLIF(queue_name, ''), $4), \
-                         queue_partition_key = COALESCE($3, queue_partition_key), \
+                         queue_partition_key = COALESCE($3, NULLIF(queue_partition_key, '')), \
                          recovery_attempts = 0, workflow_deadline_epoch_ms = NULL, owner_xid = NULL, \
                          deduplication_id = NULL, started_at_epoch_ms = NULL, completed_at = NULL, \
                          updated_at = {NOW_MS_SQL} \
@@ -5088,7 +5102,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                     let updated = sqlx::query(AssertSqlSafe(format!(
                         "UPDATE {workflow_table} SET status = 'ENQUEUED', \
                          queue_name = COALESCE($3, NULLIF(queue_name, ''), $6), \
-                         queue_partition_key = COALESCE($4, queue_partition_key), \
+                         queue_partition_key = COALESCE($4, NULLIF(queue_partition_key, '')), \
                          application_version = COALESCE($5, application_version), \
                          recovery_attempts = 0, owner_xid = NULL, \
                          workflow_deadline_epoch_ms = NULL, deduplication_id = NULL, \
@@ -7230,7 +7244,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                 // newlines that would end them, so a `--` comments out the whole rest of the
                 // statement — including the `) head ON TRUE` alias, which fails as a missing
                 // FROM-clause entry rather than as a syntax error.
-                let candidates: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
+                let candidates: Vec<(String, String)> = sqlx::query_as(AssertSqlSafe(format!(
                     "WITH RECURSIVE partitions AS ( \
                        (SELECT MIN(queue_partition_key) AS pk FROM {workflow_table} \
                          WHERE {eligible_predicate} AND queue_partition_key IS NOT NULL) \
@@ -7250,7 +7264,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                           ) \
                         ORDER BY {sweep_order} LIMIT $4 \
                      ) \
-                     SELECT head.workflow_uuid FROM chosen \
+                     SELECT head.workflow_uuid, chosen.pk FROM chosen \
                      JOIN LATERAL ( \
                        SELECT workflow_uuid FROM {workflow_table} \
                         WHERE {eligible_predicate} AND queue_partition_key = chosen.pk \
@@ -7271,15 +7285,29 @@ impl SystemDatabase for PostgresSystemDatabase {
                 }
 
                 // Re-checks queue, partition and version alongside status, so a row that
-                // `resume_workflows` moved to another queue mid-sweep is dropped rather than
-                // hijacked. $1 ids, $2 queue, $3 version, $4 application.
-                let claim_predicate = format!(
-                    "workflow_uuid = ANY($1::text[]) AND status = 'ENQUEUED' \
-                       AND queue_name = $2 AND queue_partition_key IS NOT NULL \
-                       AND {version_predicate} \
-                       AND ($4::text IS NULL OR application_name = $4 \
-                            OR application_name IS NULL)"
-                );
+                // `resume_workflows` moved to another queue or partition mid-sweep is dropped
+                // rather than hijacked. $1 ids, $2 queue, $3 version, $4 application, and the
+                // partition keys the candidates were chosen under at `{keys}`.
+                //
+                // **The key is checked against the one the head was chosen under, not just for
+                // being present.** A resume can now change the key of an `ENQUEUED` row, and at
+                // READ COMMITTED one that landed between the candidate query and this claim would
+                // pass a bare `IS NOT NULL`: the row would start in a partition whose running
+                // check never saw it, beside that partition's own `PENDING` row.
+                let claim_predicate = |keys: u8| {
+                    format!(
+                        "(workflow_uuid, queue_partition_key) IN \
+                           (SELECT * FROM unnest($1::text[], ${keys}::text[])) \
+                           AND status = 'ENQUEUED' AND queue_name = $2 \
+                           AND {version_predicate} \
+                           AND ($4::text IS NULL OR application_name = $4 \
+                                OR application_name IS NULL)"
+                    )
+                };
+                let (candidate_ids, candidate_keys): (Vec<&str>, Vec<&str>) = candidates
+                    .iter()
+                    .map(|(id, key)| (id.as_str(), key.as_str()))
+                    .unzip();
 
                 // This `SKIP LOCKED` under-delivers on CockroachDB for the reason given in
                 // `start_queued_workflows`: a head enqueued moments ago is skipped and its
@@ -7289,22 +7317,25 @@ impl SystemDatabase for PostgresSystemDatabase {
                 // `SKIP LOCKED` could slide past a locked head and admit a partition's second
                 // row ahead of its first.
                 let locked: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
-                    "SELECT workflow_uuid FROM {workflow_table} WHERE {claim_predicate} \
-                     FOR UPDATE SKIP LOCKED"
+                    "SELECT workflow_uuid FROM {workflow_table} WHERE {} \
+                     FOR UPDATE SKIP LOCKED",
+                    claim_predicate(5)
                 )))
-                .bind(&candidates)
+                .bind(&candidate_ids)
                 .bind(&queue.name)
                 .bind(application_version)
                 .bind(application_name)
+                .bind(&candidate_keys)
                 .fetch_all(&mut *tx)
                 .await?;
                 let locked: HashSet<&str> = locked.iter().map(String::as_str).collect();
                 // Partition order, so submission follows the sweep rather than the lock order.
-                let claiming: Vec<&str> = candidates
+                let (claiming, claiming_keys): (Vec<&str>, Vec<&str>) = candidate_ids
                     .iter()
-                    .map(String::as_str)
-                    .filter(|id| locked.contains(id))
-                    .collect();
+                    .zip(&candidate_keys)
+                    .filter(|(id, _)| locked.contains(**id))
+                    .map(|(id, key)| (*id, *key))
+                    .unzip();
                 if claiming.is_empty() {
                     tx.commit().await?;
                     return Ok(Vec::new());
@@ -7332,7 +7363,8 @@ impl SystemDatabase for PostgresSystemDatabase {
                              THEN {deadline_from_timeout} \
                              ELSE workflow_deadline_epoch_ms \
                          END \
-                     WHERE {claim_predicate} RETURNING workflow_uuid"
+                     WHERE {} RETURNING workflow_uuid",
+                    claim_predicate(7)
                 )))
                 .bind(&claiming)
                 .bind(&queue.name)
@@ -7340,6 +7372,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                 .bind(application_name)
                 .bind(executor_id)
                 .bind(owner_xid)
+                .bind(&claiming_keys)
                 .fetch_all(&mut *tx)
                 .await?;
 

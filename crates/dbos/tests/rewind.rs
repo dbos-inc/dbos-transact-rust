@@ -694,15 +694,12 @@ async fn a_rewind_chooses_the_queue_and_version_the_rerun_gets() {
     assert_eq!(runs.load(Ordering::SeqCst), 1);
 
     dbos.cancel(id).await.expect("cancel failed");
-    // The key was seeded by hand and is kept, but the internal queue is not partitioned and reads
-    // no keyed row, so a re-run would wait on it for good. Only a hand-edit puts a key there.
-    sqlx::query(
-        "UPDATE dbos.workflow_status SET queue_partition_key = NULL WHERE workflow_uuid = $1",
-    )
-    .bind(id)
-    .execute(&db.pool().await)
-    .await
-    .expect("clearing the key failed");
+    // The key it had is still on the row, and an unpartitioned queue dequeues a keyed row all the
+    // same: the re-run runs. That is a workflow moving from a partitioned queue to one that is not.
+    assert_eq!(
+        row(&reader, id).await.queue_partition_key.as_deref(),
+        Some("old-key")
+    );
     let rerun = dbos
         .rewind_with::<u32, EngineOnly>(
             id,

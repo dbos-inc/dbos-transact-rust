@@ -567,8 +567,9 @@ pub trait SystemDatabase: Send + Sync {
     ///
     /// Resuming clears the recovery-attempt count and the deadline: the workflow is being given
     /// a fresh start, and holding it to a deadline set before it was parked would fail it
-    /// immediately. Only what is given changes: `queue_name` and `queue_partition_key` keep the row's
-    /// own, and `queue_name` falls back to [`INTERNAL_QUEUE`] for a row that has none.
+    /// immediately. Only what is given changes: `queue_name` and `queue_partition_key` keep the
+    /// row's own, and `queue_name` falls back to [`INTERNAL_QUEUE`] for a row that has none. An
+    /// empty string for either is [`Error::InvalidInput`].
     ///
     /// Unlike [`cancel_workflows`](Self::cancel_workflows), an id with no row behind it is an
     /// [`Error::NonExistentWorkflow`]. The two differ because a zero-row update cannot tell

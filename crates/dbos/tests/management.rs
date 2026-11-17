@@ -478,6 +478,75 @@ async fn management_keeps_the_queue_through_an_instance_and_a_client() {
     dbos.shutdown().await;
 }
 
+/// **A resume refuses an empty queue name or partition key**, as a fork and a rewind do, from an
+/// instance and from a client, and moves nothing.
+#[tokio::test]
+async fn a_resume_refuses_an_empty_queue_or_partition_key() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("resume-empty-app", &db));
+    let workflow = dbos
+        .register_workflow("parked", |()| async move { Ok::<u32, Error>(1) })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+    workflow
+        .start_with(
+            (),
+            StartOptions {
+                workflow_id: Some("parked"),
+                queue: Some(QueueRequest::new("no-runner-here")),
+                ..StartOptions::default()
+            },
+        )
+        .await
+        .expect("enqueue failed");
+    dbos.cancel("parked").await.expect("cancel failed");
+    let client = Client::connect(ClientConfig {
+        app_name: Some("resume-empty-app".to_owned()),
+        ..ClientConfig::new(db.url())
+    })
+    .await
+    .expect("connect failed");
+
+    for options in [
+        ResumeOptions {
+            queue_name: Some(""),
+            ..ResumeOptions::default()
+        },
+        ResumeOptions {
+            queue_partition_key: Some(""),
+            ..ResumeOptions::default()
+        },
+    ] {
+        let by_instance = dbos
+            .resume_with::<u32, EngineOnly>("parked", options)
+            .await
+            .expect_err("an empty option was accepted");
+        assert!(
+            matches!(by_instance, Error::InvalidArgument { .. }),
+            "got {by_instance:?}"
+        );
+        let by_client = client
+            .resume_with::<u32, EngineOnly>("parked", options)
+            .await
+            .expect_err("an empty option was accepted");
+        assert!(
+            matches!(by_client, Error::InvalidArgument { .. }),
+            "got {by_client:?}"
+        );
+    }
+    let row = reader(&db)
+        .await
+        .get_workflow("parked")
+        .await
+        .expect("read failed")
+        .expect("the row is missing");
+    assert_eq!(row.status, WorkflowStatus::Cancelled, "a refusal moved it");
+    assert_eq!(row.queue_name.as_deref(), Some("no-runner-here"));
+
+    client.close().await;
+    dbos.shutdown().await;
+}
+
 /// **A fork onto a partitioned queue needs a partition key, and this source has none to give.**
 ///
 /// A partitioned queue is swept one partition at a time and every read that finds those

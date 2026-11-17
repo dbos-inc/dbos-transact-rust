@@ -337,11 +337,11 @@ pub struct ForkOptions<'a> {
     /// The partition of that queue, which a partitioned [`queue_name`](Self::queue_name) requires.
     /// `None` inherits the source's key.
     ///
-    /// Name one when forking onto a different partitioned queue than the source's. Such a queue is
-    /// swept one partition at a time and every read that does so is keyed — see
-    /// `get_queue_partitions`, which selects `WHERE queue_partition_key IS NOT NULL` — so an
-    /// unkeyed row belongs to no partition and no sweep will ever see it. It stays `ENQUEUED`,
-    /// and the handle waits on a workflow nothing will pick up.
+    /// A kept key works on any queue. Name one when the source has none and the fork goes onto a
+    /// partitioned queue: such a queue is swept one partition at a time and every read that does
+    /// so is keyed — see `get_queue_partitions`, which selects `WHERE queue_partition_key IS NOT
+    /// NULL` — so an unkeyed row belongs to no partition and no sweep will ever see it. It stays
+    /// `ENQUEUED`, and the handle waits on a workflow nothing will pick up.
     pub queue_partition_key: Option<&'a str>,
     /// How long the fork may run once it starts. `None` is unbounded, not the source's bound.
     pub timeout: Option<Duration>,
@@ -418,9 +418,9 @@ pub struct RewindOptions<'a> {
     /// The partition of that queue, which a partitioned [`queue_name`](Self::queue_name) requires.
     /// `None` keeps the key the workflow has.
     ///
-    /// Name one when moving the workflow onto a different partitioned queue. Such a queue sweeps
-    /// one partition at a time and never reads an unkeyed row, so a workflow left without a key
-    /// there never runs.
+    /// A kept key works on any queue. Name one when the workflow has none and moves onto a
+    /// partitioned queue: such a queue sweeps one partition at a time and never reads an unkeyed
+    /// row, so a workflow left without a key there never runs.
     pub queue_partition_key: Option<&'a str>,
 }
 
@@ -1086,6 +1086,13 @@ impl DBOS {
 
     /// Puts a workflow back on a queue, and hands back a handle to watch it.
     ///
+    /// **The queue is the workflow's own**, and so is its partition key: a workflow resumes where
+    /// it was waiting, under that queue's limits, and one with no queue goes to the engine's
+    /// internal queue. A queue that was deleted, or that no executor polls, leaves the workflow
+    /// `ENQUEUED` there until the queue is registered again — name
+    /// [`INTERNAL_QUEUE`](crate::sysdb::INTERNAL_QUEUE) in [`resume_with`](Self::resume_with) to
+    /// run it regardless.
+    ///
     /// **From a workflow body, reach for the free [`resume_workflow`] instead.** It is this call
     /// with no handle to capture, recorded under the same step name; a captured [`DBOS`] is a cycle
     /// with the registry that holds the workflow's closure.
@@ -1739,7 +1746,9 @@ impl crate::Client {
             .await
     }
 
-    /// [`resume`](Self::resume), naming the queue the workflow goes back on.
+    /// [`resume`](Self::resume), naming the queue or the partition the workflow goes back on. What
+    /// is not named stays as the workflow has it, so a queue that is deleted or never polled
+    /// strands the workflow until it is named elsewhere.
     pub async fn resume_with<R, E>(
         &self,
         workflow_id: &str,
@@ -1757,6 +1766,7 @@ impl crate::Client {
         workflow_ids: &[&str],
         options: ResumeOptions<'_>,
     ) -> Result<Vec<WorkflowHandle<R, E>>> {
+        refuse_invalid_resume_options(&options)?;
         self.db_connection()
             .resume_all(workflow_ids, options, None, None)
             .await
@@ -2302,7 +2312,10 @@ fn pending_resume<'a, R: 'a, E: 'a>(
 ) -> PendingStep<'a, WorkflowHandle<R, E>> {
     PendingStep::placed(
         step_names::RESUME_WORKFLOW,
-        place(db_conn, "resume a workflow"),
+        place_after(db_conn, "resume a workflow", || {
+            refuse_invalid_resume_options(&options)
+        })
+        .map(|((db_conn, ()), placement)| (db_conn, placement)),
         move |db_conn, placement| async move {
             db_conn
                 .resume_all(
@@ -2328,7 +2341,10 @@ fn pending_resume_all<'a, R: 'a, E: 'a>(
 ) -> PendingStep<'a, Vec<WorkflowHandle<R, E>>> {
     PendingStep::placed(
         step_names::RESUME_WORKFLOW,
-        place(db_conn, "resume a workflow"),
+        place_after(db_conn, "resume a workflow", || {
+            refuse_invalid_resume_options(&options)
+        })
+        .map(|((db_conn, ()), placement)| (db_conn, placement)),
         move |db_conn, placement| async move {
             db_conn
                 .resume_all(
@@ -2624,6 +2640,27 @@ fn refused_fork(error: crate::sysdb::Error, field: impl FnOnce(&str) -> String) 
         operation: FORK_OPERATION.into(),
         detail: format!("{}: {detail}", field(name)),
     })
+}
+
+/// Refuses a resume option given as an empty string, as the fork and rewind options are.
+///
+/// Made by the surfaces so a refused call spends no step id. A queue named `""` would write the
+/// empty name, and a partition key of `""` is one the partitioned sweep refuses on every poll, so
+/// the row would sit `ENQUEUED` with an error logged each time. The system database checks the
+/// same things again for its own callers.
+fn refuse_invalid_resume_options(options: &ResumeOptions<'_>) -> Result<()> {
+    for (field, value) in [
+        ("queue_name", options.queue_name),
+        ("queue_partition_key", options.queue_partition_key),
+    ] {
+        if value == Some("") {
+            return Err(Error::InvalidArgument {
+                operation: "resume a workflow".into(),
+                detail: format!("ResumeOptions::{field} must be absent rather than empty"),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Refuses a negative rewind step, and an option given as an empty string.
