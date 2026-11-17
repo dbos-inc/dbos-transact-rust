@@ -382,7 +382,7 @@ pub struct StartOptions<'a> {
 /// The name is the address — a [`Queue`](crate::Queue) receipt is not needed to enqueue onto one,
 /// and a queue registered by a peer is as valid a destination as one registered here.
 /// [`INTERNAL_QUEUE`](crate::sysdb::INTERNAL_QUEUE) is a legitimate destination too, and is where
-/// `resume` and `fork` put work.
+/// `resume`, `rewind` and `fork` put a workflow that has no queue of its own.
 ///
 /// ```no_run
 /// # async fn f(workflow: &dbos::WorkflowRef<(), String>) -> dbos::Result<()> {

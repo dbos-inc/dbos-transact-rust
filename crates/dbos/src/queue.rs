@@ -12,8 +12,9 @@
 //! no question about which kind a name refers to. The runner re-reads every queue's configuration
 //! per iteration, with no branch on where it came from.
 //!
-//! The one queue with no row is [`INTERNAL_QUEUE`], which is the engine's own: `resume` and `fork`
-//! put work there, and it is not a queue anybody registers.
+//! The one queue with no row is [`INTERNAL_QUEUE`], which is the engine's own: `resume`, `rewind`
+//! and `fork` put a workflow there when it has no queue of its own, and it is not a queue anybody
+//! registers.
 
 use std::borrow::Cow;
 use std::result::Result as StdResult;

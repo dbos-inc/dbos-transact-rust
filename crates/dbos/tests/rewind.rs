@@ -3,8 +3,9 @@
 //! A rewind leaves the workflow `ENQUEUED`, and the dequeue loop does the re-run. Where a test
 //! checks what the rewind left in the database before the re-run touches it, the workflow is
 //! rewound onto a queue nothing polls — a queue with no row — and then resumed onto the internal
-//! queue to let it run. A resume of an `ENQUEUED` workflow only moves its queue, so what the re-run
-//! finds is what the rewind left.
+//! queue, named explicitly because a plain resume keeps the queue it is on, to let it run. A resume
+//! of an `ENQUEUED` workflow only moves its queue, so what the re-run finds is what the rewind
+//! left.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -14,8 +15,8 @@ use dbos::sysdb::postgres::{PostgresSystemDatabase, Settings};
 use dbos::sysdb::types::{WorkflowRecord, WorkflowStatus};
 use dbos::sysdb::{INTERNAL_QUEUE, SystemDatabase};
 use dbos::{
-    Client, ClientConfig, Config, DBOS, EngineOnly, Error, QueueRequest, RewindOptions, RunOptions,
-    StartOptions, WorkflowIdReusePolicy,
+    Client, ClientConfig, Config, DBOS, EngineOnly, Error, QueueRequest, ResumeOptions,
+    RewindOptions, RunOptions, StartOptions, WorkflowIdReusePolicy,
 };
 use sqlx::Row;
 
@@ -26,6 +27,15 @@ const DEADLINE: Duration = Duration::from_secs(60);
 
 /// A queue with no row, which no executor polls: a workflow rewound onto it stays `ENQUEUED`.
 const PARKING: &str = "a-queue-with-no-row";
+
+/// Where a resume sends a workflow parked on [`PARKING`] so that it runs: the internal queue,
+/// which every executor polls. A plain resume keeps the queue the workflow is on.
+fn onto_the_internal_queue() -> ResumeOptions<'static> {
+    ResumeOptions {
+        queue_name: Some(INTERNAL_QUEUE),
+        ..ResumeOptions::default()
+    }
+}
 
 /// The version an instance in this file launches with, derived from its application name so two
 /// instances sharing a database never contest one version row.
@@ -410,7 +420,7 @@ async fn a_rewind_clears_an_outcome_held_only_in_the_legacy_columns() {
     assert_eq!(parked.error, None, "the legacy error survived the rewind");
 
     let rerun = dbos
-        .resume::<u32, EngineOnly>(id)
+        .resume_with::<u32, EngineOnly>(id, onto_the_internal_queue())
         .await
         .expect("resume failed");
     assert_eq!(rerun.result().await.expect("the re-run failed"), 2);
@@ -520,7 +530,7 @@ async fn a_rewind_discards_the_messages_the_discarded_steps_consumed() {
 
     send("b", "fresh").await;
     let rerun = dbos
-        .resume::<(Option<String>, Option<String>), EngineOnly>(id)
+        .resume_with::<(Option<String>, Option<String>), EngineOnly>(id, onto_the_internal_queue())
         .await
         .expect("resume failed");
     assert_eq!(
@@ -607,7 +617,7 @@ async fn a_rewind_reverts_the_events_published_past_the_cut() {
     .expect("read failed");
     assert_eq!(history, [0, 1], "only history below the cut remains");
 
-    dbos.resume::<(), EngineOnly>(id)
+    dbos.resume_with::<(), EngineOnly>(id, onto_the_internal_queue())
         .await
         .expect("resume failed")
         .result()
@@ -619,8 +629,8 @@ async fn a_rewind_reverts_the_events_published_past_the_cut() {
     dbos.shutdown().await;
 }
 
-/// **With no queue named, a rewound workflow goes to the internal queue and its partition key is
-/// cleared; with a version nobody runs, it waits.**
+/// **With no queue named, a rewound workflow keeps its own (the internal queue, for one that ran
+/// directly) and its partition key; with a version nobody runs, it waits.**
 ///
 /// Then cancelled, and rewound again under the version this executor runs, which it does.
 #[tokio::test]
@@ -671,7 +681,11 @@ async fn a_rewind_chooses_the_queue_and_version_the_rerun_gets() {
     let reader = reader(&db).await;
     let parked = row(&reader, id).await;
     assert_eq!(parked.queue_name.as_deref(), Some(INTERNAL_QUEUE));
-    assert_eq!(parked.queue_partition_key, None, "the old key is not kept");
+    assert_eq!(
+        parked.queue_partition_key.as_deref(),
+        Some("old-key"),
+        "the key it had is kept"
+    );
     assert_eq!(parked.app_version.as_deref(), Some("not-deployed"));
 
     // The internal queue is polled here, but only for this executor's version.
@@ -680,6 +694,12 @@ async fn a_rewind_chooses_the_queue_and_version_the_rerun_gets() {
     assert_eq!(runs.load(Ordering::SeqCst), 1);
 
     dbos.cancel(id).await.expect("cancel failed");
+    // The key it had is still on the row, and an unpartitioned queue dequeues a keyed row all the
+    // same: the re-run runs. That is a workflow moving from a partitioned queue to one that is not.
+    assert_eq!(
+        row(&reader, id).await.queue_partition_key.as_deref(),
+        Some("old-key")
+    );
     let rerun = dbos
         .rewind_with::<u32, EngineOnly>(
             id,

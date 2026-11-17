@@ -202,24 +202,30 @@ pub enum Children {
 
 /// Where a resumed workflow goes.
 ///
-/// A struct for one field, so that options can be added without changing every call site — and
-/// because `resume_all(&ids, None)` says nothing at a call site about what was declined.
+/// A struct, so that options can be added without changing every call site — and because
+/// `resume_all(&ids, None)` says nothing at a call site about what was declined.
 ///
-/// **Resume takes a queue name and no partition key.** The `UPDATE` behind it moves `queue_name`
-/// and leaves `queue_partition_key` untouched, so resuming onto a partitioned queue either carries
-/// over a key belonging to whatever queue the workflow was on before or, for a workflow that never
-/// had one, writes the unkeyed row that [`ForkOptions::queue_partition_key`] exists to prevent.
-/// A known open gap, shared with the other SDKs on the same database.
+/// **Only the queue columns given change.** A resumed workflow goes back to the queue and
+/// partition it was on, so resuming a bulk of partitioned-queue rows puts each one back in its own
+/// partition. Name a queue to move them, and a partition key to place them on a partitioned queue.
+/// The rest of the row is reset as ever: the attempt count, the deadline and the deduplication id.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ResumeOptions<'a> {
-    /// The queue the workflow is re-enqueued on. `None` is the engine's internal queue.
+    /// The queue the workflow is re-enqueued on. `None` keeps the queue it has, or the engine's
+    /// internal queue for a workflow that has none.
     ///
     /// A named queue is how a resumed workflow is made to wait its turn: the internal queue takes
-    /// no limits, so resuming a large backlog onto it re-enqueues everything and then dequeues
-    /// everything. Sending it to a queue with a concurrency limit is the way to resume a backlog
-    /// without flooding the fleet — and, with an `app_version`-eligible executor pool, the
-    /// way to steer resumed work at a particular deployment.
+    /// no limits, so resuming a large backlog of workflows that have no queue onto it re-enqueues
+    /// everything and then dequeues everything. Workflows that were on a queue go back to its
+    /// limits on their own; naming a queue with a concurrency limit is how to give the others
+    /// limits — and, with an `app_version`-eligible executor pool, the way to steer resumed work
+    /// at a particular deployment.
     pub queue_name: Option<&'a str>,
+    /// The partition of that queue. `None` keeps the key the workflow has.
+    ///
+    /// Name one when moving a workflow onto a partitioned queue: such a queue never reads an
+    /// unkeyed row, so a workflow resumed onto it without a key waits there for good.
+    pub queue_partition_key: Option<&'a str>,
 }
 
 /// One fork: the workflow it is forked from, the step it restarts at, and the id it gets.
@@ -314,11 +320,9 @@ impl<'a> Fork<'a> {
 ///
 /// The per-fork fields — the source, the start step and the chosen id — are on [`Fork`].
 ///
-/// **`None` does not mean the same thing across these fields.**
-/// [`app_version`](Self::app_version) is the only one that falls back to the
-/// source's; the queue, its partition and the timeout are the *fork's own*, because a fork is
-/// enqueued where the caller says rather than where its source ran. Saying nothing about those
-/// three asks for the internal queue, no partition, and no bound — not "as before".
+/// **`None` does not mean the same thing across these fields.** The version, the queue and its
+/// partition fall back to the source's, so a fork runs where its source did unless told otherwise.
+/// The timeout is the fork's own: `None` is no bound, not the source's.
 ///
 /// A field given as an empty string, or a zero [`timeout`](Self::timeout), is an
 /// [`Error::InvalidArgument`]: say `None` to leave it out.
@@ -329,18 +333,17 @@ pub struct ForkOptions<'a> {
     /// **This is what forking is usually for.** A workflow that failed against broken code is
     /// forked onto the fixed deployment, and only executors running that version will dequeue it.
     pub app_version: Option<&'a str>,
-    /// The queue the fork is enqueued on. `None` is the engine's internal queue.
+    /// The queue the fork is enqueued on. `None` inherits the source's queue, or the engine's
+    /// internal queue for a source that has none. The fork also inherits the source's priority.
     pub queue_name: Option<&'a str>,
     /// The partition of that queue, which a partitioned [`queue_name`](Self::queue_name) requires.
+    /// `None` inherits the source's key.
     ///
-    /// **Not inherited.** A source enqueued under a key does not pass it on; the fork's column is
-    /// written from this field, so `None` is no partition even when the source had one.
-    ///
-    /// Leaving it out on a partitioned queue produces a fork that can never run. Such a queue is
-    /// swept one partition at a time and every read that does so is keyed — see
-    /// `get_queue_partitions`, which selects `WHERE queue_partition_key IS NOT NULL` — so an
-    /// unkeyed row belongs to no partition and no sweep will ever see it. It stays `ENQUEUED`,
-    /// and the handle waits on a workflow nothing will pick up.
+    /// A kept key works on any queue. Name one when the source has none and the fork goes onto a
+    /// partitioned queue: such a queue is swept one partition at a time and every read that does
+    /// so is keyed — see `get_queue_partitions`, which selects `WHERE queue_partition_key IS NOT
+    /// NULL` — so an unkeyed row belongs to no partition and no sweep will ever see it. It stays
+    /// `ENQUEUED`, and the handle waits on a workflow nothing will pick up.
     pub queue_partition_key: Option<&'a str>,
     /// How long the fork may run once it starts. `None` is unbounded, not the source's bound.
     pub timeout: Option<Duration>,
@@ -396,10 +399,8 @@ impl<'a> ForkOptions<'a> {
 
 /// Where a rewind cuts a workflow's history, and where the rewound workflow goes.
 ///
-/// **`None` does not mean the same thing across these fields**, as on [`ForkOptions`]:
-/// [`app_version`](Self::app_version) keeps the workflow's own, while the queue and its partition
-/// are the rewind's. Saying nothing about those two asks for the internal queue and no partition,
-/// not the ones the workflow ran on.
+/// **Only what is given changes.** The version, the queue and its partition each keep the
+/// workflow's own unless named, as on [`ForkOptions`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RewindOptions<'a> {
     /// The first step to discard. Every step below it replays from its checkpoint; this one and
@@ -413,13 +414,15 @@ pub struct RewindOptions<'a> {
     /// As with a fork, this is how a workflow that failed against broken code is re-run on the
     /// deployment that fixes it: only executors running that version will dequeue it.
     pub app_version: Option<&'a str>,
-    /// The queue the workflow is re-enqueued on. `None` is the engine's internal queue.
+    /// The queue the workflow is re-enqueued on. `None` keeps the queue it has, or the engine's
+    /// internal queue for a workflow that has none.
     pub queue_name: Option<&'a str>,
     /// The partition of that queue, which a partitioned [`queue_name`](Self::queue_name) requires.
+    /// `None` keeps the key the workflow has.
     ///
-    /// **Not kept.** `None` clears whatever key the workflow had, so a key from the queue it ran
-    /// on does not follow it onto another. A partitioned queue sweeps one partition at a time and
-    /// never reads an unkeyed row, so leaving this out there produces a workflow that never runs.
+    /// A kept key works on any queue. Name one when the workflow has none and moves onto a
+    /// partitioned queue: such a queue sweeps one partition at a time and never reads an unkeyed
+    /// row, so a workflow left without a key there never runs.
     pub queue_partition_key: Option<&'a str>,
 }
 
@@ -1085,6 +1088,13 @@ impl DBOS {
 
     /// Puts a workflow back on a queue, and hands back a handle to watch it.
     ///
+    /// **The queue is the workflow's own**, and so is its partition key: a workflow resumes where
+    /// it was waiting, under that queue's limits, and one with no queue goes to the engine's
+    /// internal queue. A queue that was deleted, or that no executor polls, leaves the workflow
+    /// `ENQUEUED` there until the queue is registered again — name
+    /// [`INTERNAL_QUEUE`](crate::sysdb::INTERNAL_QUEUE) in [`resume_with`](Self::resume_with) to
+    /// run it regardless.
+    ///
     /// **From a workflow body, reach for the free [`resume_workflow`] instead.** It is this call
     /// with no handle to capture, recorded under the same step name; a captured [`DBOS`] is a cycle
     /// with the registry that holds the workflow's closure.
@@ -1149,14 +1159,14 @@ impl DBOS {
     /// call with no handle to capture, recorded under the same step name; a captured [`DBOS`] is a
     /// cycle with the registry that holds the workflow's closure.
     ///
-    /// [`resume`](Self::resume) for the common case, which is the engine's internal queue.
+    /// [`resume`](Self::resume) for the common case, which keeps the workflow's queue.
     ///
     /// ```no_run
     /// # async fn f(dbos: &dbos::DBOS) -> dbos::Result<()> {
     /// // Back on a limited queue, so a resumed backlog does not flood the fleet.
     /// let handle = dbos.resume_with::<u32, dbos::EngineOnly>(
     ///     "stalled-workflow",
-    ///     dbos::ResumeOptions { queue_name: Some("recovery") },
+    ///     dbos::ResumeOptions { queue_name: Some("recovery"), ..Default::default() },
     /// ).await?;
     /// # Ok(()) }
     /// ```
@@ -1738,7 +1748,9 @@ impl crate::Client {
             .await
     }
 
-    /// [`resume`](Self::resume), naming the queue the workflow goes back on.
+    /// [`resume`](Self::resume), naming the queue or the partition the workflow goes back on. What
+    /// is not named stays as the workflow has it, so a queue that is deleted or never polled
+    /// strands the workflow until it is named elsewhere.
     pub async fn resume_with<R, E>(
         &self,
         workflow_id: &str,
@@ -1756,6 +1768,7 @@ impl crate::Client {
         workflow_ids: &[&str],
         options: ResumeOptions<'_>,
     ) -> Result<Vec<WorkflowHandle<R, E>>> {
+        refuse_invalid_resume_options(&options)?;
         self.db_connection()
             .resume_all(workflow_ids, options, None, None)
             .await
@@ -2011,6 +2024,7 @@ impl DbConnection {
             .resume_workflows(
                 workflow_ids,
                 options.queue_name,
+                options.queue_partition_key,
                 from_workflow,
                 self.step_caller(caller),
             )
@@ -2300,7 +2314,10 @@ fn pending_resume<'a, R: 'a, E: 'a>(
 ) -> PendingStep<'a, WorkflowHandle<R, E>> {
     PendingStep::placed(
         step_names::RESUME_WORKFLOW,
-        place(db_conn, "resume a workflow"),
+        place_after(db_conn, "resume a workflow", || {
+            refuse_invalid_resume_options(&options)
+        })
+        .map(|((db_conn, ()), placement)| (db_conn, placement)),
         move |db_conn, placement| async move {
             db_conn
                 .resume_all(
@@ -2326,7 +2343,10 @@ fn pending_resume_all<'a, R: 'a, E: 'a>(
 ) -> PendingStep<'a, Vec<WorkflowHandle<R, E>>> {
     PendingStep::placed(
         step_names::RESUME_WORKFLOW,
-        place(db_conn, "resume a workflow"),
+        place_after(db_conn, "resume a workflow", || {
+            refuse_invalid_resume_options(&options)
+        })
+        .map(|((db_conn, ()), placement)| (db_conn, placement)),
         move |db_conn, placement| async move {
             db_conn
                 .resume_all(
@@ -2622,6 +2642,27 @@ fn refused_fork(error: crate::sysdb::Error, field: impl FnOnce(&str) -> String) 
         operation: FORK_OPERATION.into(),
         detail: format!("{}: {detail}", field(name)),
     })
+}
+
+/// Refuses a resume option given as an empty string, as the fork and rewind options are.
+///
+/// Made by the surfaces so a refused call spends no step id. A queue named `""` would write the
+/// empty name, and a partition key of `""` is one the partitioned sweep refuses on every poll, so
+/// the row would sit `ENQUEUED` with an error logged each time. The system database checks the
+/// same things again for its own callers.
+fn refuse_invalid_resume_options(options: &ResumeOptions<'_>) -> Result<()> {
+    for (field, value) in [
+        ("queue_name", options.queue_name),
+        ("queue_partition_key", options.queue_partition_key),
+    ] {
+        if value == Some("") {
+            return Err(Error::InvalidArgument {
+                operation: "resume a workflow".into(),
+                detail: format!("ResumeOptions::{field} must be absent rather than empty"),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Refuses a negative rewind step, and an option given as an empty string.

@@ -876,6 +876,11 @@ async fn a_dequeue_parks_a_workflow_past_its_recovery_limit() {
     .await
     .expect("the workflow past the limit was never dispatched");
     assert_eq!(parked.status, WorkflowStatus::MaxRecoveryAttemptsExceeded);
+    assert_eq!(
+        parked.queue_name.as_deref(),
+        Some("dead-letter-queue"),
+        "parking a workflow keeps its queue, so a resume puts it back"
+    );
     assert_eq!(parked.recovery_attempts, 102);
     assert_eq!(*ran.lock().unwrap(), ["at-the-limit"]);
 

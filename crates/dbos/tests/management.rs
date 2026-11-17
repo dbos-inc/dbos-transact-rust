@@ -42,11 +42,22 @@ async fn reader(db: &TestDatabase) -> PostgresSystemDatabase {
     PostgresSystemDatabase::from_pool(db.pool().await, &Settings::default())
 }
 
+/// Where a resume sends a workflow that waits on a queue nothing polls: the internal queue, which
+/// every executor does. A plain resume keeps the queue the workflow was on, so a test that parks
+/// one on a queue with no runner and then waits for its result has to say so.
+fn onto_the_internal_queue() -> ResumeOptions<'static> {
+    ResumeOptions {
+        queue_name: Some(dbos::sysdb::INTERNAL_QUEUE),
+        ..ResumeOptions::default()
+    }
+}
+
 /// **A resumed workflow is dequeued and run, which is what makes `resume` more than a status
 /// change.**
 ///
 /// The workflow starts on a queue nothing polls, so it sits `ENQUEUED` and untouched. Resuming
-/// moves it to the internal queue, which this executor does poll — and it runs.
+/// puts it on the internal queue, which this executor does poll — and it runs. A plain resume
+/// keeps the queue it was on, so the workflow stays where nothing polls.
 #[tokio::test]
 async fn resuming_puts_a_workflow_on_a_queue_that_runs_it() {
     let db = test_database().await;
@@ -84,8 +95,29 @@ async fn resuming_puts_a_workflow_on_a_queue_that_runs_it() {
         "a queue with no row was polled"
     );
 
-    let handle = dbos
+    let kept = dbos
         .resume::<u32, EngineOnly>(id)
+        .await
+        .expect("resume failed");
+    assert_eq!(kept.workflow_id(), id, "resuming changed the id");
+    let row = reader(&db)
+        .await
+        .get_workflow(id)
+        .await
+        .expect("read failed")
+        .expect("the row is missing");
+    assert_eq!(row.status, WorkflowStatus::Enqueued);
+    assert_eq!(row.queue_name.as_deref(), Some("a-queue-with-no-row"));
+    assert_eq!(ran.load(Ordering::SeqCst), 0, "a resume left its queue");
+
+    let handle = dbos
+        .resume_with::<u32, EngineOnly>(
+            id,
+            ResumeOptions {
+                queue_name: Some(dbos::sysdb::INTERNAL_QUEUE),
+                ..ResumeOptions::default()
+            },
+        )
         .await
         .expect("resume failed");
     assert_eq!(handle.workflow_id(), id, "resuming changed the id");
@@ -242,13 +274,401 @@ async fn a_fork_takes_the_id_and_queue_it_is_given() {
     dbos.shutdown().await;
 }
 
-/// **A fork onto a partitioned queue needs its own partition key, and is not given one.**
+/// The queue, partition key and priority a workflow's row holds.
+async fn queue_columns(db: &TestDatabase, id: &str) -> (Option<String>, Option<String>, i32) {
+    let row = reader(db)
+        .await
+        .get_workflow(id)
+        .await
+        .expect("read failed")
+        .expect("the row is missing");
+    (row.queue_name, row.queue_partition_key, row.priority)
+}
+
+fn columns(queue: &str, key: &str, priority: i32) -> (Option<String>, Option<String>, i32) {
+    (Some(queue.to_owned()), Some(key.to_owned()), priority)
+}
+
+/// **Cancel, resume and fork keep the queue, partition key and priority a workflow had**, through
+/// an instance and through a client, one workflow at a time and in bulk.
+///
+/// The workflows sit `DELAYED` on a partitioned queue, so they are cancelled before they run.
+/// Every resume variant changes only the partition key it is given, and the columns are read
+/// before the results are waited for, so a regression fails here rather than hanging on a
+/// partition nothing sweeps.
+#[tokio::test]
+async fn management_keeps_the_queue_through_an_instance_and_a_client() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("keep-queue-app", &db));
+    let echo = dbos
+        .register_workflow("echo", |x: u32| async move { Ok::<u32, Error>(x) })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+    for (name, partitioned) in [("keep-queue", true), ("other-queue", false)] {
+        dbos.register_queue(
+            name,
+            dbos::QueueOptions {
+                partition_concurrency: partitioned.then_some(2),
+                ..dbos::QueueOptions::default()
+            },
+            dbos::QueueConflict::UpdateIfLatestVersion,
+        )
+        .await
+        .expect("registration failed");
+    }
+    let client = Client::connect(ClientConfig {
+        app_name: Some("keep-queue-app".to_owned()),
+        ..ClientConfig::new(db.url())
+    })
+    .await
+    .expect("connect failed");
+
+    let enqueue = |id: String, value: u32| {
+        let echo = echo.clone();
+        async move {
+            echo.start_with(
+                value,
+                StartOptions {
+                    workflow_id: Some(&id),
+                    queue: Some(QueueRequest {
+                        partition_key: Some("p0"),
+                        priority: Some(3),
+                        delay: Some(Duration::from_secs(3600)),
+                        ..QueueRequest::new("keep-queue")
+                    }),
+                    ..StartOptions::default()
+                },
+            )
+            .await
+            .expect("enqueue failed");
+        }
+    };
+
+    // A cancel keeps the queue, and a plain resume puts the workflow back where it was.
+    enqueue("kept".to_owned(), 0).await;
+    dbos.cancel("kept").await.expect("cancel failed");
+    assert_eq!(
+        queue_columns(&db, "kept").await,
+        columns("keep-queue", "p0", 3)
+    );
+    let handle = dbos
+        .resume::<u32, EngineOnly>("kept")
+        .await
+        .expect("resume failed");
+    assert_eq!(
+        queue_columns(&db, "kept").await,
+        columns("keep-queue", "p0", 3)
+    );
+    assert_eq!(handle.result().await.expect("the workflow failed"), 0);
+
+    // Each way of resuming changes only the partition key.
+    for variant in 0..4 {
+        let key = format!("k{variant}");
+        let owned = [format!("v{variant}-a"), format!("v{variant}-b")];
+        let ids = [owned[0].as_str(), owned[1].as_str()];
+        for (value, id) in ids.iter().enumerate() {
+            enqueue((*id).to_owned(), value as u32).await;
+        }
+        dbos.cancel_all(&ids, Children::Skip)
+            .await
+            .expect("cancel failed");
+        let options = ResumeOptions {
+            queue_partition_key: Some(&key),
+            ..ResumeOptions::default()
+        };
+        let mut handles = Vec::new();
+        match variant {
+            0 => {
+                for id in ids {
+                    handles.push(
+                        dbos.resume_with::<u32, EngineOnly>(id, options)
+                            .await
+                            .expect("resume failed"),
+                    );
+                }
+            }
+            1 => {
+                handles = dbos
+                    .resume_all::<u32, EngineOnly>(&ids, options)
+                    .await
+                    .unwrap()
+            }
+            2 => {
+                for id in ids {
+                    handles.push(
+                        client
+                            .resume_with::<u32, EngineOnly>(id, options)
+                            .await
+                            .expect("resume failed"),
+                    );
+                }
+            }
+            _ => {
+                handles = client
+                    .resume_all::<u32, EngineOnly>(&ids, options)
+                    .await
+                    .unwrap();
+            }
+        }
+        for id in ids {
+            assert_eq!(
+                queue_columns(&db, id).await,
+                columns("keep-queue", &key, 3),
+                "variant {variant}, {id}"
+            );
+        }
+        for (value, handle) in handles.into_iter().enumerate() {
+            assert_eq!(
+                handle.result().await.expect("the workflow failed"),
+                value as u32
+            );
+        }
+    }
+
+    // A queue name changes only the queue.
+    enqueue("moved".to_owned(), 0).await;
+    dbos.cancel("moved").await.expect("cancel failed");
+    let moved = dbos
+        .resume_with::<u32, EngineOnly>(
+            "moved",
+            ResumeOptions {
+                queue_name: Some("other-queue"),
+                ..ResumeOptions::default()
+            },
+        )
+        .await
+        .expect("resume failed");
+    assert_eq!(
+        queue_columns(&db, "moved").await,
+        columns("other-queue", "p0", 3)
+    );
+    assert_eq!(moved.result().await.expect("the workflow failed"), 0);
+
+    // A fork inherits the queue, key and priority, and a queue or a key given replaces only itself.
+    let cases = [
+        (None, None, ("keep-queue", "p0")),
+        (None, Some("f"), ("keep-queue", "f")),
+        (Some("other-queue"), None, ("other-queue", "p0")),
+    ];
+    for (n, (queue_name, queue_partition_key, (queue, key))) in cases.into_iter().enumerate() {
+        let options = ForkOptions {
+            queue_name,
+            queue_partition_key,
+            ..ForkOptions::default()
+        };
+        let fork = if n == 0 {
+            // One through the client, which is the same call.
+            client
+                .fork_with::<u32, EngineOnly>(Fork::new("kept", 0), options)
+                .await
+        } else {
+            dbos.fork_with::<u32, EngineOnly>(Fork::new("kept", 0), options)
+                .await
+        }
+        .expect("fork failed");
+        assert_eq!(
+            queue_columns(&db, fork.workflow_id()).await,
+            columns(queue, key, 3),
+            "fork case {n}"
+        );
+        assert_eq!(fork.result().await.expect("the fork failed"), 0);
+    }
+
+    client.close().await;
+    dbos.shutdown().await;
+}
+
+/// **The free resume forms refuse an empty option and keep or change the partition key**, as the
+/// methods do.
+///
+/// A workflow body calls them, so the test runs one: the empty options come back refused with
+/// nothing moved, a plain resume leaves the key where it was, and a key given replaces only the
+/// key.
+#[tokio::test]
+async fn the_free_resume_forms_refuse_empty_options_and_keep_or_change_the_key() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("free-resume-app", &db));
+    let echo = dbos
+        .register_workflow("echo", |x: u32| async move { Ok::<u32, Error>(x) })
+        .unwrap();
+    let keeper = dbos
+        .register_workflow("keeper", |(kept, moved): (String, String)| async move {
+            let empty_queue = dbos::resume_workflow_with::<u32, EngineOnly>(
+                &kept,
+                ResumeOptions {
+                    queue_name: Some(""),
+                    ..ResumeOptions::default()
+                },
+            )
+            .await;
+            let ids = [kept.as_str(), moved.as_str()];
+            let empty_key = dbos::resume_workflows::<u32, EngineOnly>(
+                &ids,
+                ResumeOptions {
+                    queue_partition_key: Some(""),
+                    ..ResumeOptions::default()
+                },
+            )
+            .lift::<EngineOnly>()
+            .await;
+            let refused = matches!(empty_queue, Err(Error::InvalidArgument { .. }))
+                && matches!(empty_key, Err(Error::InvalidArgument { .. }));
+
+            let kept_handle = dbos::resume_workflow::<u32, EngineOnly>(&kept).await?;
+            let moved_handle = dbos::resume_workflow_with::<u32, EngineOnly>(
+                &moved,
+                ResumeOptions {
+                    queue_partition_key: Some("moved-to"),
+                    ..ResumeOptions::default()
+                },
+            )
+            .await?;
+            let results = (kept_handle.result().await?, moved_handle.result().await?);
+            Ok::<_, Error>((refused, results))
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+    dbos.register_queue(
+        "free-keep",
+        dbos::QueueOptions {
+            partition_concurrency: Some(2),
+            ..dbos::QueueOptions::default()
+        },
+        dbos::QueueConflict::UpdateIfLatestVersion,
+    )
+    .await
+    .expect("registration failed");
+    for (id, value) in [("free-kept", 1), ("free-moved", 2)] {
+        echo.start_with(
+            value,
+            StartOptions {
+                workflow_id: Some(id),
+                queue: Some(QueueRequest {
+                    partition_key: Some("p0"),
+                    priority: Some(3),
+                    delay: Some(Duration::from_secs(3600)),
+                    ..QueueRequest::new("free-keep")
+                }),
+                ..StartOptions::default()
+            },
+        )
+        .await
+        .expect("enqueue failed");
+        dbos.cancel(id).await.expect("cancel failed");
+    }
+
+    let (refused, results) = keeper
+        .run(("free-kept".to_owned(), "free-moved".to_owned()))
+        .await
+        .expect("the keeper failed");
+
+    assert!(refused, "an empty option was accepted by a free form");
+    assert_eq!(results, (1, 2));
+    assert_eq!(
+        queue_columns(&db, "free-kept").await,
+        columns("free-keep", "p0", 3),
+        "a plain resume moved the key"
+    );
+    assert_eq!(
+        queue_columns(&db, "free-moved").await,
+        columns("free-keep", "moved-to", 3),
+        "a key given changed more than the key"
+    );
+    dbos.shutdown().await;
+}
+
+/// **A resume refuses an empty queue name or partition key**, as a fork and a rewind do, from an
+/// instance and from a client, and moves nothing.
+#[tokio::test]
+async fn a_resume_refuses_an_empty_queue_or_partition_key() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("resume-empty-app", &db));
+    let workflow = dbos
+        .register_workflow("parked", |()| async move { Ok::<u32, Error>(1) })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+    workflow
+        .start_with(
+            (),
+            StartOptions {
+                workflow_id: Some("parked"),
+                queue: Some(QueueRequest::new("no-runner-here")),
+                ..StartOptions::default()
+            },
+        )
+        .await
+        .expect("enqueue failed");
+    dbos.cancel("parked").await.expect("cancel failed");
+    let client = Client::connect(ClientConfig {
+        app_name: Some("resume-empty-app".to_owned()),
+        ..ClientConfig::new(db.url())
+    })
+    .await
+    .expect("connect failed");
+
+    for options in [
+        ResumeOptions {
+            queue_name: Some(""),
+            ..ResumeOptions::default()
+        },
+        ResumeOptions {
+            queue_partition_key: Some(""),
+            ..ResumeOptions::default()
+        },
+    ] {
+        let by_instance = dbos
+            .resume_with::<u32, EngineOnly>("parked", options)
+            .await
+            .expect_err("an empty option was accepted");
+        assert!(
+            matches!(by_instance, Error::InvalidArgument { .. }),
+            "got {by_instance:?}"
+        );
+        let by_client = client
+            .resume_with::<u32, EngineOnly>("parked", options)
+            .await
+            .expect_err("an empty option was accepted");
+        assert!(
+            matches!(by_client, Error::InvalidArgument { .. }),
+            "got {by_client:?}"
+        );
+        // The bulk forms refuse it too, whatever the batch.
+        let bulk_by_instance = dbos
+            .resume_all::<u32, EngineOnly>(&["parked"], options)
+            .await
+            .expect_err("an empty option was accepted in bulk");
+        assert!(
+            matches!(bulk_by_instance, Error::InvalidArgument { .. }),
+            "got {bulk_by_instance:?}"
+        );
+        let bulk_by_client = client
+            .resume_all::<u32, EngineOnly>(&["parked"], options)
+            .await
+            .expect_err("an empty option was accepted in bulk");
+        assert!(
+            matches!(bulk_by_client, Error::InvalidArgument { .. }),
+            "got {bulk_by_client:?}"
+        );
+    }
+    let row = reader(&db)
+        .await
+        .get_workflow("parked")
+        .await
+        .expect("read failed")
+        .expect("the row is missing");
+    assert_eq!(row.status, WorkflowStatus::Cancelled, "a refusal moved it");
+    assert_eq!(row.queue_name.as_deref(), Some("no-runner-here"));
+
+    client.close().await;
+    dbos.shutdown().await;
+}
+
+/// **A fork onto a partitioned queue needs a partition key, and this source has none to give.**
 ///
 /// A partitioned queue is swept one partition at a time and every read that finds those
-/// partitions is keyed, so an unkeyed row is in none of them and no sweep can see it. The fork's
-/// key is written from [`ForkOptions::queue_partition_key`] rather than inherited from the
-/// source, which is what makes leaving it out a workflow that never runs rather than one that
-/// lands where its source did.
+/// partitions is keyed, so an unkeyed row is in none of them and no sweep can see it. A fork
+/// inherits its source's key and takes [`ForkOptions::queue_partition_key`] over it, and the
+/// source here was run directly, so leaving the option out is a workflow that never runs.
 ///
 /// Both halves are asserted from the same sweeps: the keyed fork runs to completion, and the
 /// unkeyed one — enqueued first, onto the same queue — is still `ENQUEUED` afterwards. No sleep
@@ -771,9 +1191,22 @@ async fn cancelling_makes_a_workflow_terminal_and_leaves_it_resumable() {
     );
     assert_eq!(ran.load(Ordering::SeqCst), 0, "a cancelled workflow ran");
 
-    // And back again: resume moves it onto a queue this executor does poll.
+    // The cancel left it on its queue, where a resume would put it back.
+    assert_eq!(
+        reader
+            .get_workflow(id)
+            .await
+            .expect("read failed")
+            .expect("the row is missing")
+            .queue_name
+            .as_deref(),
+        Some("no-runner-here"),
+        "a cancel took the workflow off its queue",
+    );
+
+    // And back again: resume onto a queue this executor does poll.
     let handle = dbos
-        .resume::<u32, EngineOnly>(id)
+        .resume_with::<u32, EngineOnly>(id, onto_the_internal_queue())
         .await
         .expect("resume failed");
     assert_eq!(handle.result().await.expect("the workflow failed"), 5);
@@ -1272,7 +1705,7 @@ async fn resuming_and_forking_in_bulk_hand_back_a_handle_each() {
     }
 
     let handles = dbos
-        .resume_all::<u32, EngineOnly>(&ids, ResumeOptions::default())
+        .resume_all::<u32, EngineOnly>(&ids, onto_the_internal_queue())
         .await
         .expect("bulk resume failed");
     assert_eq!(
@@ -1640,6 +2073,7 @@ async fn resuming_onto_a_named_queue_puts_the_workflow_there() {
             id,
             ResumeOptions {
                 queue_name: Some("recovery"),
+                ..ResumeOptions::default()
             },
         )
         .await
@@ -3674,13 +4108,14 @@ async fn supervise(t: Supervisees) -> Result<Supervised, Error<Halted>> {
     use dbos::{Fork, ForkOptions, ResumeOptions, RewindOptions, WorkflowDelay};
 
     dbos::cancel_workflow(&t.one).await?;
-    let resumed_one = dbos::resume_workflow::<u32, Halted>(&t.one).await?;
+    let resumed_one =
+        dbos::resume_workflow_with::<u32, Halted>(&t.one, onto_the_internal_queue()).await?;
     let mut resumed = vec![resumed_one.result().await?];
 
     let pair = [t.pair[0].as_str(), t.pair[1].as_str()];
     let mut cancelled = dbos::cancel_workflows(&pair, Children::Skip).await?;
     cancelled.sort();
-    for handle in dbos::resume_workflows::<u32, Halted>(&pair, ResumeOptions::default())
+    for handle in dbos::resume_workflows::<u32, Halted>(&pair, onto_the_internal_queue())
         .lift()
         .await?
     {

@@ -17,8 +17,8 @@ use dbos::sysdb::{Error as SysdbError, SystemDatabase};
 use dbos::{
     Change, Children, Client, ClientConfig, Config, DBOS, DuplicationPolicy, EngineOnly,
     EnqueueOptions, Error, Fork, ForkOptions, PortableWorkflowArgs, QualifiedWorkflowName,
-    QueueChange, QueueConflict, QueueOptions, QueueRequest, SendMessage, SendOptions,
-    SerializationFormat, StartOptions, Timeout, WorkflowHandle, WorkflowIdReusePolicy,
+    QueueChange, QueueConflict, QueueOptions, QueueRequest, ResumeOptions, SendMessage,
+    SendOptions, SerializationFormat, StartOptions, Timeout, WorkflowHandle, WorkflowIdReusePolicy,
 };
 use dbos_test_support::{TestDatabase, raw_database, skewed_database, test_database};
 
@@ -1365,7 +1365,8 @@ async fn a_bad_configuration_is_refused_at_connect() {
 ///
 /// The application enqueues onto a queue nothing polls, so the row sits still. A client — a
 /// separate process, holding nothing but a connection — cancels it, and the application never runs
-/// it. Resuming moves it onto the internal queue, which the application does poll, and it runs.
+/// it. The cancel leaves it on its queue, and a plain resume would put it back there; resuming
+/// onto the internal queue, which the application does poll, is what runs it.
 #[tokio::test]
 async fn a_client_cancels_and_resumes_a_workflow_it_did_not_start() {
     let db = test_database().await;
@@ -1415,10 +1416,28 @@ async fn a_client_cancels_and_resumes_a_workflow_it_did_not_start() {
         WorkflowStatus::Cancelled,
     );
     assert_eq!(ran.load(Ordering::SeqCst), 0, "a cancelled workflow ran");
+    assert_eq!(
+        reader(&db)
+            .await
+            .get_workflow(id)
+            .await
+            .expect("read failed")
+            .expect("the row is missing")
+            .queue_name
+            .as_deref(),
+        Some("nothing-polls-this"),
+        "a cancel took the workflow off its queue",
+    );
 
     // And back again, from the same process that stopped it.
     let handle = client
-        .resume::<u32, EngineOnly>(id)
+        .resume_with::<u32, EngineOnly>(
+            id,
+            ResumeOptions {
+                queue_name: Some(dbos::sysdb::INTERNAL_QUEUE),
+                ..ResumeOptions::default()
+            },
+        )
         .await
         .expect("resume failed");
     assert_eq!(handle.workflow_id(), id, "resuming changed the id");
