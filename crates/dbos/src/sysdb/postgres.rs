@@ -3749,12 +3749,23 @@ impl SystemDatabase for PostgresSystemDatabase {
     ) -> Result<Vec<WorkflowRecord>, Error> {
         let workflow_table = &self.tables.workflow_status;
         // `status` is the one filter whose values are not already strings.
-        let status: Vec<&str> = filter
-            .status
-            .iter()
-            .copied()
-            .map(WorkflowStatus::as_str)
-            .collect();
+        let status: Vec<&str> = if filter.queues_only && filter.status.is_empty() {
+            // A queue listing with no status is the queue's live work, not every row that ever
+            // went through one: a finished or cancelled workflow keeps its queue name, and
+            // listing it here would bury the work still waiting.
+            vec![
+                WorkflowStatus::Enqueued.as_str(),
+                WorkflowStatus::Pending.as_str(),
+                WorkflowStatus::Delayed.as_str(),
+            ]
+        } else {
+            filter
+                .status
+                .iter()
+                .copied()
+                .map(WorkflowStatus::as_str)
+                .collect()
+        };
         // `LIKE ANY(...)` needs the wildcard appended to each pattern, and `%` and `_` in a
         // caller's prefix would otherwise be wildcards themselves. Escaped out here because it
         // allocates, and nothing about it depends on the attempt.
@@ -6166,7 +6177,11 @@ impl SystemDatabase for PostgresSystemDatabase {
                 .map(|row| {
                     Ok(NotificationRecord {
                         message_uuid: row.try_get("message_uuid")?,
-                        topic: row.try_get("topic")?,
+                        // The default topic is stored as a sentinel every SDK writes and
+                        // recognises, and read back as the absence of a topic it stands for.
+                        topic: row
+                            .try_get::<Option<String>, _>("topic")?
+                            .filter(|topic| topic != NULL_TOPIC),
                         message: row.try_get("message")?,
                         serialization: row.try_get("serialization")?,
                         created_at: Timestamp::from_epoch_ms(row.try_get("created_at_epoch_ms")?),

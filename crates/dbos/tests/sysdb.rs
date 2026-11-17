@@ -1814,6 +1814,78 @@ async fn every_filter_narrows() {
     }
 }
 
+/// **A queue listing with no status is the queue's live work.**
+///
+/// A workflow keeps its queue once it is cancelled or has finished, so `queues_only` alone would
+/// list it beside the work still waiting. Naming a status brings the others back.
+#[tokio::test]
+async fn a_queue_listing_with_no_status_is_the_live_work() {
+    use dbos::sysdb::types::WorkflowFilter as F;
+    let (sys, db) = seeded().await;
+    // `wf-b` becomes `PENDING`, `wf-c` stays `DELAYED`, `wf-d` is cancelled, a queued row that
+    // has succeeded is added, and `wf-waiting` is `ENQUEUED`: the cancelled and the finished rows
+    // are not live, and both keep their queue.
+    sqlx::query(
+        r#"UPDATE "dbos"."workflow_status" SET status = 'PENDING' WHERE workflow_uuid = 'wf-b'"#,
+    )
+    .execute(&db.pool().await)
+    .await
+    .unwrap();
+    sys.cancel_workflows(&["wf-d"], false, None, None)
+        .await
+        .unwrap();
+    sys.init_workflow(
+        &NewWorkflow {
+            queue_name: Some("orders"),
+            ..NewWorkflow::new("wf-done")
+        },
+        None,
+        WorkflowIdReusePolicy::ReturnExisting,
+    )
+    .await
+    .unwrap();
+    sys.init_workflow(
+        &NewWorkflow {
+            queue_name: Some("orders"),
+            ..NewWorkflow::new("wf-waiting")
+        },
+        None,
+        WorkflowIdReusePolicy::ReturnExisting,
+    )
+    .await
+    .unwrap();
+    sqlx::query(
+        r#"UPDATE "dbos"."workflow_status" SET status = 'SUCCESS' WHERE workflow_uuid = 'wf-done'"#,
+    )
+    .execute(&db.pool().await)
+    .await
+    .unwrap();
+
+    let queued = F {
+        queues_only: true,
+        ..F::default()
+    };
+    let mut live = ids(&sys, &queued).await;
+    live.sort();
+    assert_eq!(
+        live,
+        ["wf-b", "wf-c", "wf-waiting"],
+        "a finished or cancelled row was listed"
+    );
+
+    for (status, expected) in [
+        (WorkflowStatus::Cancelled, "wf-d"),
+        (WorkflowStatus::Success, "wf-done"),
+    ] {
+        let named = F {
+            queues_only: true,
+            status: vec![status],
+            ..F::default()
+        };
+        assert_eq!(ids(&sys, &named).await, [expected], "{status:?}");
+    }
+}
+
 /// Ordering, limit, and offset page through the results.
 #[tokio::test]
 async fn results_are_ordered_and_pageable() {
@@ -4585,7 +4657,8 @@ async fn the_bulk_readers_return_notifications_events_and_streams() {
         "INSERT INTO dbos.notifications (message_uuid, destination_uuid, topic, message, \
          serialization, created_at_epoch_ms, consumed) \
          VALUES ('msg-2', 'wf-bulk', 'orders', '\"second\"', 'portable_json', 2000, false), \
-                ('msg-1', 'wf-bulk', NULL, '\"first\"', NULL, 1000, true)",
+                ('msg-1', 'wf-bulk', NULL, '\"first\"', NULL, 1000, true), \
+                ('msg-3', 'wf-bulk', '__null__topic__', '\"third\"', NULL, 3000, false)",
         "INSERT INTO dbos.workflow_events (workflow_uuid, key, value, serialization) \
          VALUES ('wf-bulk', 'progress', '50', 'portable_json'), ('wf-bulk', 'answer', '42', NULL)",
         "INSERT INTO dbos.streams (workflow_uuid, key, \"offset\", value, serialization, \
@@ -4602,10 +4675,13 @@ async fn the_bulk_readers_return_notifications_events_and_streams() {
 
     // Oldest first, and a consumed message is still reported.
     let notifications = sys.get_all_notifications("wf-bulk").await.unwrap();
-    assert_eq!(notifications.len(), 2);
+    assert_eq!(notifications.len(), 3);
     assert_eq!(notifications[0].message_uuid, "msg-1");
     assert_eq!(notifications[0].message, "\"first\"");
-    assert_eq!(notifications[0].topic, None, "the default topic is NULL");
+    // A NULL topic and the sentinel every SDK writes for the default topic both read as none.
+    assert_eq!(notifications[0].topic, None, "a NULL topic");
+    assert_eq!(notifications[2].message_uuid, "msg-3");
+    assert_eq!(notifications[2].topic, None, "the default topic's sentinel");
     assert!(
         notifications[0].consumed,
         "receiving marks rather than deletes, so this must still be visible",
@@ -8601,7 +8677,7 @@ async fn a_batch_resolves_each_workflow_separately_and_keeps_the_order() {
 /// A message reaches its destination, under the sentinel topic when none is given.
 #[tokio::test]
 async fn a_message_is_delivered_to_its_destination() {
-    let (sys, _db) = sysdb().await;
+    let (sys, db) = sysdb().await;
     sys.init_workflow(
         &workflow("wf-dest"),
         None,
@@ -8643,12 +8719,17 @@ async fn a_message_is_delivered_to_its_destination() {
             .clone()
     };
     assert_eq!(topic_of("\"yes\"").as_deref(), Some("approvals"));
-    // The untopicked message is filed under the sentinel, not NULL — a receiver selects on
-    // equality, and nothing equals NULL.
-    assert_eq!(
-        topic_of("\"untopicked\"").as_deref(),
-        Some(dbos::sysdb::NULL_TOPIC)
-    );
+    assert_eq!(topic_of("\"untopicked\""), None, "read back as no topic");
+    // But filed under the sentinel, not NULL: a receiver selects on equality, and nothing equals
+    // NULL.
+    let stored: Option<String> = sqlx::query_scalar(
+        r#"SELECT topic FROM "dbos"."notifications"
+           WHERE destination_uuid = 'wf-dest' AND message = '"untopicked"'"#,
+    )
+    .fetch_one(&db.pool().await)
+    .await
+    .unwrap();
+    assert_eq!(stored.as_deref(), Some(dbos::sysdb::NULL_TOPIC));
 }
 
 /// An idempotency key makes a repeated send a no-op.

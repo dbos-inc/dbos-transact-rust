@@ -1627,7 +1627,8 @@ impl DBOS {
     ///
     /// There is no separate listing of queued workflows. [`WorkflowFilter::queues_only`] is that
     /// method, and it composes with every other filter instead of being a second entry point that
-    /// repeats them.
+    /// repeats them. With no `status` it lists the queue's live work (`ENQUEUED`, `PENDING`,
+    /// `DELAYED`); name the statuses to see finished, cancelled or dead-lettered ones.
     ///
     /// ```no_run
     /// # async fn f(dbos: &dbos::DBOS) -> dbos::Result<()> {
@@ -1926,7 +1927,8 @@ impl crate::Client {
     /// Reads the workflows matching a filter.
     ///
     /// See [`DBOS::list_workflows`]. Queued workflows are listed with
-    /// [`WorkflowFilter::queues_only`] rather than a second method.
+    /// [`WorkflowFilter::queues_only`] rather than a second method; with no `status` it lists the
+    /// queue's live work, and naming statuses shows the rest.
     ///
     /// ```no_run
     /// # async fn f(client: &dbos::Client) -> dbos::Result<()> {
