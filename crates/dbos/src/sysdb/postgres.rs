@@ -7283,6 +7283,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                     tx.commit().await?;
                     return Ok(Vec::new());
                 }
+                test_hook!(crate::test_hooks::points::PARTITION_CLAIM, &queue.name)?;
 
                 // Re-checks queue, partition and version alongside status, so a row that
                 // `resume_workflows` moved to another queue or partition mid-sweep is dropped

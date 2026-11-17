@@ -12506,6 +12506,95 @@ async fn queue_partitions_are_the_keys_with_work() {
     assert!(sys.get_queue_partitions("other").await.unwrap().is_empty());
 }
 
+/// **A head moved to another partition between the sweep's choice and its claim is not claimed.**
+///
+/// A resume can change an `ENQUEUED` row's partition key. The sweep chooses each partition's head
+/// and then claims them, and a head that landed in `k1` in between was chosen for `p0`: starting
+/// it would put it beside `k1`'s own `PENDING` row, in a partition whose running check never saw
+/// it. The claim matches each head with the key it was chosen under, so the moved one is dropped.
+///
+/// The resume is made by a hook at the point between the two, so the window is exactly that one.
+#[cfg(feature = "test-hooks")]
+#[tokio::test]
+async fn a_head_resumed_into_another_partition_mid_sweep_is_not_claimed() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let (sys, db) = sysdb().await;
+    if skip_dequeue_completeness(&db) {
+        return;
+    }
+    let queue = partitioned_queue(&sys, "race-orders").await;
+
+    // `k1` already has a running workflow, which is what makes it full.
+    enqueue_partitioned(&sys, "wf-k1-running", "race-orders", "k1").await;
+    assert_eq!(
+        sys.start_queued_partitioned_workflows(&queue, "exec-1", "v1", "claim", None)
+            .await
+            .unwrap(),
+        ["wf-k1-running"],
+    );
+    enqueue_partitioned(&sys, "wf-moving", "race-orders", "p0").await;
+
+    let other = Arc::new(PostgresSystemDatabase::from_pool(
+        db.pool().await,
+        &Settings::default(),
+    ));
+    let moved = Arc::new(AtomicBool::new(false));
+    let hook = dbos::__test_hooks::on(
+        dbos::__test_hooks::points::PARTITION_CLAIM,
+        "race-orders",
+        {
+            let (other, moved) = (Arc::clone(&other), Arc::clone(&moved));
+            move || {
+                let (other, moved) = (Arc::clone(&other), Arc::clone(&moved));
+                async move {
+                    // Once: the sweep may be replayed, and the move has happened by then.
+                    if !moved.swap(true, Ordering::SeqCst) {
+                        other
+                            .resume_workflows(&["wf-moving"], None, Some("k1"), None, None)
+                            .await?;
+                    }
+                    Ok(())
+                }
+            }
+        },
+    );
+
+    let started = sys
+        .start_queued_partitioned_workflows(&queue, "exec-1", "v1", "claim", None)
+        .await
+        .unwrap();
+
+    assert!(hook.fired() >= 1, "the sweep never reached the claim");
+    assert!(
+        started.is_empty(),
+        "claimed {started:?}, a head that was no longer in the partition it was chosen for"
+    );
+    let moving = sys.get_workflow("wf-moving").await.unwrap().unwrap();
+    assert_eq!(moving.status, WorkflowStatus::Enqueued);
+    assert_eq!(moving.queue_partition_key.as_deref(), Some("k1"));
+    let running: Vec<_> = sys
+        .list_workflows(
+            &WorkflowFilter {
+                queue_names: vec!["race-orders"],
+                status: vec![WorkflowStatus::Pending],
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| (row.workflow_id, row.queue_partition_key))
+        .collect();
+    assert_eq!(
+        running,
+        [("wf-k1-running".to_owned(), Some("k1".to_owned()))],
+        "`k1` has one running workflow, not two"
+    );
+}
+
 /// A sweep takes one workflow per partition, and will not take a second while the first runs.
 #[tokio::test]
 async fn a_sweep_takes_one_head_per_partition() {

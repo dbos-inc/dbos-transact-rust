@@ -56,6 +56,13 @@ pub mod points {
     /// Failing here loses the acknowledgement of a recorded step: the retry records the same step
     /// again and must find it identical rather than call it nondeterminism.
     pub const STEP_COMMIT: &str = "step_commit";
+
+    /// In the partitioned sweep, **after** it has chosen each partition's head and **before** it
+    /// locks and claims them. Scope: the queue name.
+    ///
+    /// The window a resume can land in: it can change an `ENQUEUED` head's partition key, and the
+    /// claim must drop a head that is no longer in the partition it was chosen for.
+    pub const PARTITION_CLAIM: &str = "partition_claim";
 }
 
 type HookFuture = Pin<Box<dyn Future<Output = Result<(), Error>> + Send>>;
