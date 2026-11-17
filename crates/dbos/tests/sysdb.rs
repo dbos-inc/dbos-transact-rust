@@ -8677,7 +8677,7 @@ async fn a_batch_resolves_each_workflow_separately_and_keeps_the_order() {
 /// A message reaches its destination, under the sentinel topic when none is given.
 #[tokio::test]
 async fn a_message_is_delivered_to_its_destination() {
-    let (sys, _db) = sysdb().await;
+    let (sys, db) = sysdb().await;
     sys.init_workflow(
         &workflow("wf-dest"),
         None,
@@ -8719,12 +8719,17 @@ async fn a_message_is_delivered_to_its_destination() {
             .clone()
     };
     assert_eq!(topic_of("\"yes\"").as_deref(), Some("approvals"));
-    // The untopicked message is filed under the sentinel, not NULL — a receiver selects on
-    // equality, and nothing equals NULL.
-    assert_eq!(
-        topic_of("\"untopicked\"").as_deref(),
-        Some(dbos::sysdb::NULL_TOPIC)
-    );
+    assert_eq!(topic_of("\"untopicked\""), None, "read back as no topic");
+    // But filed under the sentinel, not NULL: a receiver selects on equality, and nothing equals
+    // NULL.
+    let stored: Option<String> = sqlx::query_scalar(
+        r#"SELECT topic FROM "dbos"."notifications"
+           WHERE destination_uuid = 'wf-dest' AND message = '"untopicked"'"#,
+    )
+    .fetch_one(&db.pool().await)
+    .await
+    .unwrap();
+    assert_eq!(stored.as_deref(), Some(dbos::sysdb::NULL_TOPIC));
 }
 
 /// An idempotency key makes a repeated send a no-op.
