@@ -298,8 +298,8 @@ async fn queued_workflows_do_not_accrue_attempts() {
     assert_eq!(again.recovery_attempts, 0, "nor is enqueueing it again");
 }
 
-/// **Dead-lettering parks a workflow**, clearing its owner and its queue, but only a `PENDING`
-/// row with at least the attempts its caller read: a row a resume reset meanwhile is left alone.
+/// **Dead-lettering parks a workflow**, clearing its owner but keeping its queue, but only a
+/// `PENDING` row with at least the attempts its caller read: a row a resume reset meanwhile is left alone.
 ///
 /// The limit is what stops a workflow that crashes its executor from taking down every executor
 /// in turn. Parking is deliberate rather than an error state: the row stays, and can be resumed
@@ -335,7 +335,11 @@ async fn dead_lettering_parks_a_pending_workflow_with_enough_attempts() {
     );
     let read = sys.get_workflow("wf-dlq").await.unwrap().unwrap();
     assert_eq!(read.status, WorkflowStatus::MaxRecoveryAttemptsExceeded);
-    assert_eq!(read.queue_name, None, "parking clears the queue assignment");
+    assert_eq!(
+        read.queue_name.as_deref(),
+        Some("q"),
+        "parking keeps the queue, for a later resume"
+    );
     assert_eq!(read.owner_xid, None, "and the owner");
     assert!(
         sys.dead_letter_workflows(&["wf-dlq"], 5)
@@ -1910,9 +1914,9 @@ async fn payloads_can_be_left_unloaded() {
     );
 }
 
-/// Cancelling stops a workflow and clears what would let it be picked up again.
+/// Cancelling stops a workflow and keeps its queue, but clears the deduplication key.
 #[tokio::test]
-async fn cancelling_clears_the_queue_and_the_deduplication_key() {
+async fn cancelling_keeps_the_queue_and_clears_the_deduplication_key() {
     let (sys, _db) = sysdb().await;
     let wf = NewWorkflow {
         queue_name: Some("orders"),
@@ -1932,8 +1936,9 @@ async fn cancelling_clears_the_queue_and_the_deduplication_key() {
     let read = sys.get_workflow("wf-cancel").await.unwrap().unwrap();
     assert_eq!(read.status, WorkflowStatus::Cancelled);
     assert_eq!(
-        read.queue_name, None,
-        "a cancelled workflow must not dequeue"
+        read.queue_name.as_deref(),
+        Some("orders"),
+        "a cancelled workflow keeps its queue, and still does not dequeue"
     );
     assert_eq!(
         read.deduplication_id, None,
@@ -2140,7 +2145,7 @@ async fn resuming_clears_the_attempt_count_and_the_deadline() {
     .unwrap();
 
     let resumed = sys
-        .resume_workflows(&["wf-resume"], None, None, None)
+        .resume_workflows(&["wf-resume"], None, None, None, None)
         .await
         .unwrap();
     assert_eq!(resumed, ["wf-resume"]);
@@ -2167,11 +2172,223 @@ async fn resuming_clears_the_attempt_count_and_the_deadline() {
     )
     .await
     .unwrap();
-    sys.resume_workflows(&["wf-resume2"], Some("orders"), None, None)
+    sys.resume_workflows(&["wf-resume2"], Some("orders"), None, None, None)
         .await
         .unwrap();
     let read = sys.get_workflow("wf-resume2").await.unwrap().unwrap();
     assert_eq!(read.queue_name.as_deref(), Some("orders"));
+}
+
+/// The queue, partition key and priority a row holds.
+async fn queue_columns(
+    sys: &PostgresSystemDatabase,
+    id: &str,
+) -> (Option<String>, Option<String>, i32) {
+    let row = sys.get_workflow(id).await.unwrap().unwrap();
+    (row.queue_name, row.queue_partition_key, row.priority)
+}
+
+fn columns(queue: &str, key: &str, priority: i32) -> (Option<String>, Option<String>, i32) {
+    (Some(queue.to_owned()), Some(key.to_owned()), priority)
+}
+
+/// Enqueues a workflow on a partitioned queue, far enough in the future that nothing runs it.
+async fn enqueue_delayed(sys: &PostgresSystemDatabase, id: &str) {
+    let wf = NewWorkflow {
+        queue_name: Some("keep-queue"),
+        queue_partition_key: Some("p0"),
+        priority: 3,
+        delay: Some(std::time::Duration::from_secs(3600)),
+        ..workflow(id)
+    };
+    sys.init_workflow(&wf, None, WorkflowIdReusePolicy::ReturnExisting)
+        .await
+        .unwrap();
+}
+
+/// **Cancel, resume and rewind change only the queue columns they are given.**
+///
+/// A cancelled workflow keeps its queue, partition key and priority, and a resume puts it back
+/// where it was. A queue name moves only the queue, and a partition key only the key.
+#[tokio::test]
+async fn management_keeps_the_queue_a_workflow_was_on() {
+    let (sys, _db) = sysdb().await;
+
+    enqueue_delayed(&sys, "wf-keep").await;
+    sys.cancel_workflows(&["wf-keep"], false, None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        queue_columns(&sys, "wf-keep").await,
+        columns("keep-queue", "p0", 3)
+    );
+
+    sys.resume_workflows(&["wf-keep"], None, None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        queue_columns(&sys, "wf-keep").await,
+        columns("keep-queue", "p0", 3)
+    );
+
+    // A key changes only the key.
+    sys.cancel_workflows(&["wf-keep"], false, None, None)
+        .await
+        .unwrap();
+    sys.resume_workflows(&["wf-keep"], None, Some("p1"), None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        queue_columns(&sys, "wf-keep").await,
+        columns("keep-queue", "p1", 3)
+    );
+
+    // A queue changes only the queue.
+    sys.cancel_workflows(&["wf-keep"], false, None, None)
+        .await
+        .unwrap();
+    sys.resume_workflows(&["wf-keep"], Some("other-queue"), None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        queue_columns(&sys, "wf-keep").await,
+        columns("other-queue", "p1", 3)
+    );
+
+    // A bulk resume puts each row back in its own partition.
+    for (id, key) in [("wf-bulk-a", "a"), ("wf-bulk-b", "b")] {
+        let wf = NewWorkflow {
+            queue_name: Some("keep-queue"),
+            queue_partition_key: Some(key),
+            ..workflow(id)
+        };
+        sys.init_workflow(&wf, None, WorkflowIdReusePolicy::ReturnExisting)
+            .await
+            .unwrap();
+    }
+    sys.cancel_workflows(&["wf-bulk-a", "wf-bulk-b"], false, None, None)
+        .await
+        .unwrap();
+    sys.resume_workflows(&["wf-bulk-a", "wf-bulk-b"], None, None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        queue_columns(&sys, "wf-bulk-a").await.1.as_deref(),
+        Some("a")
+    );
+    assert_eq!(
+        queue_columns(&sys, "wf-bulk-b").await.1.as_deref(),
+        Some("b")
+    );
+
+    // A rewind of a cancelled workflow does the same.
+    enqueue_delayed(&sys, "wf-rewound").await;
+    sys.cancel_workflows(&["wf-rewound"], false, None, None)
+        .await
+        .unwrap();
+    sys.rewind_workflow("wf-rewound", 0, &RewindOptions::default(), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        queue_columns(&sys, "wf-rewound").await,
+        columns("keep-queue", "p0", 3)
+    );
+
+    sys.cancel_workflows(&["wf-rewound"], false, None, None)
+        .await
+        .unwrap();
+    sys.rewind_workflow(
+        "wf-rewound",
+        0,
+        &RewindOptions {
+            queue_partition_key: Some("p2"),
+            ..RewindOptions::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        queue_columns(&sys, "wf-rewound").await,
+        columns("keep-queue", "p2", 3)
+    );
+
+    sys.cancel_workflows(&["wf-rewound"], false, None, None)
+        .await
+        .unwrap();
+    sys.rewind_workflow(
+        "wf-rewound",
+        0,
+        &RewindOptions {
+            queue_name: Some("other-queue"),
+            ..RewindOptions::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        queue_columns(&sys, "wf-rewound").await,
+        columns("other-queue", "p2", 3)
+    );
+}
+
+/// **A fork inherits its source's queue, partition key and priority**, and a queue or a key given
+/// replaces only itself.
+#[tokio::test]
+async fn a_fork_inherits_the_queue_columns_of_its_source() {
+    let (sys, _db) = sysdb().await;
+    enqueue_delayed(&sys, "wf-source").await;
+
+    let cases: [(Option<&str>, Option<&str>, &str, &str); 3] = [
+        (None, None, "keep-queue", "p0"),
+        (None, Some("f"), "keep-queue", "f"),
+        (Some("other-queue"), None, "other-queue", "p0"),
+    ];
+    for (n, (queue, key, expected_queue, expected_key)) in cases.into_iter().enumerate() {
+        let id = format!("wf-fork-{n}");
+        let forks = [Fork {
+            original_id: "wf-source",
+            forked_id: Some(&id),
+            start_step: 0,
+        }];
+        sys.fork_workflows(
+            &forks,
+            &ForkOptions {
+                queue_name: queue,
+                queue_partition_key: key,
+                ..ForkOptions::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            queue_columns(&sys, &id).await,
+            columns(expected_queue, expected_key, 3),
+            "fork case {n}"
+        );
+    }
+
+    // A source with no queue is forked onto the internal one.
+    sys.init_workflow(
+        &workflow("wf-direct"),
+        None,
+        WorkflowIdReusePolicy::ReturnExisting,
+    )
+    .await
+    .unwrap();
+    let forks = [Fork {
+        original_id: "wf-direct",
+        forked_id: Some("wf-direct-fork"),
+        start_step: 0,
+    }];
+    sys.fork_workflows(&forks, &ForkOptions::default(), None)
+        .await
+        .unwrap();
+    let fork = sys.get_workflow("wf-direct-fork").await.unwrap().unwrap();
+    assert_eq!(fork.queue_name.as_deref(), Some(INTERNAL_QUEUE));
+    assert_eq!(fork.queue_partition_key, None);
 }
 
 /// Resuming an id that does not exist says so; cancelling one does not.
@@ -2190,7 +2407,7 @@ async fn resuming_a_missing_workflow_is_an_error_but_cancelling_one_is_not() {
     .unwrap();
 
     match sys
-        .resume_workflows(&["wf-real", "wf-ghost"], None, None, None)
+        .resume_workflows(&["wf-real", "wf-ghost"], None, None, None, None)
         .await
     {
         Err(Error::NonExistentWorkflow { workflow_ids }) => {
@@ -7111,7 +7328,7 @@ async fn from_workflow_refuses_only_the_callers_own_line() {
         "a cancel of itself among others",
     );
     refused(
-        sys.resume_workflows(&["wf-loner", "wf-low"], None, Some("wf-low"), None)
+        sys.resume_workflows(&["wf-loner", "wf-low"], None, None, Some("wf-low"), None)
             .await,
         "a resume of itself among others",
     );
@@ -15194,7 +15411,9 @@ async fn the_timeout_sweep_cancels_expired_workflows_nobody_is_running() {
     for id in &cancelled {
         let row = alpha.get_workflow(id).await.unwrap().unwrap();
         assert_eq!(row.status, WorkflowStatus::Cancelled, "{id}");
-        assert_eq!(row.queue_name, None, "{id} leaves its queue");
+        let expected =
+            (id.as_str() == "wf-queued" || id.as_str() == "wf-delayed").then_some("unpolled");
+        assert_eq!(row.queue_name.as_deref(), expected, "{id} keeps its queue");
         assert_eq!(row.owner_xid, None, "{id} has no owner left");
         assert!(row.completed_at.is_some(), "{id} is stamped complete");
     }
@@ -15346,7 +15565,7 @@ async fn the_owner_token_follows_claims_and_is_cleared_by_every_hand_off() {
         WorkflowStatus::Pending
     );
 
-    sys.resume_workflows(&["wf-token"], Some("owned"), None, None)
+    sys.resume_workflows(&["wf-token"], Some("owned"), None, None, None)
         .await
         .unwrap();
     assert_eq!(
@@ -15447,7 +15666,9 @@ async fn the_owner_check_tells_a_cancel_from_a_hand_off() {
         "a cancelled row"
     );
 
-    sys.resume_workflows(&[id], None, None, None).await.unwrap();
+    sys.resume_workflows(&[id], None, None, None, None)
+        .await
+        .unwrap();
     assert!(refused(write().await, id), "a resumed row");
 
     let steps = sys

@@ -511,9 +511,9 @@ pub trait SystemDatabase: Send + Sync {
     /// cancelling something that is already over is a no-op, not a mistake. The returned ids are
     /// those that were still running, so a caller that needs to know can compare.
     ///
-    /// Cancelling also clears the queue assignment, the deduplication key, and the start time,
-    /// so a cancelled workflow cannot be dequeued and cannot hold a deduplication key against a
-    /// later workflow that wants it.
+    /// Cancelling clears the deduplication key and the start time, so a cancelled workflow cannot
+    /// hold a deduplication key against a later workflow that wants it. **The queue is kept**: a
+    /// cancelled row is never dequeued, and a later resume puts the workflow back where it was.
     ///
     /// With `cancel_children`, the cascade **cancels each level before discovering the next**,
     /// and repeats until it finds nothing new. Cancelling a parent first is what stops it
@@ -567,7 +567,8 @@ pub trait SystemDatabase: Send + Sync {
     ///
     /// Resuming clears the recovery-attempt count and the deadline: the workflow is being given
     /// a fresh start, and holding it to a deadline set before it was parked would fail it
-    /// immediately. `queue_name` defaults to [`INTERNAL_QUEUE`].
+    /// immediately. Only what is given changes: `queue_name` and `queue_partition_key` keep the row's
+    /// own, and `queue_name` falls back to [`INTERNAL_QUEUE`] for a row that has none.
     ///
     /// Unlike [`cancel_workflows`](Self::cancel_workflows), an id with no row behind it is an
     /// [`Error::NonExistentWorkflow`]. The two differ because a zero-row update cannot tell
@@ -595,6 +596,7 @@ pub trait SystemDatabase: Send + Sync {
         &self,
         workflow_ids: &[&str],
         queue_name: Option<&str>,
+        queue_partition_key: Option<&str>,
         from_workflow: Option<&str>,
         caller: Option<StepCaller<'_>>,
     ) -> Result<Vec<String>, Error>;
@@ -659,10 +661,10 @@ pub trait SystemDatabase: Send + Sync {
     ///
     /// Returns the forked ids in the order given, including any that were generated.
     ///
-    /// **The fork is enqueued, not started.** Its status is `ENQUEUED` on [`INTERNAL_QUEUE`] unless
-    /// [`ForkOptions::queue_name`] says otherwise, so whichever executor next polls that queue runs
-    /// it: the process asking for a fork is usually an operator's tool, not a host that can run the
-    /// workflow.
+    /// **The fork is enqueued, not started.** Its status is `ENQUEUED` on its source's queue, or
+    /// [`INTERNAL_QUEUE`] for a source that has none, unless [`ForkOptions::queue_name`] says
+    /// otherwise, so whichever executor next polls that queue runs it: the process asking for a
+    /// fork is usually an operator's tool, not a host that can run the workflow.
     ///
     /// **Four tables are copied, not one.** Steps come from `operation_outputs`; a workflow that
     /// published events or wrote streams before its start step must find them again, so

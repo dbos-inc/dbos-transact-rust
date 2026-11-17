@@ -2974,12 +2974,13 @@ pub struct ForkOptions<'a> {
     /// Forking onto a *new* version is the point of the parameter: a workflow that failed on a
     /// broken deployment is forked onto the fixed one.
     pub application_version: Option<&'a str>,
-    /// The queue the fork is enqueued on. `None` means [`INTERNAL_QUEUE`](crate::sysdb::INTERNAL_QUEUE).
+    /// The queue the fork is enqueued on. `None` keeps the source's queue, or
+    /// [`INTERNAL_QUEUE`](crate::sysdb::INTERNAL_QUEUE) for a source that has none.
     ///
     /// A fork is always enqueued rather than started: it is created by whoever asked for the
     /// fork, and run by whichever executor picks it up.
     pub queue_name: Option<&'a str>,
-    /// The partition of that queue.
+    /// The partition of that queue. `None` keeps the source's.
     pub queue_partition_key: Option<&'a str>,
     /// How long the fork may run before it is cancelled.
     pub timeout: Option<Duration>,
@@ -3061,17 +3062,16 @@ impl ForkOptions<'_> {
 
 /// Where a rewound workflow is re-enqueued.
 ///
-/// **`None` does not mean the same thing across these fields.** The version is left as it was,
-/// while the queue and its partition are the rewind's own: `None` there is the internal queue and
-/// no partition, not the workflow's previous ones, so a partition key from the queue it ran on
-/// does not follow it onto a queue that may not be partitioned.
+/// Only what is given changes: the version, the queue and its partition each keep the workflow's
+/// own when `None`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RewindOptions<'a> {
     /// The version the workflow is re-run under. `None` keeps its current one.
     pub application_version: Option<&'a str>,
-    /// The queue it is re-enqueued on. `None` means [`INTERNAL_QUEUE`](crate::sysdb::INTERNAL_QUEUE).
+    /// The queue it is re-enqueued on. `None` keeps its own, or
+    /// [`INTERNAL_QUEUE`](crate::sysdb::INTERNAL_QUEUE) for a workflow that has none.
     pub queue_name: Option<&'a str>,
-    /// The partition of that queue. `None` clears any key the workflow had.
+    /// The partition of that queue. `None` keeps the key the workflow has.
     pub queue_partition_key: Option<&'a str>,
 }
 

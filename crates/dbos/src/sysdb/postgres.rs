@@ -1335,7 +1335,6 @@ impl PostgresSystemDatabase {
         // step 0 to copy, and skipping it would re-run a step the fork was given the result of.
         let copies_anything = start_steps.iter().any(|&step| step > 0);
 
-        let queue_name = options.queue_name.unwrap_or(INTERNAL_QUEUE);
         // `fork_workflows` and `fork_from`, the only ways here, both run `ForkOptions::validate`
         // first, which refuses a timeout too large to store, so this cannot fail. It converts
         // through the method that check uses, so the rule is written once.
@@ -1384,12 +1383,14 @@ impl PostgresSystemDatabase {
             "INSERT INTO {workflow_table} (workflow_uuid, status, name, class_name, config_name, \
                 application_version, application_id, authenticated_user, authenticated_roles, \
                 assumed_role, serialization, request, queue_name, \
-                queue_partition_key, forked_from, attributes, workflow_timeout_ms, \
+                queue_partition_key, priority, forked_from, attributes, workflow_timeout_ms, \
                 application_name) \
              SELECT m.fork_id, 'ENQUEUED', w.name, w.class_name, w.config_name, \
                 COALESCE($4, w.application_version), w.application_id, w.authenticated_user, \
                 w.authenticated_roles, w.assumed_role, w.serialization, w.request, \
-                $5, $6, w.workflow_uuid, w.attributes, $7, \
+                COALESCE($5, NULLIF(w.queue_name, ''), $9), \
+                COALESCE($6, w.queue_partition_key), COALESCE(w.priority, 0), \
+                w.workflow_uuid, w.attributes, $7, \
                 COALESCE(w.application_name, $8) \
              FROM unnest($1::text[], $2::text[], $3::int4[]) \
                AS m(original_id, fork_id, start_step) \
@@ -1399,10 +1400,11 @@ impl PostgresSystemDatabase {
         .bind(forked_ids)
         .bind(start_steps)
         .bind(options.application_version)
-        .bind(queue_name)
+        .bind(options.queue_name)
         .bind(options.queue_partition_key)
         .bind(timeout_ms)
         .bind(application_name)
+        .bind(INTERNAL_QUEUE)
         .execute(&mut *tx)
         .await?;
 
@@ -1523,7 +1525,7 @@ impl PostgresSystemDatabase {
 
         tracing::info!(
             count = original_ids.len(),
-            queue_name,
+            queue = options.queue_name,
             "forked workflows onto the queue"
         );
         Ok(tx)
@@ -2001,7 +2003,7 @@ fn now_ms_plus_sql(operand: &str) -> String {
 /// What a timeout writes: a cancel's columns plus `owner_xid`, so no execution holds the row.
 fn timed_out_set_sql() -> String {
     format!(
-        "status = 'CANCELLED', owner_xid = NULL, queue_name = NULL, deduplication_id = NULL, \
+        "status = 'CANCELLED', owner_xid = NULL, deduplication_id = NULL, \
          started_at_epoch_ms = NULL, updated_at = {NOW_MS_SQL}, completed_at = {NOW_MS_SQL}"
     )
 }
@@ -2725,15 +2727,17 @@ impl PostgresSystemDatabase {
     {
         let workflow_table = &self.tables.workflow_status;
         let ids: Vec<&str> = workflow_ids.iter().map(AsRef::as_ref).collect();
+        // `queue_name` is kept, so a later resume puts the workflow back on the queue it was on.
         // `started_at_epoch_ms` is cleared because that is the cancelled row other SDKs on the same
-        // database write; nothing here needs it. The rate limiter would not: the count is scoped by
-        // `queue_name`, which this statement also clears, so the row leaves the limiter through the
-        // name. A workflow that was running when it was cancelled *did* start, so clearing the
-        // column discards true information and hides the row from `started_after`/`started_before`.
+        // database write. It is also what takes the row out of a queue's rate limit: the limiter
+        // counts a queue's rows by that column, so a cancelled row that kept it would go on using
+        // up the window. A workflow that was running when it was cancelled *did* start, so
+        // clearing the column discards true information and hides the row from
+        // `started_after`/`started_before`.
         // `owner_xid` is cleared so the execution running a cancelled workflow, should it still
         // be writing, is refused at its next write.
         let cancelled: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
-            "UPDATE {workflow_table} SET status = 'CANCELLED', queue_name = NULL, \
+            "UPDATE {workflow_table} SET status = 'CANCELLED', \
              deduplication_id = NULL, started_at_epoch_ms = NULL, owner_xid = NULL, \
              updated_at = {NOW_MS_SQL}, completed_at = {NOW_MS_SQL} \
              WHERE workflow_uuid = ANY($1) \
@@ -4453,7 +4457,7 @@ impl SystemDatabase for PostgresSystemDatabase {
             let ids: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
                 "UPDATE {workflow_table} \
                  SET status = 'MAX_RECOVERY_ATTEMPTS_EXCEEDED', owner_xid = NULL, \
-                     deduplication_id = NULL, started_at_epoch_ms = NULL, queue_name = NULL, \
+                     deduplication_id = NULL, started_at_epoch_ms = NULL, \
                      updated_at = {NOW_MS_SQL}, completed_at = {NOW_MS_SQL} \
                  WHERE workflow_uuid = ANY($1) AND status = 'PENDING' \
                    AND recovery_attempts >= $2 \
@@ -4656,6 +4660,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         &self,
         workflow_ids: &[&str],
         queue_name: Option<&str>,
+        queue_partition_key: Option<&str>,
         from_workflow: Option<&str>,
         caller: Option<StepCaller<'_>>,
     ) -> Result<Vec<String>, Error> {
@@ -4665,7 +4670,6 @@ impl SystemDatabase for PostgresSystemDatabase {
             return Ok(Vec::new());
         }
         let workflow_table = self.tables.workflow_status.as_str();
-        let queue = queue_name.unwrap_or(INTERNAL_QUEUE);
         let started_at = Timestamp::now();
 
         with_retry(&self.retry, "resume_workflows", move || async move {
@@ -4704,7 +4708,9 @@ impl SystemDatabase for PostgresSystemDatabase {
                     // dequeues it is the next owner: an execution still running a resumed `PENDING`
                     // workflow is refused at its next write rather than running beside it.
                     let resumed: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
-                        "UPDATE {workflow_table} SET status = 'ENQUEUED', queue_name = $2, \
+                        "UPDATE {workflow_table} SET status = 'ENQUEUED', \
+                         queue_name = COALESCE($2, NULLIF(queue_name, ''), $4), \
+                         queue_partition_key = COALESCE($3, queue_partition_key), \
                          recovery_attempts = 0, workflow_deadline_epoch_ms = NULL, owner_xid = NULL, \
                          deduplication_id = NULL, started_at_epoch_ms = NULL, completed_at = NULL, \
                          updated_at = {NOW_MS_SQL} \
@@ -4712,13 +4718,15 @@ impl SystemDatabase for PostgresSystemDatabase {
                          RETURNING workflow_uuid"
                     )))
                     .bind(workflow_ids)
-                    .bind(queue)
+                    .bind(queue_name)
+                    .bind(queue_partition_key)
+                    .bind(INTERNAL_QUEUE)
                     .fetch_all(&mut *tx)
                     .await?;
                     tracing::debug!(
                         requested = workflow_ids.len(),
                         resumed = resumed.len(),
-                        queue,
+                        queue_name,
                         "resumed workflows"
                     );
                     Ok((tx, resumed))
@@ -4956,7 +4964,6 @@ impl SystemDatabase for PostgresSystemDatabase {
         }
         options.validate()?;
         let tables = &self.tables;
-        let queue = options.queue_name.unwrap_or(INTERNAL_QUEUE);
         let started_at = Timestamp::now();
 
         with_retry(&self.retry, "rewind_workflow", move || async move {
@@ -5079,8 +5086,9 @@ impl SystemDatabase for PostgresSystemDatabase {
                     // `record_workflow_outcome` clears them. The timeout is kept so the dequeue
                     // derives a fresh deadline.
                     let updated = sqlx::query(AssertSqlSafe(format!(
-                        "UPDATE {workflow_table} SET status = 'ENQUEUED', queue_name = $3, \
-                         queue_partition_key = $4, \
+                        "UPDATE {workflow_table} SET status = 'ENQUEUED', \
+                         queue_name = COALESCE($3, NULLIF(queue_name, ''), $6), \
+                         queue_partition_key = COALESCE($4, queue_partition_key), \
                          application_version = COALESCE($5, application_version), \
                          recovery_attempts = 0, owner_xid = NULL, \
                          workflow_deadline_epoch_ms = NULL, deduplication_id = NULL, \
@@ -5090,9 +5098,10 @@ impl SystemDatabase for PostgresSystemDatabase {
                     )))
                     .bind(workflow_id)
                     .bind(status.as_str())
-                    .bind(queue)
+                    .bind(options.queue_name)
                     .bind(options.queue_partition_key)
                     .bind(options.application_version)
+                    .bind(INTERNAL_QUEUE)
                     .execute(&mut *tx)
                     .await?
                     .rows_affected();
@@ -5103,7 +5112,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                         });
                     }
 
-                    tracing::debug!(workflow_id, start_step, queue, "rewound workflow");
+                    tracing::debug!(workflow_id, start_step, "rewound workflow");
                     Ok((tx, ()))
                 },
             )

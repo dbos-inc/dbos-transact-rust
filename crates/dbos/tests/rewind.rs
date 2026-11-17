@@ -619,8 +619,8 @@ async fn a_rewind_reverts_the_events_published_past_the_cut() {
     dbos.shutdown().await;
 }
 
-/// **With no queue named, a rewound workflow goes to the internal queue and its partition key is
-/// cleared; with a version nobody runs, it waits.**
+/// **With no queue named, a rewound workflow keeps its own (the internal queue, for one that ran
+/// directly) and its partition key; with a version nobody runs, it waits.**
 ///
 /// Then cancelled, and rewound again under the version this executor runs, which it does.
 #[tokio::test]
@@ -671,7 +671,11 @@ async fn a_rewind_chooses_the_queue_and_version_the_rerun_gets() {
     let reader = reader(&db).await;
     let parked = row(&reader, id).await;
     assert_eq!(parked.queue_name.as_deref(), Some(INTERNAL_QUEUE));
-    assert_eq!(parked.queue_partition_key, None, "the old key is not kept");
+    assert_eq!(
+        parked.queue_partition_key.as_deref(),
+        Some("old-key"),
+        "the key it had is kept"
+    );
     assert_eq!(parked.app_version.as_deref(), Some("not-deployed"));
 
     // The internal queue is polled here, but only for this executor's version.

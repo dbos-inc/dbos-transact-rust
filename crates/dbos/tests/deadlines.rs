@@ -393,8 +393,9 @@ async fn the_sweep_cancels_expired_workflows_nobody_is_running() {
         .unwrap()
         .unwrap();
     assert_eq!(
-        queued.queue_name, None,
-        "a cancelled workflow leaves its queue"
+        queued.queue_name.as_deref(),
+        Some("unpolled-queue"),
+        "a cancelled workflow keeps its queue"
     );
     assert_eq!(
         reader

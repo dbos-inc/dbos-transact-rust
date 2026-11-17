@@ -46,7 +46,8 @@ async fn reader(db: &TestDatabase) -> PostgresSystemDatabase {
 /// change.**
 ///
 /// The workflow starts on a queue nothing polls, so it sits `ENQUEUED` and untouched. Resuming
-/// moves it to the internal queue, which this executor does poll — and it runs.
+/// puts it on the internal queue, which this executor does poll — and it runs. A plain resume
+/// keeps the queue it was on, so the workflow stays where nothing polls.
 #[tokio::test]
 async fn resuming_puts_a_workflow_on_a_queue_that_runs_it() {
     let db = test_database().await;
@@ -84,8 +85,29 @@ async fn resuming_puts_a_workflow_on_a_queue_that_runs_it() {
         "a queue with no row was polled"
     );
 
-    let handle = dbos
+    let kept = dbos
         .resume::<u32, EngineOnly>(id)
+        .await
+        .expect("resume failed");
+    assert_eq!(kept.workflow_id(), id, "resuming changed the id");
+    let row = reader(&db)
+        .await
+        .get_workflow(id)
+        .await
+        .expect("read failed")
+        .expect("the row is missing");
+    assert_eq!(row.status, WorkflowStatus::Enqueued);
+    assert_eq!(row.queue_name.as_deref(), Some("a-queue-with-no-row"));
+    assert_eq!(ran.load(Ordering::SeqCst), 0, "a resume left its queue");
+
+    let handle = dbos
+        .resume_with::<u32, EngineOnly>(
+            id,
+            ResumeOptions {
+                queue_name: Some(dbos::sysdb::INTERNAL_QUEUE),
+                ..ResumeOptions::default()
+            },
+        )
         .await
         .expect("resume failed");
     assert_eq!(handle.workflow_id(), id, "resuming changed the id");
@@ -1640,6 +1662,7 @@ async fn resuming_onto_a_named_queue_puts_the_workflow_there() {
             id,
             ResumeOptions {
                 queue_name: Some("recovery"),
+                ..ResumeOptions::default()
             },
         )
         .await
