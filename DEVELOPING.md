@@ -114,8 +114,11 @@ let lost = dbos::__test_hooks::fail_once(
     dbos::__test_hooks::points::STEP_COMMIT, "my-workflow-id", lost_acknowledgement());
 ```
 
-- A point is a name and a **scope**, usually a workflow id or a queue name, so tests in one binary
-  that name their own workflows do not share a hook. Setting the same point and scope twice panics.
+- A point is a name and a **scope**, usually a workflow id or a queue name. The registry is per
+  process, and every test has its own database, so tests that use the same id share a hook: give a
+  hooked scope a unique name (a random suffix), not an id such as `wf-1` that the suite reuses.
+  Setting the same point and scope twice panics, which catches two hooks and not a hook and an
+  unhooked test.
 - `on` runs an async closure at the point, which can make a management call or wait on a `Notify`
   to hold the window open; `fail_once` returns an error from it once. Both return a guard that
   removes the hook when it drops, panics included, and `guard.fired()` says how often it was hit.
@@ -125,7 +128,13 @@ let lost = dbos::__test_hooks::fail_once(
   API and has no semver promise.
 - To add a point: name it in `test_hooks::points` with where it is and what its scope is, and
   write `test_hook!(crate::test_hooks::points::NAME, scope)?;` at the spot. Put it *after* a
-  commit to test a lost acknowledgement, and between two statements to test a race.
+  commit to test a lost acknowledgement, and between two statements to test a race. That form is
+  for sysdb code; the engine's `Error` has no `From` for the sysdb one, so there it is
+  `test_hook!(..).map_err(Error::from_sysdb)?;`.
+- A hook that waits holds whatever the point holds. A point inside an open transaction holds a pool
+  connection (five in the test pool), and a hook that manages a row that transaction has locked
+  waits forever. `on` runs on every hit, so a hook that reaches its own point and scope recurses.
+  Dropping a guard stops later hits, not a hook already running.
 
 ### Other runtimes
 

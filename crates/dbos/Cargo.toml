@@ -41,16 +41,16 @@ engine = ["tokio/rt", "tokio/macros", "dep:croner", "dep:jiff", "dep:erased-serd
 # and a macro nobody enabled is exactly the trap it exists to prevent. What it costs is `syn` and
 # `quote` at build time; a build that would rather not pay that can turn the feature off.
 macros = ["engine", "dep:dbos-macros"]
-# The async runtime this crate spawns tasks and sets timers on, and the one `sqlx` drives its
-# connections with. At least one is required; see `rt` for how several are chosen between.
-#
-# Only spawning and timers depend on it. `tokio` stays a dependency whatever is chosen, for its
-# `sync` primitives and macros, which run on any executor.
 # Named points in production code where a test can run something or make a call fail; see
 # `test_hooks.rs`. **For this workspace's tests only**, with no semver promise, and off in every
 # build an application makes: this crate's own tests turn it on through the self dev-dependency
 # below, so a plain `cargo test` runs them.
 test-hooks = []
+# The async runtime this crate spawns tasks and sets timers on, and the one `sqlx` drives its
+# connections with. At least one is required; see `rt` for how several are chosen between.
+#
+# Only spawning and timers depend on it. `tokio` stays a dependency whatever is chosen, for its
+# `sync` primitives and macros, which run on any executor.
 runtime-tokio = ["sqlx/runtime-tokio", "tokio/rt", "tokio/time"]
 runtime-smol = ["sqlx/runtime-smol", "dep:smol", "dep:async-io"]
 # A global executor over `async-executor`, like smol's own, and the one async-std ran on.
@@ -134,7 +134,10 @@ async-io = { version = "2.4", optional = true }
 # `cargo publish` leaves a dev-dependency with no version out of the package. The alternative is
 # `#![cfg(feature = "test-hooks")]` on the tests that use hooks, which under a plain `cargo test`
 # compiles them to nothing and reports success.
-dbos = { path = ".", features = ["test-hooks"] }
+# `default-features = false` so that a test build with other features chosen, such as
+# `--no-default-features --features runtime-smol`, gets those and `test-hooks` and not the
+# defaults on top.
+dbos = { path = ".", default-features = false, features = ["test-hooks"] }
 # A format that is not human-readable, which serde types such as `Ipv4Addr` serialize differently
 # in: what tests a custom serializer against a binary format, as an application's MessagePack one
 # would be.

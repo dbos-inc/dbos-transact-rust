@@ -16,9 +16,18 @@
 //!   and the retry has to find its own work already there.
 //!
 //! **Scoped, so tests that share a binary do not share a hook.** The scope is what the point is
-//! about, usually a workflow id or a queue name, which tests already make unique. A point hit under
-//! a scope nobody registered returns at once. Registering the same point and scope twice panics,
-//! which is how two tests colliding on one name are caught rather than interleaved.
+//! about, usually a workflow id or a queue name. The registry is per process while every test has
+//! a database of its own, so **two tests that use the same id are two tests under one scope**: a
+//! hook set for one fires in the other, whichever database it is running against. Name a hooked
+//! scope uniquely, with a random suffix, and do not reuse an id the suite uses elsewhere (`wf-1`
+//! and `wf-caller` are everywhere). A point hit under a scope nobody registered returns at once.
+//! Registering the same point and scope twice panics, which catches two hooks colliding but not a
+//! hook colliding with a test that has none.
+//!
+//! **A hook holds what the point holds.** Points sit between statements, and a few may sit inside
+//! an open transaction, where a hook that waits holds a pool connection (the test pool has five)
+//! and one that manages a row the transaction has locked waits for it forever. A hook on `on` runs
+//! on every hit, so one that reaches its own point and scope recurses.
 //!
 //! **Cleared by the guard.** Registering returns a [`Guard`] that removes the hook when it drops,
 //! including when the test panics, so a failed test cannot leave one behind for the next.
