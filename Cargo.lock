@@ -675,6 +675,7 @@ dependencies = [
  "rmp-serde",
  "serde",
  "serde_json",
+ "sha2 0.11.1",
  "smol",
  "sqlx",
  "thiserror",

@@ -57,6 +57,16 @@ pub mod points {
     /// again and must find it identical rather than call it nondeterminism.
     pub const STEP_COMMIT: &str = "step_commit";
 
+    /// In `start_queued_workflows`, **after** the claim has selected and locked the rows it will
+    /// start and **before** it marks them `PENDING`. Scope: the queue name.
+    ///
+    /// The window two claimers race in: a hook that enqueues a head this claim cannot see, and
+    /// claims it through another handle, makes two claimers pick different heads.
+    ///
+    /// The claim's transaction is open here and holds a pool connection, its row locks, and the
+    /// claim lock when it took one, so a hook must not manage the rows it selected.
+    pub const QUEUE_CLAIM: &str = "queue_claim";
+
     /// In the partitioned sweep, **after** it has chosen each partition's head and **before** it
     /// locks and claims them. Scope: the queue name.
     ///

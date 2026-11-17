@@ -2499,11 +2499,12 @@ pub struct Dequeued {
     pub stopped_by: Option<DequeueStop>,
 }
 
-/// The limit that left a claim no room to start anything.
+/// The limit that left a claim no room to start anything, or the peer claim that held it off.
 ///
-/// Each is the first limit, in the order the claim checks them, whose remaining room came to zero:
+/// Each limit is the first, in the order the claim checks them, whose remaining room came to zero:
 /// worker concurrency, then the rate limits, then the concurrency limits, the queue-wide one ahead
-/// of the per-partition one at each step.
+/// of the per-partition one at each step. A claim lock is met between the worker limits and the
+/// rest, since the limits counted in the database are counted only once it is held.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DequeueStop {
     /// This process is already running as many of the queue's workflows as it may.
@@ -2518,6 +2519,16 @@ pub enum DequeueStop {
     Concurrency,
     /// The partition already has as many workflows `PENDING` as its concurrency allows.
     PartitionConcurrency,
+    /// Another claim is spending the queue's shared budget right now, so this one claimed
+    /// nothing. That claim holds the lock on the whole queue, which a claim takes when the queue
+    /// carries a queue-wide concurrency or rate limit.
+    ///
+    /// Not a full queue: the peer is claiming from it, so it still has work, and the next poll
+    /// tries again without backing off.
+    ClaimLock,
+    /// Another claim is spending this partition's budget right now, so this one claimed nothing.
+    /// It says nothing about the next key, whose lock is its own.
+    PartitionClaimLock,
 }
 
 impl DequeueStop {
@@ -2528,10 +2539,11 @@ impl DequeueStop {
     /// same thing. A per-partition limit says nothing about the next key.
     pub fn spans_partitions(self) -> bool {
         match self {
-            Self::WorkerConcurrency | Self::RateLimit | Self::Concurrency => true,
+            Self::WorkerConcurrency | Self::RateLimit | Self::Concurrency | Self::ClaimLock => true,
             Self::PartitionWorkerConcurrency
             | Self::PartitionRateLimit
-            | Self::PartitionConcurrency => false,
+            | Self::PartitionConcurrency
+            | Self::PartitionClaimLock => false,
         }
     }
 }

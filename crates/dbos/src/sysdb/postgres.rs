@@ -505,6 +505,12 @@ pub struct PostgresSystemDatabase {
     /// The schema is fixed at construction, so rendering these per query would allocate three
     /// strings on every database operation to produce a value that never changes.
     tables: Tables,
+    /// The schema as configured, unquoted, which is what names this database's claim locks: every
+    /// SDK spells a lock with the schema it was given, so a quoted form would name another lock.
+    schema: String,
+    /// Whether queue claims take advisory locks, asked of the server on the first claim that
+    /// needs to know; see [`claims_take_locks`](Self::claims_take_locks).
+    claim_locks: tokio::sync::OnceCell<bool>,
     retry: RetryPolicy,
     executor_id: Option<String>,
     /// The application every row this handle writes is stamped with. See
@@ -636,6 +642,8 @@ impl PostgresSystemDatabase {
             listener_task: std::sync::Mutex::default(),
             notifier_task: std::sync::Mutex::default(),
             tables: Tables::new(config.settings.schema),
+            schema: config.settings.schema.to_owned(),
+            claim_locks: tokio::sync::OnceCell::new(),
             retry: config.settings.retry,
             // Copied out: the handle outlives the borrowed configuration.
             executor_id: config.settings.executor_id.map(str::to_owned),
@@ -752,12 +760,68 @@ impl PostgresSystemDatabase {
             listener_task: std::sync::Mutex::default(),
             notifier_task: std::sync::Mutex::default(),
             tables: Tables::new(settings.schema),
+            schema: settings.schema.to_owned(),
+            claim_locks: tokio::sync::OnceCell::new(),
             retry: settings.retry,
             // Copied out: the handle outlives the borrowed settings.
             executor_id: settings.executor_id.map(str::to_owned),
             application_name: settings.application_name.map(str::to_owned),
         }
     }
+
+    /// Whether queue claims serialize on advisory locks: on PostgreSQL, and not on CockroachDB.
+    ///
+    /// **CockroachDB accepts the lock functions and grants every call**, so a lock taken there
+    /// would exclude nothing while reading as if it did. Its claims run at `SERIALIZABLE` instead,
+    /// which aborts the claimer that would overspend.
+    ///
+    /// Asked of the server once and remembered, since a handle's server cannot change dialect. A
+    /// failed read is not remembered, so the next claim asks again.
+    async fn claims_take_locks(&self) -> Result<bool, Error> {
+        let pool = &self.pool;
+        self.claim_locks
+            .get_or_try_init(|| {
+                with_retry(&self.retry, "detect_dialect", move || async move {
+                    let version: String = sqlx::query_scalar("SELECT version()")
+                        .fetch_one(pool)
+                        .await?;
+                    Ok(migrations::runner::dialect_of(&version) == migrations::Dialect::Postgres)
+                })
+            })
+            .await
+            .copied()
+    }
+}
+
+/// A claim lock's name: its parts as a compact JSON array, exactly as `JSON.stringify` writes one.
+///
+/// **Every SDK derives its claim locks from the same name**, so a Rust claimer and a Python or
+/// TypeScript one on the same queue take the same lock and exclude each other. `serde_json` writes
+/// these parts as `JSON.stringify` does: no whitespace, `null` for a missing part, and non-ASCII
+/// characters unescaped.
+fn lock_name(parts: &[Option<&str>]) -> String {
+    serde_json::to_string(parts).expect("a list of strings always serializes")
+}
+
+/// The SHA-256 of `text`'s UTF-8 bytes, from which every SDK's claim lock keys are read.
+fn sha256(text: &str) -> [u8; 32] {
+    use sha2::Digest;
+    sha2::Sha256::digest(text.as_bytes()).into()
+}
+
+/// The `bigint` advisory lock a claim spending a shared budget takes.
+///
+/// The first eight bytes of the SHA-256 of `["dbos.queue_claim", schema, queue, partition]`, read
+/// as a big-endian signed integer. `partition` is `None` for a claim that locks the whole queue.
+pub(crate) fn queue_claim_lock_key(schema: &str, queue: &str, partition: Option<&str>) -> i64 {
+    let name = lock_name(&[
+        Some("dbos.queue_claim"),
+        Some(schema),
+        Some(queue),
+        partition,
+    ]);
+    let digest = sha256(&name);
+    i64::from_be_bytes(digest[..8].try_into().expect("eight bytes"))
 }
 
 impl Drop for PostgresSystemDatabase {
@@ -6770,18 +6834,9 @@ impl SystemDatabase for PostgresSystemDatabase {
             || queue.partition_concurrency.is_some()
             || queue.rate_limit.is_some()
             || queue.partition_rate_limit.is_some();
-        // Whether this call sweeps one partition of a queue whose budget spans every partition,
-        // which is a second hazard and needs a stronger answer. Two calls sweeping different keys
-        // read the same queue-wide total and then claim disjoint rows, so no snapshot conflict or
-        // row lock fires under repeatable read and each spends the whole budget: write skew,
-        // which only serialisable catches.
-        //
-        // Only the queue-wide limits count here. A per-partition limit is counted within the
-        // swept key, and two calls spending it are sweeping the same key: they select the same
-        // head-of-line rows, and the `NOWAIT` lock on those rows makes the loser fail. That holds
-        // only while both select the same head. Two calls whose selections differ, for example
-        // because a version filter hides the head from one of them, lock different rows and can
-        // both admit a workflow against a per-partition limit of one.
+        // Whether this call claims from one partition of a queue whose budget spans every
+        // partition. Two calls claiming different keys then spend the same queue-wide total, so
+        // the lock they take has to be the whole queue's rather than their partition's.
         let budget_spans_partitions =
             partition_key.is_some() && (queue.concurrency.is_some() || queue.rate_limit.is_some());
         // Marks the rows a limited queue started, which is what the windows below count and why
@@ -6803,6 +6858,77 @@ impl SystemDatabase for PostgresSystemDatabase {
         let rate_limit_period_ms = period_ms(queue.rate_limit);
         let partition_rate_limit_period_ms = period_ms(queue.partition_rate_limit);
 
+        // How many this executor may take under every limit the queue carries: the tightest of
+        // them, and `None` when it carries none. Deliberately not a capturing closure, so
+        // `max_tasks` can be checked against zero after each limit while it is live.
+        let narrow = |current: Option<i64>, available: i64| -> Option<i64> {
+            Some(current.map_or(available, |taken: i64| taken.min(available)))
+        };
+        // Checked after every limit rather than after each group, so the claim can name the limit
+        // that closed it: the first in this order to reach zero.
+        let stopped = |stop: DequeueStop| Dequeued {
+            workflow_ids: Vec::new(),
+            stopped_by: Some(stop),
+        };
+
+        // **The worker limits first, and before any transaction**, because they cost no query:
+        // they are answered from what this process is already running rather than from the
+        // database, which cannot see a running workflow that has not written a step yet. Checked
+        // before the claim lock below, so a worker with no room never holds a lock a peer with
+        // room is waiting on.
+        let mut worker_max_tasks: Option<i64> = None;
+        if let Some(worker_concurrency) = queue.worker_concurrency {
+            worker_max_tasks = narrow(
+                worker_max_tasks,
+                (i64::from(worker_concurrency) - local_running_count).max(0),
+            );
+            if worker_max_tasks == Some(0) {
+                return Ok(stopped(DequeueStop::WorkerConcurrency));
+            }
+        }
+        if let Some(worker_concurrency) = queue.partition_worker_concurrency
+            && partition_key.is_some()
+        {
+            worker_max_tasks = narrow(
+                worker_max_tasks,
+                (i64::from(worker_concurrency) - partition_local_running_count).max(0),
+            );
+            if worker_max_tasks == Some(0) {
+                return Ok(stopped(DequeueStop::PartitionWorkerConcurrency));
+            }
+        }
+
+        // **A claim that spends a shared budget serializes on a lock over that budget.** Row
+        // locks alone do not make two claimers collide: each locks the head it picked, and two
+        // claimers pick different heads whenever their candidates differ — a higher-priority row
+        // enqueued between their reads, or two application versions each selecting its own rows.
+        // Both then count the same running total, lock different rows, and commit, and a limit of
+        // one runs two workflows. No isolation level short of `SERIALIZABLE` sees that, and
+        // `SERIALIZABLE` answers routine concurrent polls with aborts and backoff.
+        //
+        // So the claim first takes a transaction-scoped advisory lock on the budget's scope: the
+        // partition when every shared limit it spends is the partition's, and the whole queue when
+        // any is queue-wide. Every SDK names the lock alike, so claimers in other languages are
+        // excluded too, provided they are recent enough to take it.
+        //
+        // Not on CockroachDB, which grants every advisory lock: there the claim runs at
+        // `SERIALIZABLE` instead, and the loser of a race is aborted.
+        let claim_lock = if has_shared_budget && self.claims_take_locks().await? {
+            let scope = if budget_spans_partitions {
+                None
+            } else {
+                partition_key
+            };
+            let stop = if scope.is_some() {
+                DequeueStop::PartitionClaimLock
+            } else {
+                DequeueStop::ClaimLock
+            };
+            Some((queue_claim_lock_key(&self.schema, &queue.name, scope), stop))
+        } else {
+            None
+        };
+
         // Conflicts are not replayed here. A dequeue raised above read committed expects to lose
         // races to its peers, and its caller's answer to a lost one — poll again later, or skip
         // this partition — is the right one, which a replay underneath it would hide.
@@ -6810,60 +6936,29 @@ impl SystemDatabase for PostgresSystemDatabase {
         with_retry(&retry, "start_queued_workflows", move || async move {
             let mut tx = pool.begin().await?;
 
-            // Read committed otherwise: with no shared budget nothing here reads a total, so a
-            // stronger isolation would buy a retry rate and nothing else.
-            if has_shared_budget {
-                let isolation = if budget_spans_partitions {
-                    "SERIALIZABLE"
-                } else {
-                    "REPEATABLE READ"
-                };
-                sqlx::raw_sql(AssertSqlSafe(format!(
-                    "SET TRANSACTION ISOLATION LEVEL {isolation}"
-                )))
-                .execute(&mut *tx)
-                .await?;
+            // **Read committed under the claim lock**, and it has to be: each statement then sees
+            // what the lock's previous holder committed, which a snapshot taken any earlier — at
+            // repeatable read, the lock statement's own — would not. Without a shared budget
+            // nothing here reads a total, so read committed is enough there too.
+            if let Some((key, stop)) = claim_lock {
+                let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
+                    .bind(key)
+                    .fetch_one(&mut *tx)
+                    .await?;
+                if !acquired {
+                    tx.commit().await?;
+                    // A peer is claiming from this budget right now, so it still has work; the
+                    // next poll tries again, with no backoff, since the peer commits in moments.
+                    tracing::debug!(queue = %queue.name, ?stop, "a peer holds the claim lock");
+                    return Ok(stopped(stop));
+                }
+            } else if has_shared_budget {
+                sqlx::raw_sql("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+                    .execute(&mut *tx)
+                    .await?;
             }
 
-            // How many this executor may take under every limit the queue carries: the tightest
-            // of them, and `None` when it carries none. Deliberately not a capturing closure, so
-            // `max_tasks` can be checked against zero after each limit while it is live.
-            let narrow = |current: Option<i64>, available: i64| -> Option<i64> {
-                Some(current.map_or(available, |taken: i64| taken.min(available)))
-            };
-            let mut max_tasks: Option<i64> = None;
-            // Checked after every limit rather than after each group, so the claim can name the
-            // limit that closed it: the first in this order to reach zero.
-            let stopped = |stop: DequeueStop| Dequeued {
-                workflow_ids: Vec::new(),
-                stopped_by: Some(stop),
-            };
-
-            // Worker concurrency first, because it costs no query. Answered from what this
-            // process is already running rather than from the database, which cannot see a
-            // running workflow that has not written a step yet.
-            if let Some(worker_concurrency) = queue.worker_concurrency {
-                max_tasks = narrow(
-                    max_tasks,
-                    (i64::from(worker_concurrency) - local_running_count).max(0),
-                );
-                if max_tasks == Some(0) {
-                    tx.commit().await?;
-                    return Ok(stopped(DequeueStop::WorkerConcurrency));
-                }
-            }
-            if let Some(worker_concurrency) = queue.partition_worker_concurrency
-                && partition_key.is_some()
-            {
-                max_tasks = narrow(
-                    max_tasks,
-                    (i64::from(worker_concurrency) - partition_local_running_count).max(0),
-                );
-                if max_tasks == Some(0) {
-                    tx.commit().await?;
-                    return Ok(stopped(DequeueStop::PartitionWorkerConcurrency));
-                }
-            }
+            let mut max_tasks = worker_max_tasks;
 
             // Then the rate limits, read as slots left in a rolling window rather than as a yes
             // or no: bounding the claim by what is left means a backlogged queue locks only the
@@ -7016,6 +7111,7 @@ impl SystemDatabase for PostgresSystemDatabase {
             .bind(&queue.name)
             .fetch_all(&mut *tx)
             .await?;
+            test_hook!(crate::test_hooks::points::QUEUE_CLAIM, &queue.name)?;
 
             // One statement for the batch rather than one per workflow: every limit above has
             // already bounded `max_tasks`, so nothing is left to stop this part-way through.
@@ -8561,7 +8657,8 @@ mod tests {
     use super::{
         AssertSqlSafe, NOW_MS_SQL, PgSeverity, PollingConcurrency, PostgresSystemDatabase,
         RetryPolicy, Settings, classify_sqlstate, is_transport_failure, latest_version_sql,
-        split_database, step_listing_query, timed_out_sweep_sql, with_retry,
+        lock_name, queue_claim_lock_key, split_database, step_listing_query, timed_out_sweep_sql,
+        with_retry,
     };
     use crate::sysdb::types::{
         EncodedValue, NewWorkflow, Outcome, StepCaller, StepCodec, Timestamp,
@@ -9819,5 +9916,55 @@ mod tests {
             ),
             "the adoption is the parent's alone"
         );
+    }
+
+    /// **The claim lock keys are byte-identical to every other SDK's**, or a Rust claimer and a
+    /// Python or TypeScript one on the same queue would take different locks and both spend the
+    /// budget.
+    ///
+    /// The expected values were computed with Python's `advisory_lock_key(lock_name(...))` from
+    /// `dbos/_sys_db.py`, and cross-checked against TypeScript's `JSON.stringify` and
+    /// `readBigInt64BE` / `readInt32BE` over the same SHA-256.
+    #[test]
+    fn claim_lock_keys_match_the_other_sdks() {
+        // The name itself, character for character: what `JSON.stringify` writes.
+        assert_eq!(
+            lock_name(&[Some("dbos.queue_claim"), Some("dbos"), Some("orders"), None]),
+            r#"["dbos.queue_claim","dbos","orders",null]"#
+        );
+        assert_eq!(
+            lock_name(&[Some("q\"\u{1}\u{8}\u{c}\u{7f}\u{2028}é😀")]),
+            "[\"q\\\"\\u0001\\b\\f\u{7f}\u{2028}é😀\"]",
+            "quotes and control characters escaped as JSON.stringify does, nothing else"
+        );
+
+        for (schema, queue, partition, key) in [
+            ("dbos", "orders", None, 8929993115748756812),
+            ("dbos", "orders", Some("alpha"), -5914539597006512337),
+            (
+                "my_schema",
+                "queue \"q\"",
+                Some("ключ-é😀"),
+                -5686958513727008818,
+            ),
+            (
+                "dbos",
+                "tab\tq",
+                Some("line\nbreak\\"),
+                -3481558939802086868,
+            ),
+            (
+                "dbos",
+                "q\u{1}\u{8}\u{c}\u{7f}\u{2028}",
+                None,
+                -6693096782072589637,
+            ),
+        ] {
+            assert_eq!(
+                queue_claim_lock_key(schema, queue, partition),
+                key,
+                "{schema} {queue:?} {partition:?}"
+            );
+        }
     }
 }

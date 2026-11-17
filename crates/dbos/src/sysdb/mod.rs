@@ -1367,11 +1367,23 @@ pub trait SystemDatabase: Send + Sync {
     /// Each limit applies at the scope its column names, and the stored `partition_queue` flag plays
     /// no part; see [`QueueRecord::is_partitioned`].
     ///
-    /// A queue with global concurrency or a rate limit runs at `REPEATABLE READ` and locks with
-    /// `NOWAIT`, so every executor sees a consistent count rather than a partial one — at
-    /// `SERIALIZABLE` when a `partition_key` is given, since sweeps of different partitions spend
-    /// the same queue-wide budget. Without those limits it stays at `READ COMMITTED` and uses
-    /// `SKIP LOCKED`.
+    /// **A claim that spends a shared budget takes turns on a lock over it.** Any concurrency or
+    /// rate limit other than a worker's is such a budget, and before counting it the claim takes
+    /// a transaction-scoped advisory lock on the budget's scope: the partition when every shared
+    /// limit it spends is the partition's, and the whole queue when any is queue-wide. Row locks
+    /// alone would not do, because two claimers whose candidates differ pick different heads and
+    /// lock different rows. The claim then counts, selects and claims at `READ COMMITTED`, so it
+    /// sees what the lock's previous holder committed, and locks its rows with `NOWAIT`. The lock
+    /// is named alike in every SDK, so claimers in other languages take turns too.
+    ///
+    /// **A claim that finds the lock held claims nothing** and reports
+    /// [`DequeueStop::ClaimLock`] or [`DequeueStop::PartitionClaimLock`]: a peer is claiming
+    /// from that budget, so the next poll tries again. CockroachDB grants every advisory lock, so
+    /// there the claim takes none and runs at `SERIALIZABLE` instead. Without a shared budget a
+    /// claim runs at `READ COMMITTED`, takes no lock, and uses `SKIP LOCKED`.
+    ///
+    /// The worker limits are checked first, before any transaction, so a worker with no room
+    /// never holds a lock a peer with room is waiting on.
     ///
     /// **A lost race is returned, not retried.** A `NOWAIT` conflict (`55P03`) surfaces as a
     /// backend error rather than an empty result, and a serialization failure (`40001`) is
@@ -1396,6 +1408,8 @@ pub trait SystemDatabase: Send + Sync {
     /// would come back the same; see [`DequeueStop::spans_partitions`].
     ///
     /// [`DequeueStop::spans_partitions`]: types::DequeueStop::spans_partitions
+    /// [`DequeueStop::ClaimLock`]: types::DequeueStop::ClaimLock
+    /// [`DequeueStop::PartitionClaimLock`]: types::DequeueStop::PartitionClaimLock
     #[allow(clippy::too_many_arguments)]
     async fn start_queued_workflows(
         &self,

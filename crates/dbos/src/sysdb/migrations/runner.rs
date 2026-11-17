@@ -195,11 +195,16 @@ pub async fn detect_dialect(pool: &PgPool) -> Result<Dialect, MigrateError> {
     let version: String = sqlx::query_scalar("SELECT version()")
         .fetch_one(pool)
         .await?;
-    Ok(if version.to_lowercase().contains("cockroachdb") {
+    Ok(dialect_of(&version))
+}
+
+/// The dialect a server's `version()` string names.
+pub(crate) fn dialect_of(version: &str) -> Dialect {
+    if version.to_lowercase().contains("cockroachdb") {
         Dialect::Cockroach
     } else {
         Dialect::Postgres
-    })
+    }
 }
 
 /// Creates the schema and the version table if they are absent.
