@@ -508,9 +508,13 @@ pub struct PostgresSystemDatabase {
     /// The schema as configured, unquoted, which is what names this database's claim locks: every
     /// SDK spells a lock with the schema it was given, so a quoted form would name another lock.
     schema: String,
-    /// Whether queue claims take advisory locks, asked of the server on the first claim that
-    /// needs to know; see [`claims_take_locks`](Self::claims_take_locks).
-    claim_locks: tokio::sync::OnceCell<bool>,
+    /// Which server this is, PostgreSQL or CockroachDB, which decides whether queue claims take
+    /// advisory locks and whether notifications can be had at all.
+    ///
+    /// Set by [`connect`](Self::connect), which asks the server once for everything that needs to
+    /// know. A handle made by [`from_pool`](Self::from_pool) does no I/O, so its first caller asks;
+    /// see [`dialect`](Self::dialect).
+    dialect: tokio::sync::OnceCell<migrations::Dialect>,
     retry: RetryPolicy,
     executor_id: Option<String>,
     /// The application every row this handle writes is stamped with. See
@@ -604,15 +608,26 @@ impl PostgresSystemDatabase {
         // Either bring the schema up, or check that whoever was supposed to has. Connecting to a
         // schema this build's queries do not fit is a failure either way; the only question is
         // whether it is reported now or as a missing column on some later statement.
-        let prepared = if config.migrate {
-            migrations::runner::run(&pool, config.settings.schema, config.use_listen_notify)
-                .await
-                .map(|_| ())
-        } else {
-            migrations::runner::verify(&pool, config.settings.schema).await
-        };
+        //
+        // The dialect is asked here once, for the migrations and for the handle, which keeps it.
+        let prepared = async {
+            let dialect = migrations::runner::detect_dialect(&pool).await?;
+            if config.migrate {
+                migrations::runner::run_in(
+                    &pool,
+                    config.settings.schema,
+                    dialect,
+                    config.use_listen_notify,
+                )
+                .await?;
+            } else {
+                migrations::runner::verify(&pool, config.settings.schema).await?;
+            }
+            Ok::<_, migrations::runner::MigrateError>(dialect)
+        }
+        .await;
         // The runner has already retried what it could; whatever reaches here is settled.
-        prepared.map_err(|e| {
+        let dialect = prepared.map_err(|e| {
             Error::Backend(BackendError {
                 message: e.to_string(),
                 sqlstate: None,
@@ -643,7 +658,7 @@ impl PostgresSystemDatabase {
             notifier_task: std::sync::Mutex::default(),
             tables: Tables::new(config.settings.schema),
             schema: config.settings.schema.to_owned(),
-            claim_locks: tokio::sync::OnceCell::new(),
+            dialect: tokio::sync::OnceCell::new_with(Some(dialect)),
             retry: config.settings.retry,
             // Copied out: the handle outlives the borrowed configuration.
             executor_id: config.settings.executor_id.map(str::to_owned),
@@ -681,7 +696,18 @@ impl PostgresSystemDatabase {
     ///
     /// [`close`](SystemDatabase::close) is the shutdown for both.
     pub async fn start_notifications(&self) -> bool {
-        match migrations::runner::detect_dialect(&self.pool).await {
+        // Asked once and not retried when the handle does not know yet: a deployment that cannot
+        // say is one to start without notifications rather than to wait on.
+        let dialect = match self.dialect.get() {
+            Some(&dialect) => Ok(dialect),
+            None => migrations::runner::detect_dialect(&self.pool)
+                .await
+                .inspect(|&dialect| {
+                    // A concurrent caller that set it first set the same value.
+                    let _ = self.dialect.set(dialect);
+                }),
+        };
+        match dialect {
             Ok(migrations::Dialect::Cockroach) => {
                 tracing::debug!(
                     "not starting a notification listener: CockroachDB has no LISTEN/NOTIFY, so \
@@ -761,7 +787,7 @@ impl PostgresSystemDatabase {
             notifier_task: std::sync::Mutex::default(),
             tables: Tables::new(settings.schema),
             schema: settings.schema.to_owned(),
-            claim_locks: tokio::sync::OnceCell::new(),
+            dialect: tokio::sync::OnceCell::new(),
             retry: settings.retry,
             // Copied out: the handle outlives the borrowed settings.
             executor_id: settings.executor_id.map(str::to_owned),
@@ -774,18 +800,21 @@ impl PostgresSystemDatabase {
     /// **CockroachDB accepts the lock functions and grants every call**, so a lock taken there
     /// would exclude nothing while reading as if it did. Its claims run at `SERIALIZABLE` instead,
     /// which aborts the claimer that would overspend.
-    ///
-    /// Asked of the server once and remembered, since a handle's server cannot change dialect. A
-    /// failed read is not remembered, so the next claim asks again.
     async fn claims_take_locks(&self) -> Result<bool, Error> {
+        Ok(self.dialect().await? == migrations::Dialect::Postgres)
+    }
+
+    /// Which server this is, asking it only if [`connect`](Self::connect) did not.
+    ///
+    /// The ask is retried like any statement, since a claim that needs the answer should wait out
+    /// a lost connection rather than fail on it. A failed ask is not remembered, so the next caller
+    /// asks again; an answer is, since a handle's server cannot change dialect.
+    async fn dialect(&self) -> Result<migrations::Dialect, Error> {
         let pool = &self.pool;
-        self.claim_locks
+        self.dialect
             .get_or_try_init(|| {
                 with_retry(&self.retry, "detect_dialect", move || async move {
-                    let version: String = sqlx::query_scalar("SELECT version()")
-                        .fetch_one(pool)
-                        .await?;
-                    Ok(migrations::runner::dialect_of(&version) == migrations::Dialect::Postgres)
+                    Ok(migrations::runner::ask_dialect(pool).await?)
                 })
             })
             .await

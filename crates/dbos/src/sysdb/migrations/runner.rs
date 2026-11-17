@@ -192,6 +192,11 @@ pub struct Outcome {
 /// even valid, and getting it from a connection string is how you end up running PostgreSQL
 /// DDL against CockroachDB.
 pub async fn detect_dialect(pool: &PgPool) -> Result<Dialect, MigrateError> {
+    Ok(ask_dialect(pool).await?)
+}
+
+/// [`detect_dialect`], with the driver's error, for a caller that classifies it itself.
+pub(crate) async fn ask_dialect(pool: &PgPool) -> Result<Dialect, sqlx::Error> {
     let version: String = sqlx::query_scalar("SELECT version()")
         .fetch_one(pool)
         .await?;
@@ -319,6 +324,16 @@ pub async fn run(
     use_listen_notify: bool,
 ) -> Result<Outcome, MigrateError> {
     let dialect = detect_dialect(pool).await?;
+    run_in(pool, schema, dialect, use_listen_notify).await
+}
+
+/// [`run`], for a caller that has already asked the server its dialect.
+pub(crate) async fn run_in(
+    pool: &PgPool,
+    schema: &str,
+    dialect: Dialect,
+    use_listen_notify: bool,
+) -> Result<Outcome, MigrateError> {
     let migrations = build_migrations(schema, dialect, use_listen_notify);
     apply(pool, schema, &migrations).await
 }
