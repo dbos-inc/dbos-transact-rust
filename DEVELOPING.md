@@ -100,6 +100,32 @@ already caught integer-width divergences that reading the SQL would not have sur
 the slower leg by a wide margin, because its cost is baseline migration per test binary rather
 than the queries themselves.
 
+### Test hooks
+
+Some bugs only exist in a window between two statements: a commit whose acknowledgement is lost,
+or a resume that lands between a sweep's candidate query and its claim. The `test-hooks` feature
+puts named points in production code where a test can run something or make a call fail.
+`crates/dbos/src/test_hooks.rs` has the full account, and `crates/dbos/tests/test_hooks.rs` has an
+example of each use:
+
+```rust
+// A step's record commits, the caller is told it did not, and the retry must find it already there.
+let lost = dbos::__test_hooks::fail_once(
+    dbos::__test_hooks::points::STEP_COMMIT, "my-workflow-id", lost_acknowledgement());
+```
+
+- A point is a name and a **scope**, usually a workflow id or a queue name, so tests in one binary
+  that name their own workflows do not share a hook. Setting the same point and scope twice panics.
+- `on` runs an async closure at the point, which can make a management call or wait on a `Notify`
+  to hold the window open; `fail_once` returns an error from it once. Both return a guard that
+  removes the hook when it drops, panics included, and `guard.fired()` says how often it was hit.
+- It is compiled only with the feature, and a build without it has no registry and no check at
+  any point. Tests that use it carry `#![cfg(feature = "test-hooks")]` and run under
+  `cargo test --all-features`, as CI does. It is not public API and has no semver promise.
+- To add a point: name it in `test_hooks::points` with where it is and what its scope is, and
+  write `test_hook!(crate::test_hooks::points::NAME, scope)?;` at the spot. Put it *after* a
+  commit to test a lost acknowledgement, and between two statements to test a race.
+
 ### Other runtimes
 
 Most tests use `#[tokio::test]` and run on tokio only. The binaries that exercise spawning and

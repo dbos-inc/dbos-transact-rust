@@ -46,6 +46,11 @@ macros = ["engine", "dep:dbos-macros"]
 #
 # Only spawning and timers depend on it. `tokio` stays a dependency whatever is chosen, for its
 # `sync` primitives and macros, which run on any executor.
+# Named points in production code where a test can run something or make a call fail; see
+# `test_hooks.rs`. **For this workspace's tests only**, with no semver promise, and off in every
+# build an application makes. Tests that use it carry `#![cfg(feature = "test-hooks")]`, and run
+# under `cargo test --all-features`, as CI does.
+test-hooks = []
 runtime-tokio = ["sqlx/runtime-tokio", "tokio/rt", "tokio/time"]
 runtime-smol = ["sqlx/runtime-smol", "dep:smol", "dep:async-io"]
 # A global executor over `async-executor`, like smol's own, and the one async-std ran on.
