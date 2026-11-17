@@ -63,6 +63,13 @@ pub fn is_stream_closed(value: &str, serialization: Option<&str>) -> bool {
 /// only while its head is running.
 pub const PARTITIONED_DEQUEUE_SWEEP_CAP: u32 = 8192;
 
+/// Partitions a partitioned sweep claims per transaction.
+///
+/// Bounds how many partition locks a sweep holds at once, and for how long: each batch is its own
+/// short transaction, so a peer's sweep meets at most this many held partitions, and only while
+/// this one claims them. The same size as the other SDKs' sweeps.
+pub const PARTITIONED_DEQUEUE_BATCH_SIZE: usize = 64;
+
 pub mod error;
 mod masked_url;
 pub mod migrations;
@@ -1443,16 +1450,28 @@ pub trait SystemDatabase: Send + Sync {
     /// The partitioned counterpart to
     /// [`start_queued_workflows`](Self::start_queued_workflows), and a different shape rather
     /// than a variation: instead of taking *n* workflows from one queue, it takes *one* from each
-    /// partition in a single transaction, so a queue with a thousand partitions costs one sweep
-    /// rather than a thousand polls.
+    /// partition, a batch of [`PARTITIONED_DEQUEUE_BATCH_SIZE`] partitions per transaction, so a
+    /// queue with a thousand partitions costs one sweep rather than a thousand polls.
     ///
     /// **Only valid for a queue whose one limit is partition concurrency 1**, which is
     /// [`Error::InvalidInput`] otherwise — no queue-wide concurrency, and neither rate limit. That
-    /// restriction is what makes the sweep safe without counting: every worker ranks each
-    /// partition's head identically, and the `PENDING` gate admits at most one row per partition,
-    /// so the limit is enforced by the data rather than by a count. Anything else a queue can
-    /// carry has to be counted within each key, which is what walking the partitions one at a time
-    /// through [`start_queued_workflows`](Self::start_queued_workflows) is for.
+    /// restriction is what makes the sweep safe without counting: a partition with a `PENDING`
+    /// row is passed by, so the limit is enforced by the data rather than by a count. Anything
+    /// else a queue can carry has to be counted within each key, which is what walking the
+    /// partitions one at a time through [`start_queued_workflows`](Self::start_queued_workflows)
+    /// is for.
+    ///
+    /// **Each batch takes its partitions' advisory locks before it picks their heads**, because
+    /// two sweeps whose candidates differ pick different heads and lock different rows, and the
+    /// `PENDING` gate alone would let both start theirs. A partition whose lock a peer holds is
+    /// passed by, left to that peer or to the next poll; the heads of the rest are picked again
+    /// under the locks, so a peer's earlier claim is seen. The locks are named alike in every SDK.
+    /// CockroachDB grants every advisory lock, so there a batch takes none and relies on the
+    /// `SERIALIZABLE` it runs at.
+    ///
+    /// **A batch that fails after earlier ones committed ends the sweep, which returns what they
+    /// claimed**, so it is dispatched; the next poll retries the rest. A failure before anything
+    /// committed is returned.
     ///
     /// `partition_worker_concurrency` is deliberately not among them: it is at least 1, and a
     /// partition already capped at one workflow across the whole fleet cannot exceed one in any

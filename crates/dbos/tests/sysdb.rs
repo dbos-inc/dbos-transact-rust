@@ -12,7 +12,8 @@ use dbos::sysdb::types::{
     WorkflowStatus, WrittenBy,
 };
 use dbos::sysdb::{
-    BackendErrorKind, DEFAULT_SCHEMA, Error, INTERNAL_QUEUE, PORTABLE_JSON, SystemDatabase,
+    BackendError, BackendErrorKind, DEFAULT_SCHEMA, Error, INTERNAL_QUEUE,
+    PARTITIONED_DEQUEUE_BATCH_SIZE, PORTABLE_JSON, SystemDatabase,
 };
 
 use dbos_test_support as support;
@@ -12885,6 +12886,238 @@ async fn a_claimer_missing_another_versions_head_does_not_overspend() {
 #[tokio::test]
 async fn a_partition_claimer_missing_a_higher_priority_head_does_not_overspend() {
     a_claimer_missing_a_new_head_does_not_overspend(MissedHead::PartitionHigherPriority).await;
+}
+
+/// **Two sweeps that pick different heads in one partition do not both start them.**
+///
+/// Sweep B is held by a hook at `point`. A head that outranks B's in `p0` is enqueued, with
+/// another in `p1`, and sweep A runs through another handle: it sees the new head as `p0`'s, a
+/// different row than B's. Without a lock on the partition itself both commit, and a partition
+/// limited to one runs two workflows.
+///
+/// - Held at [`PARTITION_CLAIM`], B has picked its head under `p0`'s lock, so A passes `p0` by and
+///   claims only `p1`, and B claims its head.
+/// - Held at [`PARTITION_LOCKS`], B has no lock yet, so A claims both new heads, and B, picking
+///   `p0`'s head again under the lock, finds A's claim running there and claims nothing.
+///
+/// [`PARTITION_CLAIM`]: dbos::__test_hooks::points::PARTITION_CLAIM
+/// [`PARTITION_LOCKS`]: dbos::__test_hooks::points::PARTITION_LOCKS
+async fn a_sweep_missing_a_new_head_never_coadmits(point: &'static str) {
+    use std::sync::{Arc, Mutex};
+
+    let (sys, db) = sysdb().await;
+    let name = unique_queue("sweep-new-head");
+    let queue = partitioned_queue(&sys, name).await;
+    enqueue_row(&sys, "wf-old-head", name, Some("p0"), 5, "v1").await;
+
+    let other = Arc::new(PostgresSystemDatabase::from_pool(
+        db.pool().await,
+        &Settings::default(),
+    ));
+    let swept_a = Arc::new(Mutex::new(None));
+    let hook = dbos::__test_hooks::on(point, name, {
+        let (other, swept_a, queue) = (Arc::clone(&other), Arc::clone(&swept_a), queue.clone());
+        move || {
+            let (other, swept_a, queue) = (Arc::clone(&other), Arc::clone(&swept_a), queue.clone());
+            async move {
+                // Once: A's own sweep reaches this point too, and must run straight through.
+                if swept_a.lock().unwrap().is_some() {
+                    return Ok(());
+                }
+                *swept_a.lock().unwrap() = Some(Ok(Vec::new()));
+                enqueue_row(&other, "wf-new-head", name, Some("p0"), 1, "v1").await;
+                enqueue_row(&other, "wf-other-head", name, Some("p1"), 5, "v1").await;
+                let result = other
+                    .start_queued_partitioned_workflows(&queue, "exec-a", "v1", "claim-a", None)
+                    .await;
+                *swept_a.lock().unwrap() = Some(result);
+                Ok(())
+            }
+        }
+    });
+
+    let swept_b = sys
+        .start_queued_partitioned_workflows(&queue, "exec-b", "v1", "claim-b", None)
+        .await;
+    assert!(hook.fired() >= 1, "sweep B never reached the hook");
+    drop(hook);
+    let swept_a = swept_a.lock().unwrap().take().expect("sweep A never ran");
+
+    let pending = pending_by_partition(&db, name).await;
+    for (partition, count) in &pending {
+        assert!(
+            *count <= 1,
+            "partition {partition:?} runs {count} workflows"
+        );
+    }
+    if matches!(db.backend(), Backend::Cockroach) {
+        // No partition lock there: `SERIALIZABLE` refuses the sweep that would co-admit. Which
+        // heads each sweep then claims is not exact either, since a `SKIP LOCKED` there can pass
+        // over a row enqueued moments ago.
+        for result in [&swept_a, &swept_b] {
+            if let Err(error) = result {
+                assert!(refused_by_serializable(error), "{error}");
+            }
+        }
+        return;
+    }
+    let (expected_a, expected_b): (&[&str], &[&str]) =
+        if point == dbos::__test_hooks::points::PARTITION_CLAIM {
+            (&["wf-other-head"], &["wf-old-head"])
+        } else {
+            (&["wf-new-head", "wf-other-head"], &[])
+        };
+    assert_eq!(swept_a.unwrap(), expected_a);
+    assert_eq!(swept_b.unwrap(), expected_b);
+    assert_eq!(
+        pending,
+        [(Some("p0".to_owned()), 1), (Some("p1".to_owned()), 1)].into()
+    );
+}
+
+#[tokio::test]
+async fn a_sweep_missing_a_new_head_while_holding_the_partition_lock_never_coadmits() {
+    a_sweep_missing_a_new_head_never_coadmits(dbos::__test_hooks::points::PARTITION_CLAIM).await;
+}
+
+#[tokio::test]
+async fn a_sweep_missing_a_new_head_before_the_partition_lock_never_coadmits() {
+    a_sweep_missing_a_new_head_never_coadmits(dbos::__test_hooks::points::PARTITION_LOCKS).await;
+}
+
+/// Enqueues one workflow on each of `count` partitions of `queue`, named `p000`, `p001` and so on,
+/// returning their ids in partition order.
+async fn enqueue_across_partitions(
+    sys: &PostgresSystemDatabase,
+    queue: &str,
+    count: usize,
+) -> Vec<String> {
+    let mut ids = Vec::with_capacity(count);
+    for n in 0..count {
+        let id = format!("wf-{n:03}");
+        enqueue_row(sys, &id, queue, Some(&format!("p{n:03}")), 0, "v1").await;
+        ids.push(id);
+    }
+    ids
+}
+
+/// An error a hook makes a sweep fail with, which nothing retries.
+fn injected_failure() -> Error {
+    Error::Backend(BackendError {
+        message: "injected by a test hook".to_owned(),
+        sqlstate: None,
+        kind: BackendErrorKind::Permanent,
+    })
+}
+
+/// **A batch that fails after an earlier one committed still returns the committed claims.**
+///
+/// Each batch commits on its own, so the first batch's heads are `PENDING` by the time the second
+/// fails. Returning the failure instead would leave them claimed and never dispatched, gating
+/// their partitions until recovery. The sweep stops at the failure, and the next one claims the
+/// rest, its partitions' locks having been released with the failed batch.
+#[tokio::test]
+async fn a_failed_batch_keeps_the_claims_of_the_batches_before_it() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let (sys, db) = sysdb().await;
+    if skip_dequeue_completeness(&db) {
+        return;
+    }
+    let name = unique_queue("sweep-batch-fails");
+    let queue = partitioned_queue(&sys, name).await;
+    // One partition more than a batch holds, so the sweep runs two.
+    let ids = enqueue_across_partitions(&sys, name, PARTITIONED_DEQUEUE_BATCH_SIZE + 1).await;
+
+    let batches = Arc::new(AtomicUsize::new(0));
+    let hook = dbos::__test_hooks::on(dbos::__test_hooks::points::PARTITION_CLAIM, name, {
+        let batches = Arc::clone(&batches);
+        move || {
+            let second = batches.fetch_add(1, Ordering::SeqCst) == 1;
+            async move {
+                if second {
+                    return Err(injected_failure());
+                }
+                Ok(())
+            }
+        }
+    });
+    let started = sys
+        .start_queued_partitioned_workflows(&queue, "exec-1", "v1", "claim", None)
+        .await
+        .expect("the first batch's claims should be returned, not the second's failure");
+    assert_eq!(hook.fired(), 2);
+    drop(hook);
+    assert_eq!(started, ids[..PARTITIONED_DEQUEUE_BATCH_SIZE]);
+    let last = ids.last().unwrap();
+    assert_eq!(
+        sys.get_workflow(last).await.unwrap().unwrap().status,
+        WorkflowStatus::Enqueued,
+        "the failed batch claimed nothing"
+    );
+
+    // The failed batch's locks went with its transaction. That connection is returned to the
+    // pool, and rolled back, in the background, so the next sweep may need a moment to find them.
+    let mut next = Vec::new();
+    for _ in 0..20 {
+        next = sys
+            .start_queued_partitioned_workflows(&queue, "exec-1", "v1", "claim", None)
+            .await
+            .unwrap();
+        if !next.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(next, [last.as_str()]);
+}
+
+/// A batch that fails before any batch committed fails the sweep, which claimed nothing, and the
+/// next sweep claims every partition.
+#[tokio::test]
+async fn a_failed_first_batch_fails_the_sweep() {
+    let (sys, db) = sysdb().await;
+    if skip_dequeue_completeness(&db) {
+        return;
+    }
+    let name = unique_queue("sweep-first-batch-fails");
+    let queue = partitioned_queue(&sys, name).await;
+    let ids = enqueue_across_partitions(&sys, name, 2).await;
+
+    let hook = dbos::__test_hooks::fail_once(
+        dbos::__test_hooks::points::PARTITION_CLAIM,
+        name,
+        injected_failure(),
+    );
+    let failed = sys
+        .start_queued_partitioned_workflows(&queue, "exec-1", "v1", "claim", None)
+        .await;
+    assert!(
+        matches!(&failed, Err(Error::Backend(backend)) if backend.message.contains("injected")),
+        "{failed:?}"
+    );
+    assert_eq!(hook.fired(), 1);
+    drop(hook);
+    for id in &ids {
+        assert_eq!(
+            sys.get_workflow(id).await.unwrap().unwrap().status,
+            WorkflowStatus::Enqueued
+        );
+    }
+
+    let mut next = Vec::new();
+    for _ in 0..20 {
+        next = sys
+            .start_queued_partitioned_workflows(&queue, "exec-1", "v1", "claim", None)
+            .await
+            .unwrap();
+        if !next.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(next, ids);
 }
 
 /// A sweep takes one workflow per partition, and will not take a second while the first runs.
