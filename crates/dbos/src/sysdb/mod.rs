@@ -1410,7 +1410,7 @@ pub trait SystemDatabase: Send + Sync {
     /// the executions dispatched from them present it on every write they make.
     ///
     /// **A limit with no room left is reported, not just obeyed.** The claim then returns before
-    /// selecting anything, naming the limit in [`Dequeued::stopped_by`]. A caller walking
+    /// selecting anything, naming the limit in [`Dequeued::Stopped`]. A caller walking
     /// partitions reads it to end the walk when the limit is queue-wide, since every other key
     /// would come back the same; see [`DequeueStop::spans_partitions`].
     ///

@@ -384,7 +384,7 @@ async fn the_dequeue_claim_counts_an_attempt() {
         .start_queued_workflows(&queue, "local", "v1", "claim", None, 0, 0)
         .await
         .unwrap()
-        .workflow_ids;
+        .started();
     assert_eq!(claimed, ["wf-counted"]);
 
     let row = sys.get_workflow("wf-counted").await.unwrap().unwrap();
@@ -418,14 +418,14 @@ async fn a_claim_that_wins_nothing_counts_nothing() {
         .start_queued_workflows(&queue, "winner", "v1", "claim", None, 0, 0)
         .await
         .unwrap()
-        .workflow_ids;
+        .started();
     assert_eq!(winner, ["wf-raced"]);
     // The row is `PENDING` now, so the loser's guard matches nothing.
     let loser = sys
         .start_queued_workflows(&queue, "loser", "v1", "claim", None, 0, 0)
         .await
         .unwrap()
-        .workflow_ids;
+        .started();
     assert!(loser.is_empty(), "the second claim should have won nothing");
 
     let row = sys.get_workflow("wf-raced").await.unwrap().unwrap();
@@ -463,7 +463,7 @@ async fn repeated_recoveries_through_the_queue_park_the_workflow() {
             .start_queued_workflows(&queue, "local", "v1", "claim", None, 0, 0)
             .await
             .unwrap()
-            .workflow_ids;
+            .started();
         if claimed.is_empty() {
             break;
         }
@@ -3800,7 +3800,7 @@ async fn reenqueue_for_recovery_returns_workflows_to_their_own_queues() {
         .start_queued_workflows(&queue, "alpha", "v1", "claim", None, 0, 0)
         .await
         .unwrap()
-        .workflow_ids;
+        .started();
     assert_eq!(claimed, ["wf-was-queued"]);
 
     let mut moved = sys
@@ -3865,7 +3865,7 @@ async fn reenqueue_for_recovery_leaves_a_workflow_a_live_executor_took() {
         sys.start_queued_workflows(&queue, "live", "v1", "claim", None, 0, 0)
             .await
             .unwrap()
-            .workflow_ids,
+            .started(),
         ["wf-taken-over"],
     );
 
@@ -11583,6 +11583,21 @@ fn skip_on_cockroach_for_the_claim_race(db: &support::TestDatabase) -> bool {
     skipping
 }
 
+/// The workflows a claim started, for a test that expects it to start some (or none) and not to
+/// stop. A stop fails the test here rather than reading as an empty list.
+trait Started {
+    fn started(self) -> Vec<String>;
+}
+
+impl Started for Dequeued {
+    fn started(self) -> Vec<String> {
+        match self {
+            Dequeued::Started(workflow_ids) => workflow_ids,
+            Dequeued::Stopped(stop) => panic!("the claim stopped ({stop:?}) where it was to start"),
+        }
+    }
+}
+
 /// Enqueues a workflow on `queue`, optionally with a priority and a timeout.
 async fn enqueue(
     sys: &PostgresSystemDatabase,
@@ -11624,7 +11639,7 @@ async fn claim_all(
             sys.start_queued_workflows(queue, "exec-1", "v1", "claim", None, 0, 0)
                 .await
                 .expect("a claim failed")
-                .workflow_ids,
+                .started(),
         );
         if started.len() >= expected {
             break;
@@ -11772,7 +11787,7 @@ async fn a_dequeue_starts_workflows_in_order() {
         .start_queued_workflows(&registered, "exec-1", "v1", "claim", None, 0, 0)
         .await
         .unwrap()
-        .workflow_ids;
+        .started();
     assert_eq!(
         started,
         ["wf-high", "wf-also-high", "wf-low"],
@@ -11789,7 +11804,7 @@ async fn a_dequeue_starts_workflows_in_order() {
         sys.start_queued_workflows(&registered, "exec-1", "v1", "claim", None, 0, 0)
             .await
             .unwrap()
-            .workflow_ids
+            .started()
             .is_empty()
     );
 }
@@ -11865,7 +11880,7 @@ async fn worker_concurrency_bounds_a_dequeue() {
         sys.start_queued_workflows(&registered, "exec-1", "v1", "claim", None, 0, 0)
             .await
             .unwrap()
-            .workflow_ids
+            .started()
             .len(),
         2,
         "a free worker takes its whole allowance",
@@ -11874,17 +11889,16 @@ async fn worker_concurrency_bounds_a_dequeue() {
         sys.start_queued_workflows(&registered, "exec-1", "v1", "claim", None, 1, 0)
             .await
             .unwrap()
-            .workflow_ids
+            .started()
             .len(),
         1,
         "one already running leaves room for one",
     );
-    assert!(
+    assert_eq!(
         sys.start_queued_workflows(&registered, "exec-1", "v1", "claim", None, 2, 0)
             .await
-            .unwrap()
-            .workflow_ids
-            .is_empty(),
+            .unwrap(),
+        Dequeued::Stopped(DequeueStop::WorkerConcurrency),
         "a full worker takes nothing",
     );
 }
@@ -11916,17 +11930,16 @@ async fn concurrency_counts_across_executors() {
         sys.start_queued_workflows(&registered, "exec-other", "v1", "claim", None, 0, 0)
             .await
             .unwrap()
-            .workflow_ids
+            .started()
             .len(),
         2,
     );
     // This one is told nothing is available, even with nothing running locally.
-    assert!(
+    assert_eq!(
         sys.start_queued_workflows(&registered, "exec-1", "v1", "claim", None, 0, 0)
             .await
-            .unwrap()
-            .workflow_ids
-            .is_empty(),
+            .unwrap(),
+        Dequeued::Stopped(DequeueStop::Concurrency),
         "the limit is global, so a second executor sees none free",
     );
 }
@@ -11958,17 +11971,16 @@ async fn a_rate_limit_bounds_starts_per_window() {
         sys.start_queued_workflows(&registered, "exec-1", "v1", "claim", None, 0, 0)
             .await
             .unwrap()
-            .workflow_ids
+            .started()
             .len(),
         2,
         "the window allows two",
     );
-    assert!(
+    assert_eq!(
         sys.start_queued_workflows(&registered, "exec-1", "v1", "claim", None, 0, 0)
             .await
-            .unwrap()
-            .workflow_ids
-            .is_empty(),
+            .unwrap(),
+        Dequeued::Stopped(DequeueStop::RateLimit),
         "and no more until it passes",
     );
 
@@ -11977,7 +11989,7 @@ async fn a_rate_limit_bounds_starts_per_window() {
         sys.start_queued_workflows(&registered, "exec-1", "v1", "claim", None, 0, 0)
             .await
             .unwrap()
-            .workflow_ids
+            .started()
             .len(),
         2,
         "a fresh window allows two more",
@@ -12013,12 +12025,14 @@ async fn a_partition_rate_limit_bounds_each_key_separately() {
         }
     }
 
-    let dequeue = async |partition: &str| {
-        sys.start_queued_workflows(&registered, "exec-1", "v1", "claim", Some(partition), 0, 0)
-            .await
-            .unwrap()
-            .workflow_ids
-            .len()
+    let dequeue = async |partition: &str| match sys
+        .start_queued_workflows(&registered, "exec-1", "v1", "claim", Some(partition), 0, 0)
+        .await
+        .unwrap()
+    {
+        Dequeued::Started(workflow_ids) => workflow_ids.len(),
+        Dequeued::Stopped(DequeueStop::PartitionRateLimit) => 0,
+        Dequeued::Stopped(stop) => panic!("stopped by {stop:?}, not the partition's window"),
     };
 
     assert_eq!(dequeue("a").await, 2, "the window allows two");
@@ -12066,7 +12080,7 @@ async fn a_dequeue_claims_what_it_starts() {
         .start_queued_workflows(&registered, "exec-1", "v1", "claim", None, 0, 0)
         .await
         .unwrap()
-        .workflow_ids;
+        .started();
     started.sort();
     assert_eq!(
         started,
@@ -12118,7 +12132,7 @@ async fn unversioned_work_goes_to_the_latest_version() {
         sys.start_queued_workflows(&registered, "exec-old", "v1", "claim", None, 0, 0)
             .await
             .unwrap()
-            .workflow_ids
+            .started()
             .is_empty(),
         "only the latest version adopts unversioned work",
     );
@@ -12126,7 +12140,7 @@ async fn unversioned_work_goes_to_the_latest_version() {
         sys.start_queued_workflows(&registered, "exec-new", "v2", "claim", None, 0, 0)
             .await
             .unwrap()
-            .workflow_ids,
+            .started(),
         ["wf-unversioned"],
     );
 }
@@ -12163,7 +12177,7 @@ async fn an_empty_partition_key_is_refused() {
         sys.start_queued_workflows(&registered, "exec-1", "v1", "claim", None, 0, 0)
             .await
             .unwrap()
-            .workflow_ids,
+            .started(),
         ["wf-1"],
     );
 }
@@ -12245,14 +12259,14 @@ async fn partition_concurrency_bounds_a_dequeue() {
         .start_queued_workflows(&registered, "exec-1", "v1", "claim", Some("alpha"), 0, 0)
         .await
         .unwrap()
-        .workflow_ids;
+        .started();
     assert_eq!(alpha.len(), 2, "the partition's limit, not the queue's");
 
     let beta = sys
         .start_queued_workflows(&registered, "exec-1", "v1", "claim", Some("beta"), 0, 0)
         .await
         .unwrap()
-        .workflow_ids;
+        .started();
     assert_eq!(
         beta.len(),
         2,
@@ -12260,12 +12274,11 @@ async fn partition_concurrency_bounds_a_dequeue() {
     );
 
     // Alpha is at its limit now, so a second call for it takes nothing.
-    assert!(
+    assert_eq!(
         sys.start_queued_workflows(&registered, "exec-1", "v1", "claim", Some("alpha"), 0, 0)
             .await
-            .unwrap()
-            .workflow_ids
-            .is_empty(),
+            .unwrap(),
+        Dequeued::Stopped(DequeueStop::PartitionConcurrency),
     );
 }
 
@@ -12300,7 +12313,7 @@ async fn the_queue_wide_limit_bounds_the_sum_of_the_partitions() {
         .start_queued_workflows(&registered, "exec-1", "v1", "claim", Some("alpha"), 0, 0)
         .await
         .unwrap()
-        .workflow_ids;
+        .started();
     assert_eq!(alpha.len(), 2, "its own per-partition allowance");
 
     // Beta's allowance is 2, but the queue has only one left of its 3.
@@ -12308,20 +12321,19 @@ async fn the_queue_wide_limit_bounds_the_sum_of_the_partitions() {
         .start_queued_workflows(&registered, "exec-1", "v1", "claim", Some("beta"), 0, 0)
         .await
         .unwrap()
-        .workflow_ids;
+        .started();
     assert_eq!(
         beta.len(),
         1,
         "the queue-wide limit counts every partition's PENDING rows, not just this key's"
     );
 
-    assert!(
+    assert_eq!(
         sys.start_queued_workflows(&registered, "exec-1", "v1", "claim", Some("beta"), 0, 0)
             .await
-            .unwrap()
-            .workflow_ids
-            .is_empty(),
-        "the queue is at its limit whichever partition asks"
+            .unwrap(),
+        Dequeued::Stopped(DequeueStop::Concurrency),
+        "the queue is at its limit whichever partition asks",
     );
 }
 
@@ -12399,8 +12411,7 @@ async fn a_partition_claim_names_a_spent_queue_wide_concurrency_limit() {
         .start_queued_workflows(&registered, "exec-1", "v1", "claim", Some("beta"), 0, 0)
         .await
         .unwrap();
-    assert!(claimed.workflow_ids.is_empty());
-    assert_eq!(claimed.stopped_by, Some(DequeueStop::Concurrency));
+    assert_eq!(claimed, Dequeued::Stopped(DequeueStop::Concurrency));
     assert!(DequeueStop::Concurrency.spans_partitions());
 }
 
@@ -12428,8 +12439,7 @@ async fn a_partition_claim_names_a_spent_queue_wide_rate_limit() {
         .start_queued_workflows(&registered, "exec-1", "v1", "claim", Some("beta"), 0, 0)
         .await
         .unwrap();
-    assert!(claimed.workflow_ids.is_empty());
-    assert_eq!(claimed.stopped_by, Some(DequeueStop::RateLimit));
+    assert_eq!(claimed, Dequeued::Stopped(DequeueStop::RateLimit));
     assert!(DequeueStop::RateLimit.spans_partitions());
 }
 
@@ -12455,8 +12465,10 @@ async fn a_full_partition_is_named_as_a_limit_of_that_partition_alone() {
         .start_queued_workflows(&registered, "exec-1", "v1", "claim", Some("alpha"), 0, 0)
         .await
         .unwrap();
-    assert!(claimed.workflow_ids.is_empty());
-    assert_eq!(claimed.stopped_by, Some(DequeueStop::PartitionConcurrency));
+    assert_eq!(
+        claimed,
+        Dequeued::Stopped(DequeueStop::PartitionConcurrency)
+    );
     assert!(!DequeueStop::PartitionConcurrency.spans_partitions());
 }
 
@@ -12480,8 +12492,7 @@ async fn a_full_worker_is_named_as_the_stop() {
         .start_queued_workflows(&registered, "exec-1", "v1", "claim", Some("alpha"), 1, 0)
         .await
         .unwrap();
-    assert!(claimed.workflow_ids.is_empty());
-    assert_eq!(claimed.stopped_by, Some(DequeueStop::WorkerConcurrency));
+    assert_eq!(claimed, Dequeued::Stopped(DequeueStop::WorkerConcurrency));
     assert!(DequeueStop::WorkerConcurrency.spans_partitions());
 }
 
@@ -12510,7 +12521,7 @@ async fn both_worker_limits_are_counted_at_their_own_scope() {
         .start_queued_workflows(&registered, "exec-1", "v1", "claim", Some("alpha"), 0, 0)
         .await
         .unwrap()
-        .workflow_ids;
+        .started();
     assert_eq!(claimed.len(), 2, "bounded by partition_worker_concurrency");
 
     // One already running in this partition leaves it one, even though the queue-wide worker
@@ -12519,17 +12530,16 @@ async fn both_worker_limits_are_counted_at_their_own_scope() {
         .start_queued_workflows(&registered, "exec-1", "v1", "claim", Some("alpha"), 0, 1)
         .await
         .unwrap()
-        .workflow_ids;
+        .started();
     assert_eq!(claimed.len(), 1, "the partition-local count is subtracted");
 
     // Three already running queue-wide leaves nothing, whatever the partition has room for.
-    assert!(
+    assert_eq!(
         sys.start_queued_workflows(&registered, "exec-1", "v1", "claim", Some("alpha"), 3, 0)
             .await
-            .unwrap()
-            .workflow_ids
-            .is_empty(),
-        "the queue-wide worker limit still binds"
+            .unwrap(),
+        Dequeued::Stopped(DequeueStop::WorkerConcurrency),
+        "the queue-wide worker limit still binds",
     );
 }
 
@@ -12826,7 +12836,7 @@ async fn a_claimer_missing_a_new_head_does_not_overspend(case: MissedHead) {
                 if claimed_a.lock().unwrap().is_some() {
                     return Ok(());
                 }
-                *claimed_a.lock().unwrap() = Some(Ok(Default::default()));
+                *claimed_a.lock().unwrap() = Some(Ok(Dequeued::Started(Vec::new())));
                 enqueue_row(&other, "wf-head-a", name, partition_a, 1, version_a).await;
                 let result = other
                     .start_queued_workflows(
@@ -12883,13 +12893,10 @@ async fn a_claimer_missing_a_new_head_does_not_overspend(case: MissedHead) {
     };
     assert_eq!(
         claimed_a.unwrap(),
-        Dequeued {
-            workflow_ids: Vec::new(),
-            stopped_by: Some(expected_stop),
-        },
+        Dequeued::Stopped(expected_stop),
         "claimer A should have found the budget's lock held"
     );
-    assert_eq!(claimed_b.unwrap().workflow_ids, ["wf-head-b"]);
+    assert_eq!(claimed_b.unwrap().started(), ["wf-head-b"]);
     assert_eq!(
         sys.get_workflow("wf-head-a").await.unwrap().unwrap().status,
         WorkflowStatus::Enqueued
@@ -13657,7 +13664,7 @@ async fn finishing_releases_the_deduplication_key() {
         sys.start_queued_workflows(&registered, "exec-1", "v1", "claim", None, 0, 0)
             .await
             .unwrap()
-            .workflow_ids,
+            .started(),
         ["wf-first"],
     );
     assert_eq!(

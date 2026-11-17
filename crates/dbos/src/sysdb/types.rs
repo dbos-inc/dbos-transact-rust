@@ -2487,16 +2487,20 @@ pub enum OnExistingQueue {
     Leave,
 }
 
-/// What one claim from a queue took, and why it took nothing if it did.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Dequeued {
-    /// The workflows this claim started, in dequeue order.
-    pub workflow_ids: Vec<String>,
-    /// The limit that left this claim no room, when one did.
+/// What one claim from a queue did: started workflows, or stopped before selecting any.
+///
+/// Two outcomes and not a list beside an optional reason, because a claim that stops has selected
+/// nothing: there is no claim that both started workflows and was stopped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Dequeued {
+    /// The claim ran, and started these workflows, in dequeue order.
     ///
-    /// Set only when the claim returned before selecting anything, so `workflow_ids` is then
-    /// empty. `None` with nothing claimed means no row was eligible, or a peer took them first.
-    pub stopped_by: Option<DequeueStop>,
+    /// Empty when no row was eligible or a peer took them first. That is not a stop: nothing
+    /// said the queue was full, so it says nothing about the next partition.
+    Started(Vec<String>),
+    /// A limit with no room left, or a peer's claim lock, stopped the claim before it selected
+    /// anything.
+    Stopped(DequeueStop),
 }
 
 /// The limit that left a claim no room to start anything, or the peer claim that held it off.

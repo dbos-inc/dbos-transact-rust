@@ -6913,10 +6913,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         };
         // Checked after every limit rather than after each group, so the claim can name the limit
         // that closed it: the first in this order to reach zero.
-        let stopped = |stop: DequeueStop| Dequeued {
-            workflow_ids: Vec::new(),
-            stopped_by: Some(stop),
-        };
+        let stopped = Dequeued::Stopped;
 
         // **The worker limits first, and before any transaction**, because they cost no query:
         // they are answered from what this process is already running rather than from the
@@ -7231,10 +7228,7 @@ impl SystemDatabase for PostgresSystemDatabase {
             if !started.is_empty() {
                 tracing::debug!(queue = %queue.name, started = started.len(), "dequeued");
             }
-            Ok(Dequeued {
-                workflow_ids: started,
-                stopped_by: None,
-            })
+            Ok(Dequeued::Started(started))
         })
         .await
     }

@@ -34,7 +34,8 @@ use crate::queue::DEFAULT_POLLING_INTERVAL;
 use crate::sysdb;
 use crate::sysdb::INTERNAL_QUEUE;
 use crate::sysdb::types::{
-    AppScope, DatabaseTime, QueueRecord, Timestamp, WorkflowFilter, WorkflowRecord, WorkflowStatus,
+    AppScope, DatabaseTime, Dequeued, QueueRecord, Timestamp, WorkflowFilter, WorkflowRecord,
+    WorkflowStatus,
 };
 use crate::workflow::{MAX_RECOVERY_ATTEMPTS, Role, spawn_execution, spawn_tracked};
 
@@ -440,18 +441,11 @@ async fn poll_once(
             )
             .await
         {
-            Ok(claimed) => {
-                dispatch_claimed(
-                    executor,
-                    queue,
-                    None,
-                    running,
-                    claimed.workflow_ids,
-                    &owner_xid,
-                )
-                .await;
+            Ok(Dequeued::Started(workflow_ids)) => {
+                dispatch_claimed(executor, queue, None, running, workflow_ids, &owner_xid).await;
                 Polled::new(None, 1)
             }
+            Ok(Dequeued::Stopped(_)) => Polled::new(None, 1),
             Err(error) => Polled::new(report_dequeue_error(&error), 1),
         };
     }
@@ -562,25 +556,28 @@ async fn poll_once(
                 continue;
             }
         };
-        claimed_here += i64::try_from(claimed.workflow_ids.len()).unwrap_or(i64::MAX);
-        dispatch_claimed(
-            executor,
-            queue,
-            Some(&partition),
-            running,
-            claimed.workflow_ids,
-            &owner_xid,
-        )
-        .await;
-        if let Some(stop) = claimed.stopped_by
-            && stop.spans_partitions()
-        {
-            tracing::debug!(
-                partition,
-                ?stop,
-                "a queue-wide limit has no room left; ending the partition walk"
-            );
-            break;
+        match claimed {
+            Dequeued::Started(workflow_ids) => {
+                claimed_here += i64::try_from(workflow_ids.len()).unwrap_or(i64::MAX);
+                dispatch_claimed(
+                    executor,
+                    queue,
+                    Some(&partition),
+                    running,
+                    workflow_ids,
+                    &owner_xid,
+                )
+                .await;
+            }
+            Dequeued::Stopped(stop) if stop.spans_partitions() => {
+                tracing::debug!(
+                    partition,
+                    ?stop,
+                    "a queue-wide limit has no room left; ending the partition walk"
+                );
+                break;
+            }
+            Dequeued::Stopped(_) => {}
         }
     }
     Polled::new(None, claims)
