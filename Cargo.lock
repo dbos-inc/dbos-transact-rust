@@ -667,6 +667,7 @@ dependencies = [
  "async-io",
  "async-trait",
  "croner",
+ "dbos",
  "dbos-macros",
  "dbos-test-support",
  "erased-serde",

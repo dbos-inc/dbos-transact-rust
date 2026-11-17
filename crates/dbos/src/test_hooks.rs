@@ -1,8 +1,9 @@
 //! Named points in production code where a test can run something or make a call fail.
 //!
 //! **For this workspace's tests, and not public API.** It is compiled only with the `test-hooks`
-//! feature, and with it off every point is a macro that expands to nothing, so an application
-//! build carries no registry and no check. There is no semver promise on anything here.
+//! feature, which this crate's own tests turn on through a self dev-dependency, and with it off
+//! every point is a macro that expands to nothing, so an application build carries no registry and
+//! no check. There is no semver promise on anything here.
 //!
 //! A *point* is a named place in the code, such as the moment after a step's commit. A test
 //! registers a hook for a point and a *scope*, and the code calls [`hit`] there:

@@ -120,8 +120,9 @@ let lost = dbos::__test_hooks::fail_once(
   to hold the window open; `fail_once` returns an error from it once. Both return a guard that
   removes the hook when it drops, panics included, and `guard.fired()` says how often it was hit.
 - It is compiled only with the feature, and a build without it has no registry and no check at
-  any point. Tests that use it carry `#![cfg(feature = "test-hooks")]` and run under
-  `cargo test --all-features`, as CI does. It is not public API and has no semver promise.
+  any point. `dbos` turns the feature on for its own tests through a self dev-dependency, so a plain
+  `cargo test` runs the tests that use hooks, and they need no `cfg` of their own. It is not public
+  API and has no semver promise.
 - To add a point: name it in `test_hooks::points` with where it is and what its scope is, and
   write `test_hook!(crate::test_hooks::points::NAME, scope)?;` at the spot. Put it *after* a
   commit to test a lost acknowledgement, and between two statements to test a race.

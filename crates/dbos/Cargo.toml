@@ -48,8 +48,8 @@ macros = ["engine", "dep:dbos-macros"]
 # `sync` primitives and macros, which run on any executor.
 # Named points in production code where a test can run something or make a call fail; see
 # `test_hooks.rs`. **For this workspace's tests only**, with no semver promise, and off in every
-# build an application makes. Tests that use it carry `#![cfg(feature = "test-hooks")]`, and run
-# under `cargo test --all-features`, as CI does.
+# build an application makes: this crate's own tests turn it on through the self dev-dependency
+# below, so a plain `cargo test` runs them.
 test-hooks = []
 runtime-tokio = ["sqlx/runtime-tokio", "tokio/rt", "tokio/time"]
 runtime-smol = ["sqlx/runtime-smol", "dep:smol", "dep:async-io"]
@@ -129,6 +129,12 @@ async-global-executor = { version = "3.1", default-features = false, features = 
 async-io = { version = "2.4", optional = true }
 
 [dev-dependencies]
+# This crate's own tests turn on its `test-hooks` feature. A dev-dependency's features apply only
+# when tests, examples and benches are built, so no build an application makes sees them, and
+# `cargo publish` leaves a dev-dependency with no version out of the package. The alternative is
+# `#![cfg(feature = "test-hooks")]` on the tests that use hooks, which under a plain `cargo test`
+# compiles them to nothing and reports success.
+dbos = { path = ".", features = ["test-hooks"] }
 # A format that is not human-readable, which serde types such as `Ipv4Addr` serialize differently
 # in: what tests a custom serializer against a binary format, as an application's MessagePack one
 # would be.

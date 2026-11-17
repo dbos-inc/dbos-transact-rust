@@ -5,8 +5,6 @@
 //! retry has to find its own work already there. Failing at a point after the commit with a
 //! retryable error is how to produce one on purpose.
 
-#![cfg(feature = "test-hooks")]
-
 use std::sync::{Arc, Mutex};
 
 use dbos::__test_hooks::{fail_once, on, points};
