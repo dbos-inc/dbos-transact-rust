@@ -273,8 +273,12 @@
 // this is what lets that path resolve inside this crate's own tests and doctests.
 extern crate self as dbos;
 
+#[macro_use]
+mod test_hooks_macro;
 mod rt;
 pub mod sysdb;
+#[cfg(feature = "test-hooks")]
+mod test_hooks;
 
 #[cfg(feature = "engine")]
 mod checkpoint;
@@ -600,6 +604,16 @@ pub mod __private {
     };
     // Not for a macro: the one knob tests need that applications shouldn't have.
     pub use crate::timeout_sweep::set_interval as set_workflow_timeout_sweep_interval;
+}
+
+/// Points in production code where this workspace's tests run something or make a call fail, and
+/// **not public API**. Compiled only with the `test-hooks` feature.
+///
+/// See `test_hooks.rs` for what a point and a scope are.
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub mod __test_hooks {
+    pub use crate::test_hooks::{Guard, fail_once, on, points};
 }
 
 /// The contract the enterprise crate implements. No semver promise: that crate pins this one's

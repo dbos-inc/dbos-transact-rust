@@ -3667,6 +3667,10 @@ impl PostgresSystemDatabase {
                 .await?;
             }
             tx.commit().await?;
+            test_hook!(
+                crate::test_hooks::points::INIT_WORKFLOW_COMMIT,
+                workflow.workflow_id
+            )?;
 
             Ok(WorkflowInitResult {
                 status,
@@ -5722,6 +5726,7 @@ impl SystemDatabase for PostgresSystemDatabase {
             )
             .await?;
             tx.commit().await?;
+            test_hook!(crate::test_hooks::points::STEP_COMMIT, workflow_id)?;
             Ok(())
         })
         .await
