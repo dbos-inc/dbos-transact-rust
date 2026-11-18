@@ -6986,8 +6986,9 @@ impl SystemDatabase for PostgresSystemDatabase {
         //
         // So the claim first takes a transaction-scoped advisory lock on the budget's scope: the
         // partition when every shared limit it spends is the partition's, and the whole queue when
-        // any is queue-wide. The lock key is part of the on-database protocol, so claimers in any language on the
-        // same queue exclude each other, provided they are recent enough to take it.
+        // any is queue-wide. The lock key is part of the on-database protocol, so claimers in any
+        // language on the same queue exclude each other, provided they are recent enough to take
+        // it.
         //
         // Not on CockroachDB, which grants every advisory lock: there the claim runs at
         // `SERIALIZABLE` instead, and the loser of a race is aborted.
@@ -7416,7 +7417,8 @@ impl SystemDatabase for PostgresSystemDatabase {
         // picks them again under the locks.
         //
         // Two `int` keys rather than the claim lock's one `bigint`: the queue's, then the
-        // partition's, which lets one statement lock a batch. The pair is part of the on-database protocol.
+        // partition's, which lets one statement lock a batch. The pair is part of the on-database
+        // protocol.
         // Not on CockroachDB, which grants every advisory lock: there each batch runs at
         // `SERIALIZABLE`, which aborts the sweep that would co-admit.
         let partition_locks = if self.claims_take_locks().await? {

@@ -1358,8 +1358,8 @@ pub trait SystemDatabase: Send + Sync {
     /// taken by whichever application dequeues it first, which is how work enqueued by a nameless
     /// client finds a runner.
     ///
-    /// Limits narrow what is taken, in this order, the tightest budget winning; a limit with no room
-    /// left returns without selecting anything:
+    /// Limits narrow what is taken, in this order, the tightest budget winning; a limit with no
+    /// room left returns without selecting anything:
     ///
     /// - **Worker concurrency**, against `local_running_count` — what this process is already
     ///   running, which it knows without asking the database.
