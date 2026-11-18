@@ -622,7 +622,7 @@ pub mod __test_hooks {
 #[doc(hidden)]
 pub mod __enterprise {
     pub use crate::enterprise::{
-        ConductorConnection, ConductorEngine, ConductorOptions, EnterpriseProvider,
+        ConductorConnection, ConductorOptions, EnterpriseEngine, EnterpriseProvider,
     };
     // `ConductorConnection` is declared with this macro, so implementations need it too.
     pub use async_trait::async_trait;
