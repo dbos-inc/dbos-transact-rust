@@ -161,7 +161,8 @@ impl std::fmt::Display for MigrateError {
                 f,
                 "the DBOS system schema {schema:?} is sharded (its workflow_status table has a \
                  shard_key column), and DBOS Rust does not support a sharded system database yet. \
-                 Use an unsharded system schema."
+                 Point the schema setting, or the database URL, at an \
+                 unsharded system schema."
             ),
         }
     }
@@ -351,8 +352,8 @@ async fn drop_invalid_indexes(pool: &PgPool, schema: &str) -> Result<(), sqlx::E
 /// - **A database ahead of this build is left alone.** Another implementation may know
 ///   migrations this one does not. Proceeding would be wrong and refusing to start would be
 ///   worse, so it logs and continues.
-/// - **A sharded schema is refused**, with [`MigrateError::Sharded`], before anything is
-///   created or read. Its recorded version is in another numbering, so it is not "ahead" or
+/// - **A sharded schema is refused**, with [`MigrateError::Sharded`], before anything in the
+///   schema is created or read. Its recorded version is in another numbering, so it is not "ahead" or
 ///   "behind" in this one.
 /// - **Whole files are executed as one statement batch.** Splitting on `;` would shred the
 ///   `$$`-quoted function bodies.

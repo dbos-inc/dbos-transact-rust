@@ -271,7 +271,10 @@ async fn a_sharded_system_schema_is_refused_at_launch() {
     });
 
     let err = dbos.launch().await.unwrap_err();
-    assert!(matches!(err, Error::SystemDatabase(_)), "{err}");
+    let Error::SystemDatabase(dbos::sysdb::Error::Backend(ref backend)) = err else {
+        panic!("expected a backend error, got {err:?}");
+    };
+    assert_eq!(backend.kind, dbos::sysdb::BackendErrorKind::Permanent);
     assert!(err.to_string().contains("sharded"), "{err}");
     assert!(!dbos.is_launched());
     assert_eq!(

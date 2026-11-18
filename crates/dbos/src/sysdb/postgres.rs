@@ -787,6 +787,10 @@ impl PostgresSystemDatabase {
 
     /// Wraps an existing pool, assuming the schema is already migrated.
     ///
+    /// **Nothing is checked**, a sharded schema included: this constructor makes no query, so it
+    /// cannot refuse one as [`connect`](Self::connect) does. A caller unsure of the schema runs
+    /// [`migrations::runner::verify`] on the pool first.
+    ///
     /// For callers that manage their own connections — and for tests, which migrate through the
     /// harness. Takes the same [`Settings`] as [`connect`](Self::connect), so there is one way to
     /// describe a handle rather than a constructor plus a set of chained overrides.
