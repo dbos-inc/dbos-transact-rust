@@ -6935,8 +6935,7 @@ impl SystemDatabase for PostgresSystemDatabase {
             Some(current.map_or(available, |taken: i64| taken.min(available)))
         };
         // Checked after every limit rather than after each group, so the claim can name the limit
-        // that closed it: the first in this order to reach zero.
-        let stopped = Dequeued::Stopped;
+        // that closed it, as `Dequeued::Stopped`: the first in this order to reach zero.
 
         // **The worker limits first, and before any transaction**, because they cost no query:
         // they are answered from what this process is already running rather than from the
@@ -6950,7 +6949,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                 (i64::from(worker_concurrency) - local_running_count).max(0),
             );
             if worker_max_tasks == Some(0) {
-                return Ok(stopped(DequeueStop::WorkerConcurrency));
+                return Ok(Dequeued::Stopped(DequeueStop::WorkerConcurrency));
             }
         }
         if let Some(worker_concurrency) = queue.partition_worker_concurrency
@@ -6961,7 +6960,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                 (i64::from(worker_concurrency) - partition_local_running_count).max(0),
             );
             if worker_max_tasks == Some(0) {
-                return Ok(stopped(DequeueStop::PartitionWorkerConcurrency));
+                return Ok(Dequeued::Stopped(DequeueStop::PartitionWorkerConcurrency));
             }
         }
 
@@ -7031,7 +7030,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                     // A peer is claiming from this budget right now, so it still has work; the
                     // next poll tries again, with no backoff, since the peer commits in moments.
                     tracing::debug!(queue = %queue.name, ?stop, "a peer holds the claim lock");
-                    return Ok(stopped(stop));
+                    return Ok(Dequeued::Stopped(stop));
                 }
             }
 
@@ -7059,7 +7058,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                 max_tasks = narrow(max_tasks, (i64::from(limit.limit) - recent_starts).max(0));
                 if max_tasks == Some(0) {
                     tx.commit().await?;
-                    return Ok(stopped(DequeueStop::RateLimit));
+                    return Ok(Dequeued::Stopped(DequeueStop::RateLimit));
                 }
             }
             if let (Some(limit), Some(key)) = (queue.partition_rate_limit, partition_key) {
@@ -7083,7 +7082,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                 );
                 if max_tasks == Some(0) {
                     tx.commit().await?;
-                    return Ok(stopped(DequeueStop::PartitionRateLimit));
+                    return Ok(Dequeued::Stopped(DequeueStop::PartitionRateLimit));
                 }
             }
 
@@ -7114,7 +7113,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                 max_tasks = narrow(max_tasks, (i64::from(concurrency) - running).max(0));
                 if max_tasks == Some(0) {
                     tx.commit().await?;
-                    return Ok(stopped(DequeueStop::Concurrency));
+                    return Ok(Dequeued::Stopped(DequeueStop::Concurrency));
                 }
             }
             if let (Some(concurrency), Some(key)) = (queue.partition_concurrency, partition_key) {
@@ -7142,7 +7141,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                 max_tasks = narrow(max_tasks, (i64::from(concurrency) - running).max(0));
                 if max_tasks == Some(0) {
                     tx.commit().await?;
-                    return Ok(stopped(DequeueStop::PartitionConcurrency));
+                    return Ok(Dequeued::Stopped(DequeueStop::PartitionConcurrency));
                 }
             }
 
