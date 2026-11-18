@@ -4,15 +4,16 @@ use dbos::sysdb::postgres::{Config, PostgresSystemDatabase, Settings};
 use dbos::sysdb::retry::RetryPolicy;
 use dbos::sysdb::types::{
     AppScope, AttributeUpdate, AwaitedOutcome, AwaitedStream, Change, Debounce, DebounceRequest,
-    DequeueStop, EncodedValue, Fork, ForkOptions, ForkPoint, GetEventCaller, InitWorkflowCaller,
-    Message, NewQueue, NewSchedule, NewWorkflow, OnExistingQueue, Outcome, OutcomeWrite,
-    PollingConcurrency, QualifiedWorkflowName, QueueRecord, QueueUpdate, RateLimit, RenameBatching,
-    RenameFrom, RewindOptions, ScheduleFilter, ScheduleStatus, ScheduleUpdate, StepTiming,
-    Timestamp, WorkflowDelay, WorkflowFilter, WorkflowIdReusePolicy, WorkflowRecord,
+    DequeueStop, Dequeued, EncodedValue, Fork, ForkOptions, ForkPoint, GetEventCaller,
+    InitWorkflowCaller, Message, NewQueue, NewSchedule, NewWorkflow, OnExistingQueue, Outcome,
+    OutcomeWrite, PollingConcurrency, QualifiedWorkflowName, QueueRecord, QueueUpdate, RateLimit,
+    RenameBatching, RenameFrom, RewindOptions, ScheduleFilter, ScheduleStatus, ScheduleUpdate,
+    StepTiming, Timestamp, WorkflowDelay, WorkflowFilter, WorkflowIdReusePolicy, WorkflowRecord,
     WorkflowStatus, WrittenBy,
 };
 use dbos::sysdb::{
-    BackendErrorKind, DEFAULT_SCHEMA, Error, INTERNAL_QUEUE, PORTABLE_JSON, SystemDatabase,
+    BackendError, BackendErrorKind, DEFAULT_SCHEMA, Error, INTERNAL_QUEUE,
+    PARTITIONED_DEQUEUE_BATCH_SIZE, PARTITIONED_DEQUEUE_SWEEP_CAP, PORTABLE_JSON, SystemDatabase,
 };
 
 use dbos_test_support as support;
@@ -36,6 +37,22 @@ async fn sysdb() -> (PostgresSystemDatabase, support::TestDatabase) {
         PostgresSystemDatabase::from_pool(pool, &Settings::default()),
         db,
     )
+}
+
+/// [`sysdb`] with settings of the test's own, such as a partitioned sweep's bounds at a size a test
+/// can afford.
+async fn sysdb_with(settings: &Settings<'_>) -> (PostgresSystemDatabase, support::TestDatabase) {
+    let db = test_database().await;
+    let pool = db.pool().await;
+    (PostgresSystemDatabase::from_pool(pool, settings), db)
+}
+
+/// Batches of two partitions, so a sweep over three runs two batches.
+fn two_per_batch() -> Settings<'static> {
+    Settings {
+        partition_batch_size: std::num::NonZeroUsize::new(2).unwrap(),
+        ..Settings::default()
+    }
 }
 
 /// A workflow round-trips through the database unchanged.
@@ -383,7 +400,7 @@ async fn the_dequeue_claim_counts_an_attempt() {
         .start_queued_workflows(&queue, "local", "v1", "claim", None, 0, 0)
         .await
         .unwrap()
-        .workflow_ids;
+        .started();
     assert_eq!(claimed, ["wf-counted"]);
 
     let row = sys.get_workflow("wf-counted").await.unwrap().unwrap();
@@ -417,14 +434,14 @@ async fn a_claim_that_wins_nothing_counts_nothing() {
         .start_queued_workflows(&queue, "winner", "v1", "claim", None, 0, 0)
         .await
         .unwrap()
-        .workflow_ids;
+        .started();
     assert_eq!(winner, ["wf-raced"]);
     // The row is `PENDING` now, so the loser's guard matches nothing.
     let loser = sys
         .start_queued_workflows(&queue, "loser", "v1", "claim", None, 0, 0)
         .await
         .unwrap()
-        .workflow_ids;
+        .started();
     assert!(loser.is_empty(), "the second claim should have won nothing");
 
     let row = sys.get_workflow("wf-raced").await.unwrap().unwrap();
@@ -462,7 +479,7 @@ async fn repeated_recoveries_through_the_queue_park_the_workflow() {
             .start_queued_workflows(&queue, "local", "v1", "claim", None, 0, 0)
             .await
             .unwrap()
-            .workflow_ids;
+            .started();
         if claimed.is_empty() {
             break;
         }
@@ -3799,7 +3816,7 @@ async fn reenqueue_for_recovery_returns_workflows_to_their_own_queues() {
         .start_queued_workflows(&queue, "alpha", "v1", "claim", None, 0, 0)
         .await
         .unwrap()
-        .workflow_ids;
+        .started();
     assert_eq!(claimed, ["wf-was-queued"]);
 
     let mut moved = sys
@@ -3864,7 +3881,7 @@ async fn reenqueue_for_recovery_leaves_a_workflow_a_live_executor_took() {
         sys.start_queued_workflows(&queue, "live", "v1", "claim", None, 0, 0)
             .await
             .unwrap()
-            .workflow_ids,
+            .started(),
         ["wf-taken-over"],
     );
 
@@ -11582,6 +11599,21 @@ fn skip_on_cockroach_for_the_claim_race(db: &support::TestDatabase) -> bool {
     skipping
 }
 
+/// The workflows a claim started, for a test that expects it to start some (or none) and not to
+/// stop. A stop fails the test here rather than reading as an empty list.
+trait Started {
+    fn started(self) -> Vec<String>;
+}
+
+impl Started for Dequeued {
+    fn started(self) -> Vec<String> {
+        match self {
+            Dequeued::Started(workflow_ids) => workflow_ids,
+            Dequeued::Stopped(stop) => panic!("the claim stopped ({stop:?}) where it was to start"),
+        }
+    }
+}
+
 /// Enqueues a workflow on `queue`, optionally with a priority and a timeout.
 async fn enqueue(
     sys: &PostgresSystemDatabase,
@@ -11623,7 +11655,7 @@ async fn claim_all(
             sys.start_queued_workflows(queue, "exec-1", "v1", "claim", None, 0, 0)
                 .await
                 .expect("a claim failed")
-                .workflow_ids,
+                .started(),
         );
         if started.len() >= expected {
             break;
@@ -11771,7 +11803,7 @@ async fn a_dequeue_starts_workflows_in_order() {
         .start_queued_workflows(&registered, "exec-1", "v1", "claim", None, 0, 0)
         .await
         .unwrap()
-        .workflow_ids;
+        .started();
     assert_eq!(
         started,
         ["wf-high", "wf-also-high", "wf-low"],
@@ -11788,7 +11820,7 @@ async fn a_dequeue_starts_workflows_in_order() {
         sys.start_queued_workflows(&registered, "exec-1", "v1", "claim", None, 0, 0)
             .await
             .unwrap()
-            .workflow_ids
+            .started()
             .is_empty()
     );
 }
@@ -11864,7 +11896,7 @@ async fn worker_concurrency_bounds_a_dequeue() {
         sys.start_queued_workflows(&registered, "exec-1", "v1", "claim", None, 0, 0)
             .await
             .unwrap()
-            .workflow_ids
+            .started()
             .len(),
         2,
         "a free worker takes its whole allowance",
@@ -11873,17 +11905,16 @@ async fn worker_concurrency_bounds_a_dequeue() {
         sys.start_queued_workflows(&registered, "exec-1", "v1", "claim", None, 1, 0)
             .await
             .unwrap()
-            .workflow_ids
+            .started()
             .len(),
         1,
         "one already running leaves room for one",
     );
-    assert!(
+    assert_eq!(
         sys.start_queued_workflows(&registered, "exec-1", "v1", "claim", None, 2, 0)
             .await
-            .unwrap()
-            .workflow_ids
-            .is_empty(),
+            .unwrap(),
+        Dequeued::Stopped(DequeueStop::WorkerConcurrency),
         "a full worker takes nothing",
     );
 }
@@ -11915,17 +11946,16 @@ async fn concurrency_counts_across_executors() {
         sys.start_queued_workflows(&registered, "exec-other", "v1", "claim", None, 0, 0)
             .await
             .unwrap()
-            .workflow_ids
+            .started()
             .len(),
         2,
     );
     // This one is told nothing is available, even with nothing running locally.
-    assert!(
+    assert_eq!(
         sys.start_queued_workflows(&registered, "exec-1", "v1", "claim", None, 0, 0)
             .await
-            .unwrap()
-            .workflow_ids
-            .is_empty(),
+            .unwrap(),
+        Dequeued::Stopped(DequeueStop::Concurrency),
         "the limit is global, so a second executor sees none free",
     );
 }
@@ -11957,17 +11987,16 @@ async fn a_rate_limit_bounds_starts_per_window() {
         sys.start_queued_workflows(&registered, "exec-1", "v1", "claim", None, 0, 0)
             .await
             .unwrap()
-            .workflow_ids
+            .started()
             .len(),
         2,
         "the window allows two",
     );
-    assert!(
+    assert_eq!(
         sys.start_queued_workflows(&registered, "exec-1", "v1", "claim", None, 0, 0)
             .await
-            .unwrap()
-            .workflow_ids
-            .is_empty(),
+            .unwrap(),
+        Dequeued::Stopped(DequeueStop::RateLimit),
         "and no more until it passes",
     );
 
@@ -11976,7 +12005,7 @@ async fn a_rate_limit_bounds_starts_per_window() {
         sys.start_queued_workflows(&registered, "exec-1", "v1", "claim", None, 0, 0)
             .await
             .unwrap()
-            .workflow_ids
+            .started()
             .len(),
         2,
         "a fresh window allows two more",
@@ -12012,12 +12041,14 @@ async fn a_partition_rate_limit_bounds_each_key_separately() {
         }
     }
 
-    let dequeue = async |partition: &str| {
-        sys.start_queued_workflows(&registered, "exec-1", "v1", "claim", Some(partition), 0, 0)
-            .await
-            .unwrap()
-            .workflow_ids
-            .len()
+    let dequeue = async |partition: &str| match sys
+        .start_queued_workflows(&registered, "exec-1", "v1", "claim", Some(partition), 0, 0)
+        .await
+        .unwrap()
+    {
+        Dequeued::Started(workflow_ids) => workflow_ids.len(),
+        Dequeued::Stopped(DequeueStop::PartitionRateLimit) => 0,
+        Dequeued::Stopped(stop) => panic!("stopped by {stop:?}, not the partition's window"),
     };
 
     assert_eq!(dequeue("a").await, 2, "the window allows two");
@@ -12065,7 +12096,7 @@ async fn a_dequeue_claims_what_it_starts() {
         .start_queued_workflows(&registered, "exec-1", "v1", "claim", None, 0, 0)
         .await
         .unwrap()
-        .workflow_ids;
+        .started();
     started.sort();
     assert_eq!(
         started,
@@ -12117,7 +12148,7 @@ async fn unversioned_work_goes_to_the_latest_version() {
         sys.start_queued_workflows(&registered, "exec-old", "v1", "claim", None, 0, 0)
             .await
             .unwrap()
-            .workflow_ids
+            .started()
             .is_empty(),
         "only the latest version adopts unversioned work",
     );
@@ -12125,8 +12156,41 @@ async fn unversioned_work_goes_to_the_latest_version() {
         sys.start_queued_workflows(&registered, "exec-new", "v2", "claim", None, 0, 0)
             .await
             .unwrap()
-            .workflow_ids,
+            .started(),
         ["wf-unversioned"],
+    );
+}
+
+/// **A claim from a partitioned queue needs a partition key.**
+///
+/// The per-partition limits are counted within a key, so a claim with none would take from every
+/// partition at once, past the limit of each.
+#[tokio::test]
+async fn a_claim_from_a_partitioned_queue_needs_a_key() {
+    let (sys, _db) = sysdb().await;
+    let name = unique_queue("keyless-claim");
+    let queue = partitioned_queue(&sys, name).await;
+    enqueue_partitioned(&sys, "wf-keyless-a", name, "a").await;
+    enqueue_partitioned(&sys, "wf-keyless-b", name, "a").await;
+
+    let result = sys
+        .start_queued_workflows(&queue, "exec-1", "v1", "claim", None, 0, 0)
+        .await;
+    assert!(
+        matches!(
+            result,
+            Err(Error::InvalidInput { ref field, .. }) if field == "partition_key"
+        ),
+        "got {result:?}",
+    );
+    assert_eq!(
+        sys.get_workflow("wf-keyless-a")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        WorkflowStatus::Enqueued,
+        "the refusal claimed nothing"
     );
 }
 
@@ -12162,7 +12226,7 @@ async fn an_empty_partition_key_is_refused() {
         sys.start_queued_workflows(&registered, "exec-1", "v1", "claim", None, 0, 0)
             .await
             .unwrap()
-            .workflow_ids,
+            .started(),
         ["wf-1"],
     );
 }
@@ -12244,14 +12308,14 @@ async fn partition_concurrency_bounds_a_dequeue() {
         .start_queued_workflows(&registered, "exec-1", "v1", "claim", Some("alpha"), 0, 0)
         .await
         .unwrap()
-        .workflow_ids;
+        .started();
     assert_eq!(alpha.len(), 2, "the partition's limit, not the queue's");
 
     let beta = sys
         .start_queued_workflows(&registered, "exec-1", "v1", "claim", Some("beta"), 0, 0)
         .await
         .unwrap()
-        .workflow_ids;
+        .started();
     assert_eq!(
         beta.len(),
         2,
@@ -12259,12 +12323,11 @@ async fn partition_concurrency_bounds_a_dequeue() {
     );
 
     // Alpha is at its limit now, so a second call for it takes nothing.
-    assert!(
+    assert_eq!(
         sys.start_queued_workflows(&registered, "exec-1", "v1", "claim", Some("alpha"), 0, 0)
             .await
-            .unwrap()
-            .workflow_ids
-            .is_empty(),
+            .unwrap(),
+        Dequeued::Stopped(DequeueStop::PartitionConcurrency),
     );
 }
 
@@ -12299,7 +12362,7 @@ async fn the_queue_wide_limit_bounds_the_sum_of_the_partitions() {
         .start_queued_workflows(&registered, "exec-1", "v1", "claim", Some("alpha"), 0, 0)
         .await
         .unwrap()
-        .workflow_ids;
+        .started();
     assert_eq!(alpha.len(), 2, "its own per-partition allowance");
 
     // Beta's allowance is 2, but the queue has only one left of its 3.
@@ -12307,20 +12370,19 @@ async fn the_queue_wide_limit_bounds_the_sum_of_the_partitions() {
         .start_queued_workflows(&registered, "exec-1", "v1", "claim", Some("beta"), 0, 0)
         .await
         .unwrap()
-        .workflow_ids;
+        .started();
     assert_eq!(
         beta.len(),
         1,
         "the queue-wide limit counts every partition's PENDING rows, not just this key's"
     );
 
-    assert!(
+    assert_eq!(
         sys.start_queued_workflows(&registered, "exec-1", "v1", "claim", Some("beta"), 0, 0)
             .await
-            .unwrap()
-            .workflow_ids
-            .is_empty(),
-        "the queue is at its limit whichever partition asks"
+            .unwrap(),
+        Dequeued::Stopped(DequeueStop::Concurrency),
+        "the queue is at its limit whichever partition asks",
     );
 }
 
@@ -12398,8 +12460,7 @@ async fn a_partition_claim_names_a_spent_queue_wide_concurrency_limit() {
         .start_queued_workflows(&registered, "exec-1", "v1", "claim", Some("beta"), 0, 0)
         .await
         .unwrap();
-    assert!(claimed.workflow_ids.is_empty());
-    assert_eq!(claimed.stopped_by, Some(DequeueStop::Concurrency));
+    assert_eq!(claimed, Dequeued::Stopped(DequeueStop::Concurrency));
     assert!(DequeueStop::Concurrency.spans_partitions());
 }
 
@@ -12427,8 +12488,7 @@ async fn a_partition_claim_names_a_spent_queue_wide_rate_limit() {
         .start_queued_workflows(&registered, "exec-1", "v1", "claim", Some("beta"), 0, 0)
         .await
         .unwrap();
-    assert!(claimed.workflow_ids.is_empty());
-    assert_eq!(claimed.stopped_by, Some(DequeueStop::RateLimit));
+    assert_eq!(claimed, Dequeued::Stopped(DequeueStop::RateLimit));
     assert!(DequeueStop::RateLimit.spans_partitions());
 }
 
@@ -12454,8 +12514,10 @@ async fn a_full_partition_is_named_as_a_limit_of_that_partition_alone() {
         .start_queued_workflows(&registered, "exec-1", "v1", "claim", Some("alpha"), 0, 0)
         .await
         .unwrap();
-    assert!(claimed.workflow_ids.is_empty());
-    assert_eq!(claimed.stopped_by, Some(DequeueStop::PartitionConcurrency));
+    assert_eq!(
+        claimed,
+        Dequeued::Stopped(DequeueStop::PartitionConcurrency)
+    );
     assert!(!DequeueStop::PartitionConcurrency.spans_partitions());
 }
 
@@ -12479,8 +12541,7 @@ async fn a_full_worker_is_named_as_the_stop() {
         .start_queued_workflows(&registered, "exec-1", "v1", "claim", Some("alpha"), 1, 0)
         .await
         .unwrap();
-    assert!(claimed.workflow_ids.is_empty());
-    assert_eq!(claimed.stopped_by, Some(DequeueStop::WorkerConcurrency));
+    assert_eq!(claimed, Dequeued::Stopped(DequeueStop::WorkerConcurrency));
     assert!(DequeueStop::WorkerConcurrency.spans_partitions());
 }
 
@@ -12509,7 +12570,7 @@ async fn both_worker_limits_are_counted_at_their_own_scope() {
         .start_queued_workflows(&registered, "exec-1", "v1", "claim", Some("alpha"), 0, 0)
         .await
         .unwrap()
-        .workflow_ids;
+        .started();
     assert_eq!(claimed.len(), 2, "bounded by partition_worker_concurrency");
 
     // One already running in this partition leaves it one, even though the queue-wide worker
@@ -12518,17 +12579,16 @@ async fn both_worker_limits_are_counted_at_their_own_scope() {
         .start_queued_workflows(&registered, "exec-1", "v1", "claim", Some("alpha"), 0, 1)
         .await
         .unwrap()
-        .workflow_ids;
+        .started();
     assert_eq!(claimed.len(), 1, "the partition-local count is subtracted");
 
     // Three already running queue-wide leaves nothing, whatever the partition has room for.
-    assert!(
+    assert_eq!(
         sys.start_queued_workflows(&registered, "exec-1", "v1", "claim", Some("alpha"), 3, 0)
             .await
-            .unwrap()
-            .workflow_ids
-            .is_empty(),
-        "the queue-wide worker limit still binds"
+            .unwrap(),
+        Dequeued::Stopped(DequeueStop::WorkerConcurrency),
+        "the queue-wide worker limit still binds",
     );
 }
 
@@ -12686,6 +12746,602 @@ async fn a_head_resumed_into_another_partition_mid_sweep_is_not_claimed() {
         [("wf-k1-running".to_owned(), Some("k1".to_owned()))],
         "`k1` has one running workflow, not two"
     );
+}
+
+/// A queue name no other test uses, which a hooked test needs: hooks are keyed by queue name
+/// across the whole binary. Leaked because the helpers want a `'static` name, and a test that
+/// leaks one string loses nothing.
+fn unique_queue(prefix: &str) -> &'static str {
+    Box::leak(format!("{prefix}-{}", uuid::Uuid::new_v4()).into_boxed_str())
+}
+
+/// Enqueues one workflow with the priority, version and partition key given.
+async fn enqueue_row(
+    sys: &PostgresSystemDatabase,
+    id: &str,
+    queue: &str,
+    partition: Option<&str>,
+    priority: i32,
+    version: &str,
+) {
+    let wf = NewWorkflow {
+        queue_name: Some(queue),
+        queue_partition_key: partition,
+        priority,
+        application_version: Some(version),
+        ..NewWorkflow::new(id)
+    };
+    sys.init_workflow(&wf, None, WorkflowIdReusePolicy::ReturnExisting)
+        .await
+        .unwrap();
+}
+
+/// How many of a queue's workflows are `PENDING`, by partition key.
+async fn pending_by_partition(
+    db: &support::TestDatabase,
+    queue: &str,
+) -> std::collections::BTreeMap<Option<String>, i64> {
+    sqlx::query_as::<_, (Option<String>, i64)>(
+        r#"SELECT queue_partition_key, count(*) FROM "dbos"."workflow_status"
+           WHERE queue_name = $1 AND status = 'PENDING' GROUP BY queue_partition_key"#,
+    )
+    .bind(queue)
+    .fetch_all(&db.pool().await)
+    .await
+    .unwrap()
+    .into_iter()
+    .collect()
+}
+
+/// Whether a claim failed because CockroachDB's `SERIALIZABLE` refused it, which is how that
+/// backend, taking no claim locks, stops two claimers spending one budget.
+fn refused_by_serializable(error: &Error) -> bool {
+    matches!(error, Error::Backend(backend) if backend.sqlstate.as_deref() == Some("40001"))
+}
+
+/// The limits a claimer that misses a new head is tested under.
+enum MissedHead {
+    /// `concurrency = 1`, and the new head outranks the one the paused claimer took.
+    HigherPriority,
+    /// `concurrency = 1`, and the new head is another application version's, which the paused
+    /// claimer does not select.
+    OtherVersion,
+    /// `partition_concurrency = 1` with a partition rate limit, which keeps the queue off the
+    /// batched sweep, and the new head outranks the paused claimer's in the same partition.
+    PartitionHigherPriority,
+    /// A partitioned queue with `concurrency = 1`, and the new head is in another partition: two
+    /// claimers on different keys still spend one queue-wide budget, so they must take the same
+    /// lock, the queue's.
+    CrossPartition,
+}
+
+/// **Two claimers that pick different heads do not both spend one budget.**
+///
+/// Claimer B selects and locks its head, and is held there by a hook before it marks the head
+/// `PENDING`. A head B cannot see is enqueued — it outranks B's, or only another version claims it
+/// — and claimer A claims through another handle. A locks a different row than B, so no row lock
+/// makes the two collide: without a lock on the budget itself both commit, and a limit of one
+/// runs two workflows. The claim lock makes A wait its turn instead: it claims nothing, and says
+/// why.
+async fn a_claimer_missing_a_new_head_does_not_overspend(case: MissedHead) {
+    use std::sync::{Arc, Mutex};
+
+    let (sys, db) = sysdb().await;
+    let name = unique_queue("claim-lock");
+    let (queue, partition, partition_a) = match case {
+        MissedHead::HigherPriority | MissedHead::OtherVersion => (
+            NewQueue {
+                concurrency: Some(1),
+                ..NewQueue::new(name)
+            },
+            None,
+            None,
+        ),
+        MissedHead::CrossPartition => (
+            NewQueue {
+                concurrency: Some(1),
+                partition_concurrency: Some(1),
+                ..NewQueue::new(name)
+            },
+            Some("p0"),
+            Some("p1"),
+        ),
+        MissedHead::PartitionHigherPriority => (
+            NewQueue {
+                partition_concurrency: Some(1),
+                partition_rate_limit: Some(RateLimit {
+                    limit: 100,
+                    period: std::time::Duration::from_secs(60),
+                }),
+                ..NewQueue::new(name)
+            },
+            Some("p"),
+            Some("p"),
+        ),
+    };
+    sys.upsert_queue(&queue, OnExistingQueue::Update)
+        .await
+        .unwrap();
+    let queue = sys.get_queue(name).await.unwrap().unwrap();
+    let version_b = "v1";
+    let version_a = match case {
+        MissedHead::OtherVersion => "v2",
+        _ => version_b,
+    };
+    enqueue_row(&sys, "wf-head-b", name, partition, 5, version_b).await;
+
+    let other = Arc::new(PostgresSystemDatabase::from_pool(
+        db.pool().await,
+        &Settings::default(),
+    ));
+    let claimed_a = Arc::new(Mutex::new(None));
+    let hook = dbos::__test_hooks::on(dbos::__test_hooks::points::QUEUE_CLAIM, name, {
+        let (other, claimed_a, queue) = (Arc::clone(&other), Arc::clone(&claimed_a), queue.clone());
+        move || {
+            let (other, claimed_a, queue) =
+                (Arc::clone(&other), Arc::clone(&claimed_a), queue.clone());
+            async move {
+                // Once: A's own claim reaches this point too, and must run straight through.
+                if claimed_a.lock().unwrap().is_some() {
+                    return Ok(());
+                }
+                *claimed_a.lock().unwrap() = Some(Ok(Dequeued::Started(Vec::new())));
+                enqueue_row(&other, "wf-head-a", name, partition_a, 1, version_a).await;
+                let result = other
+                    .start_queued_workflows(
+                        &queue,
+                        "exec-a",
+                        version_a,
+                        "claim-a",
+                        partition_a,
+                        0,
+                        0,
+                    )
+                    .await;
+                *claimed_a.lock().unwrap() = Some(result);
+                Ok(())
+            }
+        }
+    });
+
+    let claimed_b = sys
+        .start_queued_workflows(&queue, "exec-b", version_b, "claim-b", partition, 0, 0)
+        .await;
+    assert!(hook.fired() >= 1, "claimer B never reached its claim");
+    drop(hook);
+    let claimed_a = claimed_a
+        .lock()
+        .unwrap()
+        .take()
+        .expect("claimer A never ran");
+
+    let partition = partition.map(str::to_owned);
+    let pending = pending_by_partition(&db, name).await;
+    if matches!(db.backend(), Backend::Cockroach) {
+        // No claim lock there: `SERIALIZABLE` refuses whichever claimer would overspend.
+        for result in [&claimed_a, &claimed_b] {
+            if let Err(error) = result {
+                assert!(refused_by_serializable(error), "{error}");
+            }
+        }
+        assert!(
+            pending.values().sum::<i64>() <= 1,
+            "a limit of one admitted {pending:?}"
+        );
+        return;
+    }
+
+    assert_eq!(
+        pending,
+        [(partition, 1)].into(),
+        "a limit of one admitted one"
+    );
+    let expected_stop = match case {
+        MissedHead::PartitionHigherPriority => DequeueStop::PartitionClaimLock,
+        _ => DequeueStop::ClaimLock,
+    };
+    assert_eq!(
+        claimed_a.unwrap(),
+        Dequeued::Stopped(expected_stop),
+        "claimer A should have found the budget's lock held"
+    );
+    assert_eq!(claimed_b.unwrap().started(), ["wf-head-b"]);
+    assert_eq!(
+        sys.get_workflow("wf-head-a").await.unwrap().unwrap().status,
+        WorkflowStatus::Enqueued
+    );
+}
+
+#[tokio::test]
+async fn a_claimer_missing_a_higher_priority_head_does_not_overspend() {
+    a_claimer_missing_a_new_head_does_not_overspend(MissedHead::HigherPriority).await;
+}
+
+#[tokio::test]
+async fn a_claimer_missing_another_versions_head_does_not_overspend() {
+    a_claimer_missing_a_new_head_does_not_overspend(MissedHead::OtherVersion).await;
+}
+
+#[tokio::test]
+async fn a_partition_claimer_missing_a_higher_priority_head_does_not_overspend() {
+    a_claimer_missing_a_new_head_does_not_overspend(MissedHead::PartitionHigherPriority).await;
+}
+
+#[tokio::test]
+async fn claimers_on_different_partitions_share_the_queue_wide_lock() {
+    a_claimer_missing_a_new_head_does_not_overspend(MissedHead::CrossPartition).await;
+}
+
+/// **Two sweeps that pick different heads in one partition do not both start them.**
+///
+/// Sweep B is held by a hook at `point`. A head that outranks B's in `p0` is enqueued, with
+/// another in `p1`, and sweep A runs through another handle: it sees the new head as `p0`'s, a
+/// different row than B's. Without a lock on the partition itself both commit, and a partition
+/// limited to one runs two workflows.
+///
+/// - Held at [`PARTITION_CLAIM`], B has picked its head under `p0`'s lock, so A passes `p0` by and
+///   claims only `p1`, and B claims its head.
+/// - Held at [`PARTITION_LOCKS`], B has no lock yet, so A claims both new heads, and B, picking
+///   `p0`'s head again under the lock, finds A's claim running there and claims nothing.
+///
+/// [`PARTITION_CLAIM`]: dbos::__test_hooks::points::PARTITION_CLAIM
+/// [`PARTITION_LOCKS`]: dbos::__test_hooks::points::PARTITION_LOCKS
+async fn a_sweep_missing_a_new_head_never_coadmits(point: &'static str) {
+    use std::sync::{Arc, Mutex};
+
+    let (sys, db) = sysdb().await;
+    let name = unique_queue("sweep-new-head");
+    let queue = partitioned_queue(&sys, name).await;
+    enqueue_row(&sys, "wf-old-head", name, Some("p0"), 5, "v1").await;
+
+    let other = Arc::new(PostgresSystemDatabase::from_pool(
+        db.pool().await,
+        &Settings::default(),
+    ));
+    let swept_a = Arc::new(Mutex::new(None));
+    let hook = dbos::__test_hooks::on(point, name, {
+        let (other, swept_a, queue) = (Arc::clone(&other), Arc::clone(&swept_a), queue.clone());
+        move || {
+            let (other, swept_a, queue) = (Arc::clone(&other), Arc::clone(&swept_a), queue.clone());
+            async move {
+                // Once: A's own sweep reaches this point too, and must run straight through.
+                if swept_a.lock().unwrap().is_some() {
+                    return Ok(());
+                }
+                *swept_a.lock().unwrap() = Some(Ok(Vec::new()));
+                enqueue_row(&other, "wf-new-head", name, Some("p0"), 1, "v1").await;
+                enqueue_row(&other, "wf-other-head", name, Some("p1"), 5, "v1").await;
+                let result = other
+                    .start_queued_partitioned_workflows(&queue, "exec-a", "v1", "claim-a", None)
+                    .await;
+                *swept_a.lock().unwrap() = Some(result);
+                Ok(())
+            }
+        }
+    });
+
+    let swept_b = sys
+        .start_queued_partitioned_workflows(&queue, "exec-b", "v1", "claim-b", None)
+        .await;
+    assert!(hook.fired() >= 1, "sweep B never reached the hook");
+    drop(hook);
+    let swept_a = swept_a.lock().unwrap().take().expect("sweep A never ran");
+
+    let pending = pending_by_partition(&db, name).await;
+    for (partition, count) in &pending {
+        assert!(
+            *count <= 1,
+            "partition {partition:?} runs {count} workflows"
+        );
+    }
+    if matches!(db.backend(), Backend::Cockroach) {
+        // No partition lock there: `SERIALIZABLE` refuses the sweep that would co-admit. Which
+        // heads each sweep then claims is not exact either, since a `SKIP LOCKED` there can pass
+        // over a row enqueued moments ago.
+        for result in [&swept_a, &swept_b] {
+            if let Err(error) = result {
+                assert!(refused_by_serializable(error), "{error}");
+            }
+        }
+        return;
+    }
+    let (expected_a, expected_b): (&[&str], &[&str]) =
+        if point == dbos::__test_hooks::points::PARTITION_CLAIM {
+            (&["wf-other-head"], &["wf-old-head"])
+        } else {
+            (&["wf-new-head", "wf-other-head"], &[])
+        };
+    assert_eq!(swept_a.unwrap(), expected_a);
+    assert_eq!(swept_b.unwrap(), expected_b);
+    assert_eq!(
+        pending,
+        [(Some("p0".to_owned()), 1), (Some("p1".to_owned()), 1)].into()
+    );
+}
+
+#[tokio::test]
+async fn a_sweep_missing_a_new_head_while_holding_the_partition_lock_never_coadmits() {
+    a_sweep_missing_a_new_head_never_coadmits(dbos::__test_hooks::points::PARTITION_CLAIM).await;
+}
+
+#[tokio::test]
+async fn a_sweep_missing_a_new_head_before_the_partition_lock_never_coadmits() {
+    a_sweep_missing_a_new_head_never_coadmits(dbos::__test_hooks::points::PARTITION_LOCKS).await;
+}
+
+/// Enqueues one workflow on each of `count` partitions of `queue`, named `p000`, `p001` and so on,
+/// returning their ids in partition order.
+async fn enqueue_across_partitions(
+    sys: &PostgresSystemDatabase,
+    queue: &str,
+    count: usize,
+) -> Vec<String> {
+    let mut ids = Vec::with_capacity(count);
+    for n in 0..count {
+        let id = format!("wf-{n:03}");
+        enqueue_row(sys, &id, queue, Some(&format!("p{n:03}")), 0, "v1").await;
+        ids.push(id);
+    }
+    ids
+}
+
+/// **A sweep claims at most its cap's worth of partitions, in key order, and the next sweep the
+/// rest.**
+///
+/// The cap is a bound on one sweep's work, not on what is dequeued: a partition past it waits for
+/// the next poll, and the partitions this sweep claimed are passed by then, as their heads run.
+#[tokio::test]
+async fn a_sweep_claims_at_most_its_cap_and_the_next_one_the_rest() {
+    let (sys, db) = sysdb_with(&Settings {
+        partition_sweep_cap: 3,
+        ..Settings::default()
+    })
+    .await;
+    if skip_dequeue_completeness(&db) {
+        return;
+    }
+    let name = unique_queue("sweep-cap");
+    let queue = partitioned_queue(&sys, name).await;
+    let ids = enqueue_across_partitions(&sys, name, 5).await;
+
+    let first = sys
+        .start_queued_partitioned_workflows(&queue, "exec-1", "v1", "claim", None)
+        .await
+        .unwrap();
+    assert_eq!(first, ids[..3], "the cap's worth, the lowest keys first");
+
+    let second = sys
+        .start_queued_partitioned_workflows(&queue, "exec-1", "v1", "claim", None)
+        .await
+        .unwrap();
+    assert_eq!(second, ids[3..], "the rest, on the next sweep");
+}
+
+/// **The tighter of the cap and the caller's budget bounds a sweep, and decides its order.**
+///
+/// Under the cap the sweep reaches every partition it may, so it takes them in key order. When the
+/// budget is tighter it does not, and taking the lowest keys every time would starve the rest, so
+/// it takes them at random.
+#[tokio::test]
+async fn the_tighter_of_the_cap_and_the_budget_bounds_a_sweep() {
+    let (sys, db) = sysdb_with(&Settings {
+        partition_sweep_cap: 3,
+        ..Settings::default()
+    })
+    .await;
+    if skip_dequeue_completeness(&db) {
+        return;
+    }
+    let name = unique_queue("sweep-cap-or-budget");
+    let queue = partitioned_queue(&sys, name).await;
+    let ids = enqueue_across_partitions(&sys, name, 6).await;
+
+    // A budget looser than the cap: the cap binds, in key order.
+    let capped = sys
+        .start_queued_partitioned_workflows(&queue, "exec-1", "v1", "claim", Some(5))
+        .await
+        .unwrap();
+    assert_eq!(capped, ids[..3]);
+
+    // A budget tighter than the cap: the budget binds, from what is left.
+    let budgeted = sys
+        .start_queued_partitioned_workflows(&queue, "exec-1", "v1", "claim", Some(2))
+        .await
+        .unwrap();
+    assert_eq!(budgeted.len(), 2);
+    assert!(
+        budgeted.iter().all(|id| ids[3..].contains(id)),
+        "claimed {budgeted:?}, which the first sweep already had"
+    );
+}
+
+/// A handle with default settings sweeps with the crate's bounds.
+#[test]
+fn the_default_sweep_bounds_are_the_crates_constants() {
+    let settings = Settings::default();
+    assert_eq!(settings.partition_sweep_cap, PARTITIONED_DEQUEUE_SWEEP_CAP);
+    assert_eq!(
+        settings.partition_batch_size,
+        PARTITIONED_DEQUEUE_BATCH_SIZE
+    );
+}
+
+/// An error a hook makes a sweep fail with, which nothing retries.
+fn injected_failure() -> Error {
+    Error::Backend(BackendError {
+        message: "injected by a test hook".to_owned(),
+        sqlstate: None,
+        kind: BackendErrorKind::Permanent,
+    })
+}
+
+/// **A batch that fails after an earlier one committed still returns the committed claims.**
+///
+/// Each batch commits on its own, so the first batch's heads are `PENDING` by the time the second
+/// fails. Returning the failure instead would leave them claimed and never dispatched, gating
+/// their partitions until recovery. The sweep stops at the failure, and the next one claims the
+/// rest, its partitions' locks having been released with the failed batch.
+#[tokio::test]
+async fn a_failed_batch_keeps_the_claims_of_the_batches_before_it() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let (sys, db) = sysdb_with(&two_per_batch()).await;
+    if skip_dequeue_completeness(&db) {
+        return;
+    }
+    let name = unique_queue("sweep-batch-fails");
+    let queue = partitioned_queue(&sys, name).await;
+    // One partition more than a batch of two holds, so the sweep runs two batches.
+    let ids = enqueue_across_partitions(&sys, name, 3).await;
+
+    let batches = Arc::new(AtomicUsize::new(0));
+    let hook = dbos::__test_hooks::on(dbos::__test_hooks::points::PARTITION_CLAIM, name, {
+        let batches = Arc::clone(&batches);
+        move || {
+            let second = batches.fetch_add(1, Ordering::SeqCst) == 1;
+            async move {
+                if second {
+                    return Err(injected_failure());
+                }
+                Ok(())
+            }
+        }
+    });
+    let started = sys
+        .start_queued_partitioned_workflows(&queue, "exec-1", "v1", "claim", None)
+        .await
+        .expect("the first batch's claims should be returned, not the second's failure");
+    assert_eq!(hook.fired(), 2);
+    drop(hook);
+    assert_eq!(started, ids[..2]);
+    let last = ids.last().unwrap();
+    assert_eq!(
+        sys.get_workflow(last).await.unwrap().unwrap().status,
+        WorkflowStatus::Enqueued,
+        "the failed batch claimed nothing"
+    );
+
+    // The failed batch's locks went with its transaction. That connection is returned to the
+    // pool, and rolled back, in the background, so the next sweep may need a moment to find them.
+    let mut next = Vec::new();
+    for _ in 0..20 {
+        next = sys
+            .start_queued_partitioned_workflows(&queue, "exec-1", "v1", "claim", None)
+            .await
+            .unwrap();
+        if !next.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(next, [last.as_str()]);
+}
+
+/// **A later batch does not wait out a lost connection while earlier claims wait to be
+/// dispatched.**
+///
+/// A connection failure is otherwise retried until the database comes back. That is right for the
+/// first batch, which has claimed nothing, but a later one would hold back the claims the batches
+/// before it committed, `PENDING` and undispatched, for as long as the database is away. So a
+/// later batch reports the failure, and the sweep returns what it has.
+#[tokio::test]
+async fn a_later_batch_does_not_wait_out_a_lost_connection() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let (sys, db) = sysdb_with(&two_per_batch()).await;
+    if skip_dequeue_completeness(&db) {
+        return;
+    }
+    let name = unique_queue("sweep-batch-loses-connection");
+    let queue = partitioned_queue(&sys, name).await;
+    let ids = enqueue_across_partitions(&sys, name, 3).await;
+
+    // The second batch loses its connection once; retried, it would claim the last partition.
+    let batches = Arc::new(AtomicUsize::new(0));
+    let hook = dbos::__test_hooks::on(dbos::__test_hooks::points::PARTITION_CLAIM, name, {
+        let batches = Arc::clone(&batches);
+        move || {
+            let second = batches.fetch_add(1, Ordering::SeqCst) == 1;
+            async move {
+                if second {
+                    return Err(Error::Backend(BackendError {
+                        message: "connection lost, injected by a test hook".to_owned(),
+                        sqlstate: None,
+                        kind: BackendErrorKind::Connection,
+                    }));
+                }
+                Ok(())
+            }
+        }
+    });
+    let started = sys
+        .start_queued_partitioned_workflows(&queue, "exec-1", "v1", "claim", None)
+        .await
+        .expect("the first batch's claims should be returned");
+    assert_eq!(
+        hook.fired(),
+        2,
+        "the failed batch should not have been retried"
+    );
+    drop(hook);
+    assert_eq!(started, ids[..2]);
+    assert_eq!(
+        sys.get_workflow(ids.last().unwrap())
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        WorkflowStatus::Enqueued
+    );
+}
+
+/// A batch that fails before any batch committed fails the sweep, which claimed nothing, and the
+/// next sweep claims every partition.
+#[tokio::test]
+async fn a_failed_first_batch_fails_the_sweep() {
+    let (sys, db) = sysdb().await;
+    if skip_dequeue_completeness(&db) {
+        return;
+    }
+    let name = unique_queue("sweep-first-batch-fails");
+    let queue = partitioned_queue(&sys, name).await;
+    let ids = enqueue_across_partitions(&sys, name, 2).await;
+
+    let hook = dbos::__test_hooks::fail_once(
+        dbos::__test_hooks::points::PARTITION_CLAIM,
+        name,
+        injected_failure(),
+    );
+    let failed = sys
+        .start_queued_partitioned_workflows(&queue, "exec-1", "v1", "claim", None)
+        .await;
+    assert!(
+        matches!(&failed, Err(Error::Backend(backend)) if backend.message.contains("injected")),
+        "{failed:?}"
+    );
+    assert_eq!(hook.fired(), 1);
+    drop(hook);
+    for id in &ids {
+        assert_eq!(
+            sys.get_workflow(id).await.unwrap().unwrap().status,
+            WorkflowStatus::Enqueued
+        );
+    }
+
+    let mut next = Vec::new();
+    for _ in 0..20 {
+        next = sys
+            .start_queued_partitioned_workflows(&queue, "exec-1", "v1", "claim", None)
+            .await
+            .unwrap();
+        if !next.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(next, ids);
 }
 
 /// A sweep takes one workflow per partition, and will not take a second while the first runs.
@@ -13138,7 +13794,7 @@ async fn finishing_releases_the_deduplication_key() {
         sys.start_queued_workflows(&registered, "exec-1", "v1", "claim", None, 0, 0)
             .await
             .unwrap()
-            .workflow_ids,
+            .started(),
         ["wf-first"],
     );
     assert_eq!(

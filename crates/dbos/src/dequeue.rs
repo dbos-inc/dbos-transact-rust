@@ -34,7 +34,8 @@ use crate::queue::DEFAULT_POLLING_INTERVAL;
 use crate::sysdb;
 use crate::sysdb::INTERNAL_QUEUE;
 use crate::sysdb::types::{
-    AppScope, DatabaseTime, QueueRecord, Timestamp, WorkflowFilter, WorkflowRecord, WorkflowStatus,
+    AppScope, DatabaseTime, Dequeued, QueueRecord, Timestamp, WorkflowFilter, WorkflowRecord,
+    WorkflowStatus,
 };
 use crate::workflow::{MAX_RECOVERY_ATTEMPTS, Role, spawn_execution, spawn_tracked};
 
@@ -405,13 +406,19 @@ impl Polled {
 /// does not starve the ones sorting last.
 ///
 /// **The walk is bounded by the queue-wide limits as well as by the worker's own.** Each visit is a
-/// claim transaction, at a stricter isolation whenever the queue carries a shared limit, and with a
+/// claim transaction, under a claim lock whenever the queue carries a shared limit, and with a
 /// queue-wide limit spent every one of them claims nothing, so a queue with tens of thousands of
 /// waiting partitions would otherwise pay that many transactions a poll to learn one fact. The
 /// queue's room under its global concurrency is read once up front: none means no partition is
 /// visited at all, and the walk ends as soon as this poll has claimed it. A claim that reports a
 /// queue-wide limit closed — a peer filled it since, or the rate limit's window is full — ends the
-/// walk too, since every other key would report the same.
+/// walk too, since every other key would report the same. So does one that found the queue-wide
+/// claim lock held: a peer is claiming from the whole queue, so every other key is held too. A
+/// partition's own claim lock skips only that partition.
+///
+/// **A claim lock held by a peer is not contention to back off from.** The peer commits in
+/// moments, and its claim says the queue still has work, so the next poll comes at the usual
+/// interval.
 async fn poll_once(
     executor: &Arc<Executor>,
     queue: &QueueRecord,
@@ -434,18 +441,11 @@ async fn poll_once(
             )
             .await
         {
-            Ok(claimed) => {
-                dispatch_claimed(
-                    executor,
-                    queue,
-                    None,
-                    running,
-                    claimed.workflow_ids,
-                    &owner_xid,
-                )
-                .await;
+            Ok(Dequeued::Started(workflow_ids)) => {
+                dispatch_claimed(executor, queue, None, running, workflow_ids, &owner_xid).await;
                 Polled::new(None, 1)
             }
+            Ok(Dequeued::Stopped(_)) => Polled::new(None, 1),
             Err(error) => Polled::new(report_dequeue_error(&error), 1),
         };
     }
@@ -556,25 +556,28 @@ async fn poll_once(
                 continue;
             }
         };
-        claimed_here += i64::try_from(claimed.workflow_ids.len()).unwrap_or(i64::MAX);
-        dispatch_claimed(
-            executor,
-            queue,
-            Some(&partition),
-            running,
-            claimed.workflow_ids,
-            &owner_xid,
-        )
-        .await;
-        if let Some(stop) = claimed.stopped_by
-            && stop.spans_partitions()
-        {
-            tracing::debug!(
-                partition,
-                ?stop,
-                "a queue-wide limit has no room left; ending the partition walk"
-            );
-            break;
+        match claimed {
+            Dequeued::Started(workflow_ids) => {
+                claimed_here += i64::try_from(workflow_ids.len()).unwrap_or(i64::MAX);
+                dispatch_claimed(
+                    executor,
+                    queue,
+                    Some(&partition),
+                    running,
+                    workflow_ids,
+                    &owner_xid,
+                )
+                .await;
+            }
+            Dequeued::Stopped(stop) if stop.spans_partitions() => {
+                tracing::debug!(
+                    partition,
+                    ?stop,
+                    "a queue-wide limit has no room left; ending the partition walk"
+                );
+                break;
+            }
+            Dequeued::Stopped(_) => {}
         }
     }
     Polled::new(None, claims)
@@ -838,9 +841,9 @@ enum Contention {
     /// holding the rows. The peer commits in milliseconds, so the next poll finds them free, and
     /// backing off would only leave waiting work unclaimed.
     LockNotAvailable,
-    /// `40001` `serialization_failure`: a dequeue running at repeatable read or serialisable lost
-    /// to a peer that committed first. On PostgreSQL that is a dequeue raised to keep a shared
-    /// budget consistent; on CockroachDB, whose default isolation is serialisable, any dequeue.
+    /// `40001` `serialization_failure`: a dequeue running at serialisable lost to a peer that
+    /// committed first. That is CockroachDB, where a claim spending a shared budget runs at
+    /// serialisable rather than taking a claim lock, and where every other dequeue does too.
     /// Contenders can keep colliding on every poll, so the worker backs off to spread them out.
     SerializationFailure,
 }
@@ -1295,6 +1298,117 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(claimed, 2, "exactly the room the queue had");
+        dbos.shutdown().await;
+    }
+
+    /// Holds a claim lock on `walked` as a peer's claim would, until the returned transaction
+    /// drops. `partition` is `None` for the lock over the whole queue.
+    async fn hold_claim_lock(
+        db: &dbos_test_support::TestDatabase,
+        partition: Option<&str>,
+    ) -> sqlx::Transaction<'static, sqlx::Postgres> {
+        let key = crate::sysdb::postgres::queue_claim_lock_key(
+            crate::sysdb::DEFAULT_SCHEMA,
+            "walked",
+            partition,
+        );
+        let mut holder = db.pool().await.begin().await.unwrap();
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(key)
+            .execute(&mut *holder)
+            .await
+            .unwrap();
+        holder
+    }
+
+    /// Whether a test of the claim locks cannot run, which it cannot on CockroachDB: it grants
+    /// every advisory lock, so a claim there takes none and a held one excludes nothing.
+    fn skip_claim_locks(db: &dbos_test_support::TestDatabase) -> bool {
+        let skipping = matches!(db.backend(), dbos_test_support::Backend::Cockroach);
+        if skipping {
+            eprintln!("skipped on CockroachDB: it takes no claim locks");
+        }
+        skipping
+    }
+
+    /// **A peer holding the queue-wide claim lock ends the walk at its first claim**, without
+    /// backing off: every other partition is under the same lock, and the peer commits in
+    /// moments.
+    #[tokio::test]
+    async fn a_walk_stops_at_a_queue_wide_claim_lock() {
+        let queue = crate::sysdb::types::NewQueue {
+            concurrency: Some(10),
+            partition_concurrency: Some(2),
+            ..crate::sysdb::types::NewQueue::new("walked")
+        };
+        let (dbos, executor, db, registered) = partitioned_backlog(queue, 5).await;
+        if skip_claim_locks(&db) {
+            dbos.shutdown().await;
+            return;
+        }
+        let holder = hold_claim_lock(&db, None).await;
+
+        let polled = poll_once(&executor, &registered, &Arc::new(Running::default())).await;
+        assert_eq!(
+            polled.claims, 1,
+            "the first claim's stop should end the walk"
+        );
+        assert_eq!(
+            polled.contention, None,
+            "a held claim lock is not contention"
+        );
+        let waiting: i64 = sqlx::query_scalar(
+            r#"SELECT count(*) FROM "dbos"."workflow_status"
+               WHERE queue_name = 'walked' AND status = 'ENQUEUED'"#,
+        )
+        .fetch_one(&db.pool().await)
+        .await
+        .unwrap();
+        assert_eq!(waiting, 5, "nothing claimed while a peer holds the queue");
+
+        // Released, the same poll takes every partition's head.
+        holder.rollback().await.unwrap();
+        let polled = poll_once(&executor, &registered, &Arc::new(Running::default())).await;
+        assert_eq!(polled.claims, 5);
+        dbos.shutdown().await;
+    }
+
+    /// **A peer holding one partition's claim lock costs the walk that partition alone**: the
+    /// other partitions' locks are their own, so the walk passes it by and claims the rest.
+    #[tokio::test]
+    async fn a_walk_skips_a_partition_whose_claim_lock_is_held() {
+        // A partition limit above one keeps the queue off the batched sweep, and no queue-wide
+        // limit leaves each claim locking only its partition.
+        let queue = crate::sysdb::types::NewQueue {
+            partition_concurrency: Some(2),
+            ..crate::sysdb::types::NewQueue::new("walked")
+        };
+        let (dbos, executor, db, registered) = partitioned_backlog(queue, 5).await;
+        if skip_claim_locks(&db) {
+            dbos.shutdown().await;
+            return;
+        }
+        let holder = hold_claim_lock(&db, Some("p-0")).await;
+
+        let polled = poll_once(&executor, &registered, &Arc::new(Running::default())).await;
+        assert_eq!(
+            polled.claims, 5,
+            "every partition visited, the held one included"
+        );
+        assert_eq!(polled.contention, None);
+        let waiting: Vec<String> = sqlx::query_scalar(
+            r#"SELECT workflow_uuid FROM "dbos"."workflow_status"
+               WHERE queue_name = 'walked' AND status = 'ENQUEUED'"#,
+        )
+        .fetch_all(&db.pool().await)
+        .await
+        .unwrap();
+        assert_eq!(
+            waiting,
+            ["wf-waiting-0"],
+            "only the held partition's row waits"
+        );
+        holder.rollback().await.unwrap();
         dbos.shutdown().await;
     }
 

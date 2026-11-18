@@ -73,12 +73,12 @@ use sqlx::{AssertSqlSafe, PgPool, Row};
 
 use self::listener::Listener;
 use self::notifier::Notifier;
-use super::PARTITIONED_DEQUEUE_SWEEP_CAP;
 use super::migrations::{self, quote_identifier};
 use super::notify::{
     EVENTS_CHANNEL, Registry, STREAMS_CHANNEL, event_key, message_key, stream_key,
 };
 use super::retry::{RetryPolicy, with_retry};
+use super::{PARTITIONED_DEQUEUE_BATCH_SIZE, PARTITIONED_DEQUEUE_SWEEP_CAP};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -350,6 +350,18 @@ pub struct Settings<'a> {
     /// Nothing here is load-bearing whatever it is set to: a wakeup only ever shortens a wait that
     /// re-queries on its own interval regardless.
     pub notification_coalesce: Option<Duration>,
+    /// The most partition heads one partitioned sweep claims, before the caller's own budget.
+    /// Defaults to [`PARTITIONED_DEQUEUE_SWEEP_CAP`].
+    ///
+    /// A bound on the work one sweep does: partitions past it are claimed by the next poll. Set
+    /// lower only to test the bound at a size a test can afford.
+    pub partition_sweep_cap: u32,
+    /// The most partitions a partitioned sweep claims in one transaction. Defaults to
+    /// [`PARTITIONED_DEQUEUE_BATCH_SIZE`].
+    ///
+    /// Bounds how many partition locks a sweep holds at once, and for how long. Set lower only to
+    /// test batching with a handful of partitions.
+    pub partition_batch_size: std::num::NonZeroUsize,
 }
 
 impl Default for Settings<'_> {
@@ -365,6 +377,8 @@ impl Default for Settings<'_> {
             application_name: None,
             polling_concurrency: PollingConcurrency::Default,
             notification_coalesce: None,
+            partition_sweep_cap: PARTITIONED_DEQUEUE_SWEEP_CAP,
+            partition_batch_size: PARTITIONED_DEQUEUE_BATCH_SIZE,
         }
     }
 }
@@ -505,7 +519,21 @@ pub struct PostgresSystemDatabase {
     /// The schema is fixed at construction, so rendering these per query would allocate three
     /// strings on every database operation to produce a value that never changes.
     tables: Tables,
+    /// The schema as configured, unquoted, which is what names this database's claim locks: every
+    /// SDK spells a lock with the schema it was given, so a quoted form would name another lock.
+    schema: String,
+    /// Which server this is, PostgreSQL or CockroachDB, which decides whether queue claims take
+    /// advisory locks and whether notifications can be had at all.
+    ///
+    /// Set by [`connect`](Self::connect), which asks the server once for everything that needs to
+    /// know. A handle made by [`from_pool`](Self::from_pool) does no I/O, so its first caller asks;
+    /// see [`dialect`](Self::dialect).
+    dialect: tokio::sync::OnceCell<migrations::Dialect>,
     retry: RetryPolicy,
+    /// See [`Settings::partition_sweep_cap`].
+    partition_sweep_cap: u32,
+    /// See [`Settings::partition_batch_size`].
+    partition_batch_size: std::num::NonZeroUsize,
     executor_id: Option<String>,
     /// The application every row this handle writes is stamped with. See
     /// [`Settings::application_name`].
@@ -598,15 +626,27 @@ impl PostgresSystemDatabase {
         // Either bring the schema up, or check that whoever was supposed to has. Connecting to a
         // schema this build's queries do not fit is a failure either way; the only question is
         // whether it is reported now or as a missing column on some later statement.
-        let prepared = if config.migrate {
-            migrations::runner::run(&pool, config.settings.schema, config.use_listen_notify)
-                .await
-                .map(|_| ())
-        } else {
-            migrations::runner::verify(&pool, config.settings.schema).await
-        };
-        // The runner has already retried what it could; whatever reaches here is settled.
-        prepared.map_err(|e| {
+        //
+        // The dialect is asked here once, for the migrations and for the handle, which keeps it.
+        //
+        // The runner has already retried what it could; whatever fails here is settled.
+        let dialect = async {
+            let dialect = migrations::runner::detect_dialect(&pool).await?;
+            if config.migrate {
+                migrations::runner::run_with(
+                    &pool,
+                    config.settings.schema,
+                    dialect,
+                    config.use_listen_notify,
+                )
+                .await?;
+            } else {
+                migrations::runner::verify(&pool, config.settings.schema).await?;
+            }
+            Ok::<_, migrations::runner::MigrateError>(dialect)
+        }
+        .await
+        .map_err(|e| {
             Error::Backend(BackendError {
                 message: e.to_string(),
                 sqlstate: None,
@@ -636,7 +676,11 @@ impl PostgresSystemDatabase {
             listener_task: std::sync::Mutex::default(),
             notifier_task: std::sync::Mutex::default(),
             tables: Tables::new(config.settings.schema),
+            schema: config.settings.schema.to_owned(),
+            dialect: tokio::sync::OnceCell::new_with(Some(dialect)),
             retry: config.settings.retry,
+            partition_sweep_cap: config.settings.partition_sweep_cap,
+            partition_batch_size: config.settings.partition_batch_size,
             // Copied out: the handle outlives the borrowed configuration.
             executor_id: config.settings.executor_id.map(str::to_owned),
             application_name: config.settings.application_name.map(str::to_owned),
@@ -673,7 +717,18 @@ impl PostgresSystemDatabase {
     ///
     /// [`close`](SystemDatabase::close) is the shutdown for both.
     pub async fn start_notifications(&self) -> bool {
-        match migrations::runner::detect_dialect(&self.pool).await {
+        // Asked once and not retried when the handle does not know yet: a deployment that cannot
+        // say is one to start without notifications rather than to wait on.
+        let dialect = match self.dialect.get() {
+            Some(&dialect) => Ok(dialect),
+            None => migrations::runner::detect_dialect(&self.pool)
+                .await
+                .inspect(|&dialect| {
+                    // A concurrent caller that set it first set the same value.
+                    let _ = self.dialect.set(dialect);
+                }),
+        };
+        match dialect {
             Ok(migrations::Dialect::Cockroach) => {
                 tracing::debug!(
                     "not starting a notification listener: CockroachDB has no LISTEN/NOTIFY, so \
@@ -752,12 +807,91 @@ impl PostgresSystemDatabase {
             listener_task: std::sync::Mutex::default(),
             notifier_task: std::sync::Mutex::default(),
             tables: Tables::new(settings.schema),
+            schema: settings.schema.to_owned(),
+            dialect: tokio::sync::OnceCell::new(),
             retry: settings.retry,
+            partition_sweep_cap: settings.partition_sweep_cap,
+            partition_batch_size: settings.partition_batch_size,
             // Copied out: the handle outlives the borrowed settings.
             executor_id: settings.executor_id.map(str::to_owned),
             application_name: settings.application_name.map(str::to_owned),
         }
     }
+
+    /// Whether queue claims serialize on advisory locks: on PostgreSQL, and not on CockroachDB.
+    ///
+    /// **CockroachDB accepts the lock functions and grants every call**, so a lock taken there
+    /// would exclude nothing while reading as if it did. Its claims run at `SERIALIZABLE` instead,
+    /// which aborts the claimer that would overspend.
+    async fn claims_take_locks(&self) -> Result<bool, Error> {
+        Ok(self.dialect().await? == migrations::Dialect::Postgres)
+    }
+
+    /// Which server this is, asking it only if [`connect`](Self::connect) did not.
+    ///
+    /// The ask is retried like any statement, since a claim that needs the answer should wait out
+    /// a lost connection rather than fail on it. A failed ask is not remembered, so the next caller
+    /// asks again; an answer is, since a handle's server cannot change dialect.
+    async fn dialect(&self) -> Result<migrations::Dialect, Error> {
+        let pool = &self.pool;
+        self.dialect
+            .get_or_try_init(|| {
+                with_retry(&self.retry, "detect_dialect", move || async move {
+                    Ok(migrations::runner::ask_dialect(pool).await?)
+                })
+            })
+            .await
+            .copied()
+    }
+}
+
+/// A claim lock's name: its parts as a compact JSON array.
+///
+/// **A claim lock's name is part of the on-database protocol**, so claimers in any language on the
+/// same queue take the same lock and exclude each other. That makes the exact text part of the
+/// protocol: no whitespace, `null` for a missing part, quotes, backslashes and control characters
+/// escaped, and every other character, non-ASCII included, written as itself — which is what
+/// `serde_json` writes.
+fn lock_name(parts: &[Option<&str>]) -> String {
+    serde_json::to_string(parts).expect("a list of strings always serializes")
+}
+
+/// The SHA-256 of `text`'s UTF-8 bytes, from which the claim lock keys are read.
+fn sha256(text: &str) -> [u8; 32] {
+    use sha2::Digest;
+    sha2::Sha256::digest(text.as_bytes()).into()
+}
+
+/// The `bigint` advisory lock a claim spending a shared budget takes.
+///
+/// The first eight bytes of the SHA-256 of `["dbos.queue_claim", schema, queue, partition]`, read
+/// as a big-endian signed integer. `partition` is `None` for a claim that locks the whole queue.
+pub(crate) fn queue_claim_lock_key(schema: &str, queue: &str, partition: Option<&str>) -> i64 {
+    let name = lock_name(&[
+        Some("dbos.queue_claim"),
+        Some(schema),
+        Some(queue),
+        partition,
+    ]);
+    let digest = sha256(&name);
+    i64::from_be_bytes(digest[..8].try_into().expect("eight bytes"))
+}
+
+/// The first of the two `int` keys the partitioned sweep locks each partition with: the queue's.
+///
+/// Bytes 4–7 of the SHA-256 of `["dbos.partition_claim", schema, queue]`, read as a big-endian
+/// signed integer, which is the low half of that name's `bigint` key.
+fn partition_claim_queue_id(schema: &str, queue: &str) -> i32 {
+    let name = lock_name(&[Some("dbos.partition_claim"), Some(schema), Some(queue)]);
+    let digest = sha256(&name);
+    i32::from_be_bytes(digest[4..8].try_into().expect("four bytes"))
+}
+
+/// The second of the sweep's two `int` keys: the first four bytes of the SHA-256 of the
+/// partition key itself, read as a big-endian signed integer.
+fn partition_claim_lock_id(partition: &str) -> i32 {
+    let digest = sha256(partition);
+    i32::from_be_bytes(digest[..4].try_into().expect("four bytes"))
 }
 
 impl Drop for PostgresSystemDatabase {
@@ -6750,6 +6884,18 @@ impl SystemDatabase for PostgresSystemDatabase {
                 detail: "must be absent rather than empty".to_owned(),
             });
         }
+        // A partitioned queue's per-partition limits are counted within a key, so a claim with no
+        // key would take from every partition bounded only by the queue-wide limits. Nothing that
+        // claims a partitioned queue does that: it walks the partitions, or sweeps them.
+        if partition_key.is_none() && queue.is_partitioned() {
+            return Err(Error::InvalidInput {
+                field: "partition_key".into(),
+                detail: format!(
+                    "queue {:?} is partitioned, so a claim from it needs a partition key",
+                    queue.name
+                ),
+            });
+        }
 
         let workflow_table = self.tables.workflow_status.as_str();
         let pool = &self.pool;
@@ -6770,18 +6916,9 @@ impl SystemDatabase for PostgresSystemDatabase {
             || queue.partition_concurrency.is_some()
             || queue.rate_limit.is_some()
             || queue.partition_rate_limit.is_some();
-        // Whether this call sweeps one partition of a queue whose budget spans every partition,
-        // which is a second hazard and needs a stronger answer. Two calls sweeping different keys
-        // read the same queue-wide total and then claim disjoint rows, so no snapshot conflict or
-        // row lock fires under repeatable read and each spends the whole budget: write skew,
-        // which only serialisable catches.
-        //
-        // Only the queue-wide limits count here. A per-partition limit is counted within the
-        // swept key, and two calls spending it are sweeping the same key: they select the same
-        // head-of-line rows, and the `NOWAIT` lock on those rows makes the loser fail. That holds
-        // only while both select the same head. Two calls whose selections differ, for example
-        // because a version filter hides the head from one of them, lock different rows and can
-        // both admit a workflow against a per-partition limit of one.
+        // Whether this call claims from one partition of a queue whose budget spans every
+        // partition. Two calls claiming different keys then spend the same queue-wide total, so
+        // the lock they take has to be the whole queue's rather than their partition's.
         let budget_spans_partitions =
             partition_key.is_some() && (queue.concurrency.is_some() || queue.rate_limit.is_some());
         // Marks the rows a limited queue started, which is what the windows below count and why
@@ -6803,67 +6940,113 @@ impl SystemDatabase for PostgresSystemDatabase {
         let rate_limit_period_ms = period_ms(queue.rate_limit);
         let partition_rate_limit_period_ms = period_ms(queue.partition_rate_limit);
 
-        // Conflicts are not replayed here. A dequeue raised above read committed expects to lose
-        // races to its peers, and its caller's answer to a lost one — poll again later, or skip
-        // this partition — is the right one, which a replay underneath it would hide.
+        // How many this executor may take under every limit the queue carries: the tightest of
+        // them, and `None` when it carries none. Deliberately not a capturing closure, so
+        // `max_tasks` can be checked against zero after each limit while it is live.
+        let narrow = |current: Option<i64>, available: i64| -> Option<i64> {
+            Some(current.map_or(available, |taken: i64| taken.min(available)))
+        };
+        // Checked after every limit rather than after each group, so the claim can name the limit
+        // that closed it, as `Dequeued::Stopped`: the first in this order to reach zero.
+
+        // **The worker limits first, and before any transaction**, because they cost no query:
+        // they are answered from what this process is already running rather than from the
+        // database, which cannot see a running workflow that has not written a step yet. Checked
+        // before the claim lock below, so a worker with no room never holds a lock a peer with
+        // room is waiting on.
+        let mut worker_max_tasks: Option<i64> = None;
+        if let Some(worker_concurrency) = queue.worker_concurrency {
+            worker_max_tasks = narrow(
+                worker_max_tasks,
+                (i64::from(worker_concurrency) - local_running_count).max(0),
+            );
+            if worker_max_tasks == Some(0) {
+                return Ok(Dequeued::Stopped(DequeueStop::WorkerConcurrency));
+            }
+        }
+        if let Some(worker_concurrency) = queue.partition_worker_concurrency
+            && partition_key.is_some()
+        {
+            worker_max_tasks = narrow(
+                worker_max_tasks,
+                (i64::from(worker_concurrency) - partition_local_running_count).max(0),
+            );
+            if worker_max_tasks == Some(0) {
+                return Ok(Dequeued::Stopped(DequeueStop::PartitionWorkerConcurrency));
+            }
+        }
+
+        // **A claim that spends a shared budget serializes on a lock over that budget.** Row
+        // locks alone do not make two claimers collide: each locks the head it picked, and two
+        // claimers pick different heads whenever their candidates differ — a higher-priority row
+        // enqueued between their reads, or two application versions each selecting its own rows.
+        // Both then count the same running total, lock different rows, and commit, and a limit of
+        // one runs two workflows. No isolation level short of `SERIALIZABLE` sees that, and
+        // `SERIALIZABLE` answers routine concurrent polls with aborts and backoff.
+        //
+        // So the claim first takes a transaction-scoped advisory lock on the budget's scope: the
+        // partition when every shared limit it spends is the partition's, and the whole queue when
+        // any is queue-wide. The lock key is part of the on-database protocol, so claimers in any
+        // language on the same queue exclude each other, provided they are recent enough to take
+        // it.
+        //
+        // Not on CockroachDB, which grants every advisory lock: there the claim runs at
+        // `SERIALIZABLE` instead, and the loser of a race is aborted.
+        let claim_lock = if has_shared_budget && self.claims_take_locks().await? {
+            let scope = if budget_spans_partitions {
+                None
+            } else {
+                partition_key
+            };
+            let stop = if scope.is_some() {
+                DequeueStop::PartitionClaimLock
+            } else {
+                DequeueStop::ClaimLock
+            };
+            Some((queue_claim_lock_key(&self.schema, &queue.name, scope), stop))
+        } else {
+            None
+        };
+
+        // **The isolation level is pinned, never left to the server's default.** Under the claim
+        // lock it has to be read committed: each statement then sees what the lock's previous
+        // holder committed, where a snapshot taken any earlier — at repeatable read, when the
+        // lock statement starts, before the lock is granted — would count a stale total and admit
+        // past the budget. A database, role or connection defaulting to repeatable read is
+        // ordinary configuration, so the claim does not trust the default. Without the lock, a
+        // shared budget runs at serializable (CockroachDB, which can default to read committed).
+        // Without a shared budget nothing here reads a total, but it still runs at read committed:
+        // at repeatable read a `SKIP LOCKED` that reaches a row a peer has just claimed fails with
+        // a serialization error, and the caller backs off from what is only ordinary contention.
+        let begin = match claim_lock {
+            Some(_) => "BEGIN ISOLATION LEVEL READ COMMITTED",
+            None if has_shared_budget => "BEGIN ISOLATION LEVEL SERIALIZABLE",
+            None => "BEGIN ISOLATION LEVEL READ COMMITTED",
+        };
+
+        // Conflicts are not replayed here. A claim expects to lose races to its peers — a `NOWAIT`
+        // row lock a peer holds, or on CockroachDB a serialization failure — and its caller's
+        // answer to a lost one, poll again later or skip this partition, is the right one, which a
+        // replay underneath it would hide.
         let retry = self.retry.without_conflict_replay();
         with_retry(&retry, "start_queued_workflows", move || async move {
-            let mut tx = pool.begin().await?;
+            let mut tx = pool.begin_with(begin).await?;
 
-            // Read committed otherwise: with no shared budget nothing here reads a total, so a
-            // stronger isolation would buy a retry rate and nothing else.
-            if has_shared_budget {
-                let isolation = if budget_spans_partitions {
-                    "SERIALIZABLE"
-                } else {
-                    "REPEATABLE READ"
-                };
-                sqlx::raw_sql(AssertSqlSafe(format!(
-                    "SET TRANSACTION ISOLATION LEVEL {isolation}"
-                )))
-                .execute(&mut *tx)
-                .await?;
-            }
-
-            // How many this executor may take under every limit the queue carries: the tightest
-            // of them, and `None` when it carries none. Deliberately not a capturing closure, so
-            // `max_tasks` can be checked against zero after each limit while it is live.
-            let narrow = |current: Option<i64>, available: i64| -> Option<i64> {
-                Some(current.map_or(available, |taken: i64| taken.min(available)))
-            };
-            let mut max_tasks: Option<i64> = None;
-            // Checked after every limit rather than after each group, so the claim can name the
-            // limit that closed it: the first in this order to reach zero.
-            let stopped = |stop: DequeueStop| Dequeued {
-                workflow_ids: Vec::new(),
-                stopped_by: Some(stop),
-            };
-
-            // Worker concurrency first, because it costs no query. Answered from what this
-            // process is already running rather than from the database, which cannot see a
-            // running workflow that has not written a step yet.
-            if let Some(worker_concurrency) = queue.worker_concurrency {
-                max_tasks = narrow(
-                    max_tasks,
-                    (i64::from(worker_concurrency) - local_running_count).max(0),
-                );
-                if max_tasks == Some(0) {
+            if let Some((key, stop)) = claim_lock {
+                let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
+                    .bind(key)
+                    .fetch_one(&mut *tx)
+                    .await?;
+                if !acquired {
                     tx.commit().await?;
-                    return Ok(stopped(DequeueStop::WorkerConcurrency));
+                    // A peer is claiming from this budget right now, so it still has work; the
+                    // next poll tries again, with no backoff, since the peer commits in moments.
+                    tracing::debug!(queue = %queue.name, ?stop, "a peer holds the claim lock");
+                    return Ok(Dequeued::Stopped(stop));
                 }
             }
-            if let Some(worker_concurrency) = queue.partition_worker_concurrency
-                && partition_key.is_some()
-            {
-                max_tasks = narrow(
-                    max_tasks,
-                    (i64::from(worker_concurrency) - partition_local_running_count).max(0),
-                );
-                if max_tasks == Some(0) {
-                    tx.commit().await?;
-                    return Ok(stopped(DequeueStop::PartitionWorkerConcurrency));
-                }
-            }
+
+            let mut max_tasks = worker_max_tasks;
 
             // Then the rate limits, read as slots left in a rolling window rather than as a yes
             // or no: bounding the claim by what is left means a backlogged queue locks only the
@@ -6887,7 +7070,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                 max_tasks = narrow(max_tasks, (i64::from(limit.limit) - recent_starts).max(0));
                 if max_tasks == Some(0) {
                     tx.commit().await?;
-                    return Ok(stopped(DequeueStop::RateLimit));
+                    return Ok(Dequeued::Stopped(DequeueStop::RateLimit));
                 }
             }
             if let (Some(limit), Some(key)) = (queue.partition_rate_limit, partition_key) {
@@ -6911,7 +7094,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                 );
                 if max_tasks == Some(0) {
                     tx.commit().await?;
-                    return Ok(stopped(DequeueStop::PartitionRateLimit));
+                    return Ok(Dequeued::Stopped(DequeueStop::PartitionRateLimit));
                 }
             }
 
@@ -6942,7 +7125,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                 max_tasks = narrow(max_tasks, (i64::from(concurrency) - running).max(0));
                 if max_tasks == Some(0) {
                     tx.commit().await?;
-                    return Ok(stopped(DequeueStop::Concurrency));
+                    return Ok(Dequeued::Stopped(DequeueStop::Concurrency));
                 }
             }
             if let (Some(concurrency), Some(key)) = (queue.partition_concurrency, partition_key) {
@@ -6970,7 +7153,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                 max_tasks = narrow(max_tasks, (i64::from(concurrency) - running).max(0));
                 if max_tasks == Some(0) {
                     tx.commit().await?;
-                    return Ok(stopped(DequeueStop::PartitionConcurrency));
+                    return Ok(Dequeued::Stopped(DequeueStop::PartitionConcurrency));
                 }
             }
 
@@ -7016,6 +7199,7 @@ impl SystemDatabase for PostgresSystemDatabase {
             .bind(&queue.name)
             .fetch_all(&mut *tx)
             .await?;
+            test_hook!(crate::test_hooks::points::QUEUE_CLAIM, &queue.name)?;
 
             // One statement for the batch rather than one per workflow: every limit above has
             // already bounded `max_tasks`, so nothing is left to stop this part-way through.
@@ -7078,10 +7262,7 @@ impl SystemDatabase for PostgresSystemDatabase {
             if !started.is_empty() {
                 tracing::debug!(queue = %queue.name, started = started.len(), "dequeued");
             }
-            Ok(Dequeued {
-                workflow_ids: started,
-                stopped_by: None,
-            })
+            Ok(Dequeued::Started(started))
         })
         .await
     }
@@ -7184,7 +7365,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         }
         // This worker's own budget bounds the sweep alongside the cap, so a process near its
         // worker concurrency does not claim heads it must immediately sit on.
-        let cap = i64::from(PARTITIONED_DEQUEUE_SWEEP_CAP);
+        let cap = i64::from(self.partition_sweep_cap);
         let sweep_limit = max_tasks.map_or(cap, |budget| budget.min(cap));
         // **Random when the budget is what binds, key order when it is not.** An unbounded sweep
         // reaches every partition, so ordering by key is free and makes the claim deterministic.
@@ -7200,33 +7381,79 @@ impl SystemDatabase for PostgresSystemDatabase {
         let workflow_table = self.tables.workflow_status.as_str();
         let pool = &self.pool;
         let application_name = self.application_name.as_deref();
+        // The rows this application could dequeue from this queue, at $1 queue and $2
+        // application. Shared by the walk and by each batch's head lookup, which have to agree —
+        // see `get_queue_partitions`.
+        let eligible_predicate = "queue_name = $1 AND status = 'ENQUEUED' \
+                                  AND ($2::text IS NULL OR application_name = $2 \
+                                       OR application_name IS NULL)";
+        // The head of the partition `{pk}` names: its first row this executor's version may
+        // run. `workflow_uuid` totalizes the order, so every worker ranks a partition
+        // identically, and the index's trailing `workflow_uuid` keeps the probe a pure top-1 —
+        // **for a partition whose head is eligible.** Where the version predicate rejects every
+        // row the probe is not a top-1 at all: `application_version` is not in the index, so it
+        // walks that partition's entries and heap-checks each to return nothing. That cost is paid
+        // whatever the walk's `LIMIT` bounds, and it is why the index, rather than the `LIMIT`, is
+        // the thing to change. Version at $3.
+        //
+        // `LATERAL` rather than a correlated scalar subquery: it plans as a tight nested loop
+        // instead of a slower per-row subplan.
+        let head_of = |pk: &str, version_predicate: &str| {
+            format!(
+                "JOIN LATERAL ( \
+                   SELECT workflow_uuid FROM {workflow_table} \
+                    WHERE {eligible_predicate} AND queue_partition_key = {pk} \
+                      AND {version_predicate} \
+                    ORDER BY priority ASC, created_at ASC, workflow_uuid ASC LIMIT 1 \
+                 ) head ON TRUE"
+            )
+        };
+
+        // **Sweeps whose heads differ lock different rows**, so the rows' own locks never made
+        // two sweeps collide. A partition gets two heads whenever two sweeps' candidates differ —
+        // a higher-priority row enqueued between their reads, or two application versions each
+        // ranking its own rows — and each sweep, having seen the partition idle, starts its own.
+        // So each batch takes its partitions' advisory locks before it picks their heads, and
+        // picks them again under the locks.
+        //
+        // Two `int` keys rather than the claim lock's one `bigint`: the queue's, then the
+        // partition's, which lets one statement lock a batch. The pair is part of the on-database
+        // protocol.
+        // Not on CockroachDB, which grants every advisory lock: there each batch runs at
+        // `SERIALIZABLE`, which aborts the sweep that would co-admit.
+        let partition_locks = if self.claims_take_locks().await? {
+            Some(partition_claim_queue_id(&self.schema, &queue.name))
+        } else {
+            None
+        };
+        // **Pinned, never the server's default**, for the reason `start_queued_workflows` gives:
+        // under the locks, read committed is what lets the heads picked again see what the locks'
+        // previous holders committed. Without them, serializable is the whole of the protection,
+        // and a CockroachDB cluster can default to read committed.
+        let begin_batch = if partition_locks.is_some() {
+            "BEGIN ISOLATION LEVEL READ COMMITTED"
+        } else {
+            "BEGIN ISOLATION LEVEL SERIALIZABLE"
+        };
 
         // Conflicts are not replayed, as in `start_queued_workflows`: losing a race is the caller's
         // to answer.
         let retry = self.retry.without_conflict_replay();
-        with_retry(
+
+        // **The walk takes no lock and claims nothing.** It finds the partitions worth claiming
+        // from — idle, with a head this executor may run — and each batch below picks their heads
+        // again under its locks.
+        let (is_latest, partitions) = with_retry(
             &retry,
             "start_queued_partitioned_workflows",
             move || async move {
                 let mut tx = pool.begin().await?;
-
                 let is_latest = self
                     .is_latest_application_version(&mut tx, application_version)
                     .await?;
-                // Both statements below place the version at `$3`.
-                let version_predicate = version_predicate(is_latest, 3);
 
-                // Candidate query: $1 queue, $2 application, $3 version. `eligible` is the
-                // shared predicate all three of its uses must agree on — see
-                // `get_queue_partitions`.
-                let eligible_predicate = "queue_name = $1 AND status = 'ENQUEUED' \
-                                          AND ($2::text IS NULL OR application_name = $2 \
-                                               OR application_name IS NULL)";
-
-                // The same loose index scan `get_queue_partitions` uses, then one head per
-                // partition. `workflow_uuid` breaks ties in the head order so every worker ranks
-                // a partition identically — which is what lets the guarded flip below admit at
-                // most one row per partition without anyone counting.
+                // The same loose index scan `get_queue_partitions` uses, then each partition's
+                // head. $1 queue, $2 application, $3 version, $4 the sweep's limit.
                 //
                 // **Partitions are chosen before their heads are looked up.** The `LIMIT` sits in
                 // `chosen`, so a sweep the budget cuts short probes only the partitions it will
@@ -7242,25 +7469,15 @@ impl SystemDatabase for PostgresSystemDatabase {
                 // reports no contention, so the poller scales *back* towards the queue's interval
                 // rather than backing off. Adding `application_version` to
                 // `idx_workflow_status_partition_dequeue_v3` would let `chosen` filter by version
-                // cheaply; that index is shared schema, so it needs a shared migration.
-                //
-                // `LATERAL` rather than a correlated scalar subquery: it plans as a tight nested
-                // loop instead of a slower per-row subplan. `workflow_uuid` totalizes the head
-                // order, so every worker picks the same head under a `created_at` tie, and the
-                // index's trailing `workflow_uuid` keeps the probe a pure top-1 — **for a
-                // partition whose head is eligible.** Where the version predicate rejects every
-                // row the probe is not a top-1 at all: `application_version` is not in the index,
-                // so it walks that partition's entries and heap-checks each to return nothing.
-                // That cost is paid whatever the `LIMIT` bounds, and it is why the index, rather
-                // than the `LIMIT`, is the thing to change. The `NOT EXISTS` on
-                // `PENDING` is unscoped by design — a mutual-exclusion probe must block on any
-                // owner's row.
+                // cheaply; that index is shared schema, so it needs a shared migration. The
+                // `NOT EXISTS` on `PENDING` is unscoped by design — a mutual-exclusion probe must
+                // block on any owner's row.
                 //
                 // **No `--` comments inside this string.** The `\` continuations strip the
                 // newlines that would end them, so a `--` comments out the whole rest of the
                 // statement — including the `) head ON TRUE` alias, which fails as a missing
                 // FROM-clause entry rather than as a syntax error.
-                let candidates: Vec<(String, String)> = sqlx::query_as(AssertSqlSafe(format!(
+                let partitions: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
                     "WITH RECURSIVE partitions AS ( \
                        (SELECT MIN(queue_partition_key) AS pk FROM {workflow_table} \
                          WHERE {eligible_predicate} AND queue_partition_key IS NOT NULL) \
@@ -7280,14 +7497,9 @@ impl SystemDatabase for PostgresSystemDatabase {
                           ) \
                         ORDER BY {sweep_order} LIMIT $4 \
                      ) \
-                     SELECT head.workflow_uuid, chosen.pk FROM chosen \
-                     JOIN LATERAL ( \
-                       SELECT workflow_uuid FROM {workflow_table} \
-                        WHERE {eligible_predicate} AND queue_partition_key = chosen.pk \
-                          AND {version_predicate} \
-                        ORDER BY priority ASC, created_at ASC, workflow_uuid ASC LIMIT 1 \
-                     ) head ON TRUE \
-                     ORDER BY chosen.pk ASC"
+                     SELECT chosen.pk FROM chosen {} \
+                     ORDER BY chosen.pk ASC",
+                    head_of("chosen.pk", &version_predicate(is_latest, 3))
                 )))
                 .bind(&queue.name)
                 .bind(application_name)
@@ -7295,122 +7507,239 @@ impl SystemDatabase for PostgresSystemDatabase {
                 .bind(sweep_limit)
                 .fetch_all(&mut *tx)
                 .await?;
-                if candidates.is_empty() {
-                    tx.commit().await?;
-                    return Ok(Vec::new());
-                }
-                test_hook!(crate::test_hooks::points::PARTITION_CLAIM, &queue.name)?;
-
-                // Re-checks queue, partition and version alongside status, so a row that
-                // `resume_workflows` moved to another queue or partition mid-sweep is dropped
-                // rather than hijacked. $1 ids, $2 queue, $3 version, $4 application, and the
-                // partition keys the candidates were chosen under at `{keys}`.
-                //
-                // **The key is checked against the one the head was chosen under, not just for
-                // being present.** A resume can now change the key of an `ENQUEUED` row, and at
-                // READ COMMITTED one that landed between the candidate query and this claim would
-                // pass a bare `IS NOT NULL`: the row would start in a partition whose running
-                // check never saw it, beside that partition's own `PENDING` row.
-                let claim_predicate = |keys: u8| {
-                    format!(
-                        "(workflow_uuid, queue_partition_key) IN \
-                           (SELECT * FROM unnest($1::text[], ${keys}::text[])) \
-                           AND status = 'ENQUEUED' AND queue_name = $2 \
-                           AND {version_predicate} \
-                           AND ($4::text IS NULL OR application_name = $4 \
-                                OR application_name IS NULL)"
-                    )
-                };
-                let (candidate_ids, candidate_keys): (Vec<&str>, Vec<&str>) = candidates
-                    .iter()
-                    .map(|(id, key)| (id.as_str(), key.as_str()))
-                    .unzip();
-
-                // This `SKIP LOCKED` under-delivers on CockroachDB for the reason given in
-                // `start_queued_workflows`: a head enqueued moments ago is skipped and its
-                // partition idles until the next sweep.
-                //
-                // Locks the fixed candidate set rather than re-selecting with a `LIMIT`, whose
-                // `SKIP LOCKED` could slide past a locked head and admit a partition's second
-                // row ahead of its first.
-                let locked: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
-                    "SELECT workflow_uuid FROM {workflow_table} WHERE {} \
-                     FOR UPDATE SKIP LOCKED",
-                    claim_predicate(5)
-                )))
-                .bind(&candidate_ids)
-                .bind(&queue.name)
-                .bind(application_version)
-                .bind(application_name)
-                .bind(&candidate_keys)
-                .fetch_all(&mut *tx)
-                .await?;
-                let locked: HashSet<&str> = locked.iter().map(String::as_str).collect();
-                // Partition order, so submission follows the sweep rather than the lock order.
-                let (claiming, claiming_keys): (Vec<&str>, Vec<&str>) = candidate_ids
-                    .iter()
-                    .zip(&candidate_keys)
-                    .filter(|(id, _)| locked.contains(**id))
-                    .map(|(id, key)| (*id, *key))
-                    .unzip();
-                if claiming.is_empty() {
-                    tx.commit().await?;
-                    return Ok(Vec::new());
-                }
-
-                // `RETURNING` reports exactly the rows this statement flipped, which is what
-                // makes the guard the admission control rather than a check before one.
-                //
-                // Counts `recovery_attempts` for the reason the unpartitioned sweep gives: both
-                // are claims.
-                //
-                // The deadline saturates, as in the unpartitioned claim; see `now_ms_plus_sql`.
-                let deadline_from_timeout = now_ms_plus_sql("workflow_timeout_ms");
-                let flipped: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
-                    "UPDATE {workflow_table} \
-                     SET status = 'PENDING', executor_id = $5, application_version = $3, \
-                         owner_xid = $6, \
-                         started_at_epoch_ms = {NOW_MS_SQL}, rate_limited = FALSE, \
-                         updated_at = {NOW_MS_SQL}, \
-                         application_name = COALESCE(application_name, $4), \
-                         recovery_attempts = recovery_attempts + 1, \
-                         workflow_deadline_epoch_ms = CASE \
-                             WHEN workflow_timeout_ms IS NOT NULL \
-                              AND workflow_deadline_epoch_ms IS NULL \
-                             THEN {deadline_from_timeout} \
-                             ELSE workflow_deadline_epoch_ms \
-                         END \
-                     WHERE {} RETURNING workflow_uuid",
-                    claim_predicate(7)
-                )))
-                .bind(&claiming)
-                .bind(&queue.name)
-                .bind(application_version)
-                .bind(application_name)
-                .bind(executor_id)
-                .bind(owner_xid)
-                .bind(&claiming_keys)
-                .fetch_all(&mut *tx)
-                .await?;
-
                 tx.commit().await?;
-                let flipped: HashSet<&str> = flipped.iter().map(String::as_str).collect();
-                let started: Vec<String> = claiming
-                    .into_iter()
-                    .filter(|id| flipped.contains(id))
-                    .map(str::to_owned)
-                    .collect();
-                if !started.is_empty() {
-                    tracing::debug!(
-                        queue = %queue.name,
-                        started = started.len(),
-                        "dequeued a partition sweep"
-                    );
-                }
-                Ok(started)
+                Ok((is_latest, partitions))
             },
         )
-        .await
+        .await?;
+        // Both statements of each batch place the version at `$3`.
+        let version_predicate = version_predicate(is_latest, 3);
+
+        // **One short transaction per batch**, so a sweep holds at most a batch's locks, and only
+        // while it claims that batch: a peer's sweep waits for none of them, it passes them by.
+        //
+        // **Only the first batch waits out a lost connection.** Once a batch has committed, its
+        // claims are `PENDING` and reach dispatch only when this sweep returns, so a later batch
+        // that blocked on a connection failure would hold them back for as long as the database
+        // is away. A later batch reports the failure instead, and the sweep returns what it has.
+        let later_batch_retry = RetryPolicy {
+            retry_connection_errors: false,
+            ..retry
+        };
+        let mut started: Vec<String> = Vec::new();
+        for batch in partitions.chunks(self.partition_batch_size.get()) {
+            let lock_ids: Vec<i32> = batch.iter().map(|pk| partition_claim_lock_id(pk)).collect();
+            let (version_predicate, lock_ids) = (version_predicate.as_str(), lock_ids.as_slice());
+            let claimed = with_retry(
+                if started.is_empty() {
+                    &retry
+                } else {
+                    &later_batch_retry
+                },
+                "start_queued_partitioned_workflows",
+                move || async move {
+                    let mut tx = pool.begin_with(begin_batch).await?;
+                    test_hook!(crate::test_hooks::points::PARTITION_LOCKS, &queue.name)?;
+
+                    // The partitions of this batch no peer is claiming from. One a peer holds is
+                    // left to it, or to the next poll.
+                    let held: Vec<String> = match partition_locks {
+                        Some(queue_id) => {
+                            sqlx::query_scalar(
+                                "SELECT coalesce(array_agg(p.pk), '{}') \
+                                 FROM unnest($1::text[], $2::int4[]) AS p(pk, lock_id) \
+                                 WHERE pg_try_advisory_xact_lock($3, p.lock_id)",
+                            )
+                            .bind(batch)
+                            .bind(lock_ids)
+                            .bind(queue_id)
+                            .fetch_one(&mut *tx)
+                            .await?
+                        }
+                        None => batch.to_vec(),
+                    };
+                    if held.len() < batch.len() {
+                        tracing::debug!(
+                            queue = %queue.name,
+                            skipped = batch.len() - held.len(),
+                            "peers hold some partitions' claim locks; passing them by"
+                        );
+                    }
+                    if held.is_empty() {
+                        tx.commit().await?;
+                        return Ok(Vec::new());
+                    }
+
+                    // **The heads are picked again under the locks**, which is what the locks are
+                    // for: this sees what the locks' previous holders committed, and any head that
+                    // has arrived since the walk. $1 queue, $2 application, $3 version, $4 the
+                    // partitions held.
+                    let candidates: Vec<(String, String)> = sqlx::query_as(AssertSqlSafe(format!(
+                        "SELECT head.workflow_uuid, batch.pk \
+                             FROM unnest($4::text[]) AS batch(pk) {} \
+                             WHERE NOT EXISTS ( \
+                               SELECT 1 FROM {workflow_table} \
+                                WHERE queue_name = $1 AND status = 'PENDING' \
+                                  AND queue_partition_key IS NOT NULL \
+                                  AND queue_partition_key = batch.pk \
+                             ) \
+                             ORDER BY batch.pk ASC",
+                        head_of("batch.pk", version_predicate)
+                    )))
+                    .bind(&queue.name)
+                    .bind(application_name)
+                    .bind(application_version)
+                    .bind(&held)
+                    .fetch_all(&mut *tx)
+                    .await?;
+                    if candidates.is_empty() {
+                        tx.commit().await?;
+                        return Ok(Vec::new());
+                    }
+                    test_hook!(crate::test_hooks::points::PARTITION_CLAIM, &queue.name)?;
+
+                    // Re-checks queue, partition and version alongside status, so a row that
+                    // `resume_workflows` moved to another queue or partition since its head was
+                    // picked is dropped rather than hijacked. $1 ids, $2 queue, $3 version, $4
+                    // application, and the partition keys the heads were picked under at `{keys}`.
+                    //
+                    // **The key is checked against the one the head was picked under, not just for
+                    // being present.** A resume can change the key of an `ENQUEUED` row, and takes
+                    // no partition lock to do it, so one that landed between the pick and this
+                    // claim would pass a bare `IS NOT NULL`: the row would start in a partition
+                    // whose running check never saw it, beside that partition's own `PENDING` row.
+                    let claim_predicate = |keys: u8| {
+                        format!(
+                            "(workflow_uuid, queue_partition_key) IN \
+                               (SELECT * FROM unnest($1::text[], ${keys}::text[])) \
+                               AND status = 'ENQUEUED' AND queue_name = $2 \
+                               AND {version_predicate} \
+                               AND ($4::text IS NULL OR application_name = $4 \
+                                    OR application_name IS NULL)"
+                        )
+                    };
+                    let (candidate_ids, candidate_keys): (Vec<&str>, Vec<&str>) = candidates
+                        .iter()
+                        .map(|(id, key)| (id.as_str(), key.as_str()))
+                        .unzip();
+
+                    // This `SKIP LOCKED` under-delivers on CockroachDB for the reason given in
+                    // `start_queued_workflows`: a head enqueued moments ago is skipped and its
+                    // partition idles until the next sweep.
+                    //
+                    // Locks the fixed candidate set rather than re-selecting with a `LIMIT`, whose
+                    // `SKIP LOCKED` could slide past a locked head and admit a partition's second
+                    // row ahead of its first.
+                    let locked: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
+                        "SELECT workflow_uuid FROM {workflow_table} WHERE {} \
+                         FOR UPDATE SKIP LOCKED",
+                        claim_predicate(5)
+                    )))
+                    .bind(&candidate_ids)
+                    .bind(&queue.name)
+                    .bind(application_version)
+                    .bind(application_name)
+                    .bind(&candidate_keys)
+                    .fetch_all(&mut *tx)
+                    .await?;
+                    let locked: HashSet<&str> = locked.iter().map(String::as_str).collect();
+                    // Partition order, so submission follows the sweep rather than the lock order.
+                    let (claiming, claiming_keys): (Vec<&str>, Vec<&str>) = candidate_ids
+                        .iter()
+                        .zip(&candidate_keys)
+                        .filter(|(id, _)| locked.contains(**id))
+                        .map(|(id, key)| (*id, *key))
+                        .unzip();
+                    if claiming.is_empty() {
+                        tx.commit().await?;
+                        return Ok(Vec::new());
+                    }
+
+                    // `RETURNING` reports exactly the rows this statement flipped, which is what
+                    // makes the guard the admission control rather than a check before one.
+                    //
+                    // Counts `recovery_attempts` for the reason the unpartitioned sweep gives: both
+                    // are claims.
+                    //
+                    // The deadline saturates, as in the unpartitioned claim; see
+                    // `now_ms_plus_sql`.
+                    let deadline_from_timeout = now_ms_plus_sql("workflow_timeout_ms");
+                    let flipped: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
+                        "UPDATE {workflow_table} \
+                         SET status = 'PENDING', executor_id = $5, application_version = $3, \
+                             owner_xid = $6, \
+                             started_at_epoch_ms = {NOW_MS_SQL}, rate_limited = FALSE, \
+                             updated_at = {NOW_MS_SQL}, \
+                             application_name = COALESCE(application_name, $4), \
+                             recovery_attempts = recovery_attempts + 1, \
+                             workflow_deadline_epoch_ms = CASE \
+                                 WHEN workflow_timeout_ms IS NOT NULL \
+                                  AND workflow_deadline_epoch_ms IS NULL \
+                                 THEN {deadline_from_timeout} \
+                                 ELSE workflow_deadline_epoch_ms \
+                             END \
+                         WHERE {} RETURNING workflow_uuid",
+                        claim_predicate(7)
+                    )))
+                    .bind(&claiming)
+                    .bind(&queue.name)
+                    .bind(application_version)
+                    .bind(application_name)
+                    .bind(executor_id)
+                    .bind(owner_xid)
+                    .bind(&claiming_keys)
+                    .fetch_all(&mut *tx)
+                    .await?;
+
+                    tx.commit().await?;
+                    let flipped: HashSet<&str> = flipped.iter().map(String::as_str).collect();
+                    Ok(claiming
+                        .into_iter()
+                        .filter(|id| flipped.contains(id))
+                        .map(str::to_owned)
+                        .collect::<Vec<String>>())
+                },
+            )
+            .await;
+            match claimed {
+                Ok(claimed) => started.extend(claimed),
+                // **Earlier batches committed, and their claims must reach dispatch**: a claimed
+                // row nobody dispatches stays `PENDING` until recovery, and gates its partition
+                // the whole time. So the sweep stops here and returns them; the next poll retries
+                // the rest.
+                Err(error) if !started.is_empty() => {
+                    if matches!(
+                        &error,
+                        Error::Backend(BackendError {
+                            kind: BackendErrorKind::Conflict,
+                            ..
+                        })
+                    ) {
+                        tracing::debug!(
+                            queue = %queue.name, claimed = started.len(), error = %error,
+                            "a peer won a batch of the partitioned sweep; keeping what it claimed"
+                        );
+                    } else {
+                        tracing::warn!(
+                            queue = %queue.name, claimed = started.len(), error = %error,
+                            "stopping a partitioned sweep after a failed batch; keeping what it \
+                             claimed"
+                        );
+                    }
+                    break;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        if !started.is_empty() {
+            tracing::debug!(
+                queue = %queue.name,
+                started = started.len(),
+                "dequeued a partition sweep"
+            );
+        }
+        Ok(started)
     }
 
     async fn get_deduplication_key_holder(
@@ -8561,6 +8890,7 @@ mod tests {
     use super::{
         AssertSqlSafe, NOW_MS_SQL, PgSeverity, PollingConcurrency, PostgresSystemDatabase,
         RetryPolicy, Settings, classify_sqlstate, is_transport_failure, latest_version_sql,
+        lock_name, partition_claim_lock_id, partition_claim_queue_id, queue_claim_lock_key,
         split_database, step_listing_query, timed_out_sweep_sql, with_retry,
     };
     use crate::sysdb::types::{
@@ -9819,5 +10149,63 @@ mod tests {
             ),
             "the adoption is the parent's alone"
         );
+    }
+
+    /// **The claim lock keys follow the on-database protocol's formula**, or claimers in different
+    /// languages on the same queue would take different locks and both spend the budget.
+    ///
+    /// The expected values pin that formula: the name as compact JSON, then the SHA-256 of its
+    /// UTF-8 bytes read big-endian — its first eight bytes for a claim lock, bytes 4–7 of the
+    /// partition-claim name and bytes 0–3 of the partition key's own hash for the sweep's pair.
+    #[test]
+    fn claim_lock_keys_follow_the_shared_formula() {
+        // The name itself, character for character.
+        assert_eq!(
+            lock_name(&[Some("dbos.queue_claim"), Some("dbos"), Some("orders"), None]),
+            r#"["dbos.queue_claim","dbos","orders",null]"#
+        );
+        assert_eq!(
+            lock_name(&[Some("q\"\u{1}\u{8}\u{c}\u{7f}\u{2028}é😀")]),
+            "[\"q\\\"\\u0001\\b\\f\u{7f}\u{2028}é😀\"]",
+            "quotes and control characters escaped, nothing else"
+        );
+
+        for (schema, queue, partition, key) in [
+            ("dbos", "orders", None, 8929993115748756812),
+            ("dbos", "orders", Some("alpha"), -5914539597006512337),
+            (
+                "my_schema",
+                "queue \"q\"",
+                Some("ключ-é😀"),
+                -5686958513727008818,
+            ),
+            (
+                "dbos",
+                "tab\tq",
+                Some("line\nbreak\\"),
+                -3481558939802086868,
+            ),
+            (
+                "dbos",
+                "q\u{1}\u{8}\u{c}\u{7f}\u{2028}",
+                None,
+                -6693096782072589637,
+            ),
+        ] {
+            assert_eq!(
+                queue_claim_lock_key(schema, queue, partition),
+                key,
+                "{schema} {queue:?} {partition:?}"
+            );
+        }
+
+        assert_eq!(partition_claim_queue_id("dbos", "orders"), 90898642);
+        for (partition, id) in [
+            ("alpha", -1898711379),
+            ("p0", 379280258),
+            ("ключ-é😀", 1192220896),
+        ] {
+            assert_eq!(partition_claim_lock_id(partition), id, "{partition:?}");
+        }
     }
 }

@@ -63,6 +63,14 @@ pub fn is_stream_closed(value: &str, serialization: Option<&str>) -> bool {
 /// only while its head is running.
 pub const PARTITIONED_DEQUEUE_SWEEP_CAP: u32 = 8192;
 
+/// Partitions a partitioned sweep claims per transaction.
+///
+/// Bounds how many partition locks a sweep holds at once, and for how long: each batch is its own
+/// short transaction, so a peer's sweep meets at most this many held partitions, and only while
+/// this one claims them.
+pub const PARTITIONED_DEQUEUE_BATCH_SIZE: std::num::NonZeroUsize =
+    std::num::NonZeroUsize::new(64).unwrap();
+
 pub mod error;
 mod masked_url;
 pub mod migrations;
@@ -1350,12 +1358,12 @@ pub trait SystemDatabase: Send + Sync {
     /// taken by whichever application dequeues it first, which is how work enqueued by a nameless
     /// client finds a runner.
     ///
-    /// Limits narrow what is taken, rate limits first — a queue already at one returns nothing
-    /// without selecting anything — then the concurrency limits, whose tightest budget wins:
+    /// Limits narrow what is taken, in this order, the tightest budget winning; a limit with no
+    /// room left returns without selecting anything:
     ///
-    /// - **Rate limit**, against the starts in the trailing window.
     /// - **Worker concurrency**, against `local_running_count` — what this process is already
     ///   running, which it knows without asking the database.
+    /// - **Rate limit**, against the starts in the trailing window.
     /// - **Global concurrency**, against the `PENDING` count across every executor.
     ///
     /// **`partition_key` narrows the selection and adds a second scope; it does not move the
@@ -1367,11 +1375,27 @@ pub trait SystemDatabase: Send + Sync {
     /// Each limit applies at the scope its column names, and the stored `partition_queue` flag plays
     /// no part; see [`QueueRecord::is_partitioned`].
     ///
-    /// A queue with global concurrency or a rate limit runs at `REPEATABLE READ` and locks with
-    /// `NOWAIT`, so every executor sees a consistent count rather than a partial one — at
-    /// `SERIALIZABLE` when a `partition_key` is given, since sweeps of different partitions spend
-    /// the same queue-wide budget. Without those limits it stays at `READ COMMITTED` and uses
-    /// `SKIP LOCKED`.
+    /// **A claim that spends a shared budget takes turns on a lock over it.** Any concurrency or
+    /// rate limit other than a worker's is such a budget, and before counting it the claim takes
+    /// a transaction-scoped advisory lock on the budget's scope: the partition when every shared
+    /// limit it spends is the partition's, and the whole queue when any is queue-wide. Row locks
+    /// alone would not do, because two claimers whose candidates differ pick different heads and
+    /// lock different rows. The claim then counts, selects and claims at `READ COMMITTED`, so it
+    /// sees what the lock's previous holder committed, and locks its rows with `NOWAIT`. The lock
+    /// key is part of the on-database protocol, so claimers in any language on the same queue take
+    /// turns.
+    ///
+    /// **A claim that finds the lock held claims nothing** and reports
+    /// [`DequeueStop::ClaimLock`] or [`DequeueStop::PartitionClaimLock`]: a peer is claiming
+    /// from that budget, so the next poll tries again. CockroachDB grants every advisory lock, so
+    /// there the claim takes none and runs at `SERIALIZABLE` instead. Without a shared budget a
+    /// claim runs at `READ COMMITTED`, takes no lock, and uses `SKIP LOCKED`.
+    ///
+    /// **A partitioned queue needs a `partition_key`**: its per-partition limits are counted
+    /// within a key, so a claim across every partition is [`Error::InvalidInput`].
+    ///
+    /// The worker limits are checked first, before any transaction, so a worker with no room
+    /// never holds a lock a peer with room is waiting on.
     ///
     /// **A lost race is returned, not retried.** A `NOWAIT` conflict (`55P03`) surfaces as a
     /// backend error rather than an empty result, and a serialization failure (`40001`) is
@@ -1391,11 +1415,13 @@ pub trait SystemDatabase: Send + Sync {
     /// the executions dispatched from them present it on every write they make.
     ///
     /// **A limit with no room left is reported, not just obeyed.** The claim then returns before
-    /// selecting anything, naming the limit in [`Dequeued::stopped_by`]. A caller walking
+    /// selecting anything, naming the limit in [`Dequeued::Stopped`]. A caller walking
     /// partitions reads it to end the walk when the limit is queue-wide, since every other key
     /// would come back the same; see [`DequeueStop::spans_partitions`].
     ///
     /// [`DequeueStop::spans_partitions`]: types::DequeueStop::spans_partitions
+    /// [`DequeueStop::ClaimLock`]: types::DequeueStop::ClaimLock
+    /// [`DequeueStop::PartitionClaimLock`]: types::DequeueStop::PartitionClaimLock
     #[allow(clippy::too_many_arguments)]
     async fn start_queued_workflows(
         &self,
@@ -1429,28 +1455,44 @@ pub trait SystemDatabase: Send + Sync {
     /// The partitioned counterpart to
     /// [`start_queued_workflows`](Self::start_queued_workflows), and a different shape rather
     /// than a variation: instead of taking *n* workflows from one queue, it takes *one* from each
-    /// partition in a single transaction, so a queue with a thousand partitions costs one sweep
-    /// rather than a thousand polls.
+    /// partition, a batch of partitions per transaction ([`PARTITIONED_DEQUEUE_BATCH_SIZE`] unless
+    /// the backend is told otherwise), so a queue with a thousand partitions costs one sweep rather
+    /// than a thousand polls.
     ///
     /// **Only valid for a queue whose one limit is partition concurrency 1**, which is
     /// [`Error::InvalidInput`] otherwise — no queue-wide concurrency, and neither rate limit. That
-    /// restriction is what makes the sweep safe without counting: every worker ranks each
-    /// partition's head identically, and the `PENDING` gate admits at most one row per partition,
-    /// so the limit is enforced by the data rather than by a count. Anything else a queue can
-    /// carry has to be counted within each key, which is what walking the partitions one at a time
-    /// through [`start_queued_workflows`](Self::start_queued_workflows) is for.
+    /// restriction is what makes the sweep safe without counting: a partition with a `PENDING`
+    /// row is passed by, so the limit is enforced by the data rather than by a count. Anything
+    /// else a queue can carry has to be counted within each key, which is what walking the
+    /// partitions one at a time through [`start_queued_workflows`](Self::start_queued_workflows)
+    /// is for.
+    ///
+    /// **Each batch takes its partitions' advisory locks before it picks their heads**, because
+    /// two sweeps whose candidates differ pick different heads and lock different rows, and the
+    /// `PENDING` gate alone would let both start theirs. A partition whose lock a peer holds is
+    /// passed by, left to that peer or to the next poll; the heads of the rest are picked again
+    /// under the locks, so a peer's earlier claim is seen. The locks' keys are part of the
+    /// on-database protocol.
+    /// CockroachDB grants every advisory lock, so there a batch takes none and relies on the
+    /// `SERIALIZABLE` it runs at.
+    ///
+    /// **A batch that fails after earlier ones committed ends the sweep, which returns what they
+    /// claimed**, so it is dispatched; the next poll retries the rest. A failure before anything
+    /// committed is returned.
     ///
     /// `partition_worker_concurrency` is deliberately not among them: it is at least 1, and a
     /// partition already capped at one workflow across the whole fleet cannot exceed one in any
     /// single process, so it could never bind here.
     ///
     /// `max_tasks` is the caller's own remaining budget — its worker concurrency less what it is
-    /// already running — and bounds the sweep alongside
-    /// [`PARTITIONED_DEQUEUE_SWEEP_CAP`], so a process near its limit does not claim heads it must
-    /// immediately sit on. `None` is unbounded; `Some(0)` returns without a query.
+    /// already running — and bounds the sweep alongside the backend's cap, so a process near its
+    /// limit does not claim heads it must immediately sit on. `None` is unbounded; `Some(0)`
+    /// returns without a query.
     ///
-    /// At most [`PARTITIONED_DEQUEUE_SWEEP_CAP`]
-    /// partitions per sweep; the rest arrive on later polls.
+    /// At most the cap's worth of partitions per sweep ([`PARTITIONED_DEQUEUE_SWEEP_CAP`] unless
+    /// the backend is told otherwise); the rest arrive on later polls. Under the cap the heads are
+    /// claimed in key order; when the caller's budget is the tighter bound, in random order, so a
+    /// budget-bound worker does not take the lowest keys every time.
     async fn start_queued_partitioned_workflows(
         &self,
         queue: &QueueRecord,

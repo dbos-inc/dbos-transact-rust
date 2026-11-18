@@ -164,8 +164,11 @@ impl Queue {
 ///
 /// **`worker_` is the whole of what says "this process"**, and its absence says every executor.
 /// The fleet-wide pair is counted in the database against `PENDING` rows, which is what makes a
-/// queue carrying either run its claim at `REPEATABLE READ`; the per-process pair is answered from
-/// a local tally without a round trip, which is why it is the cheap limit.
+/// queue carrying either serialize its claims on a lock over the budget; the per-process pair is
+/// answered from a local tally without a round trip, which is why it is the cheap limit.
+///
+/// **Exact only once every claimer on the queue takes that lock.** An older claimer sharing the
+/// queue that does not take it can still admit a workflow past the budget.
 ///
 /// **Every limit set is enforced, and the tightest wins.** They are not alternatives: a queue can
 /// say "sixty at a time overall, four per customer, and no more than two of those in any one
@@ -190,8 +193,10 @@ impl Queue {
 pub struct QueueOptions {
     /// How many of this queue's workflows may run at once across every executor.
     ///
-    /// Counted in the database against `PENDING` rows, so it costs the dequeue a consistent read —
-    /// a queue carrying this runs its claim at `REPEATABLE READ` rather than `READ COMMITTED`.
+    /// Counted in the database against `PENDING` rows, so it costs the dequeue a consistent read:
+    /// claims from a queue carrying this take turns on a lock over the queue, so two executors
+    /// never spend the same room. On CockroachDB, which has no such lock, they run at
+    /// `SERIALIZABLE` instead.
     ///
     /// **Fleet-wide**, which is what an unqualified concurrency limit means here: it counts the
     /// `PENDING` rows of every executor, not this process's.
@@ -227,9 +232,8 @@ pub struct QueueOptions {
     /// How fast this queue's workflows may start, or `None` for unthrottled.
     ///
     /// Counted in the database against the starts in the trailing window, so — like
-    /// [`concurrency`](Self::concurrency) — a queue carrying one runs its claim at
-    /// `REPEATABLE READ` rather than `READ COMMITTED`. A queue already at its limit returns
-    /// nothing without selecting anything.
+    /// [`concurrency`](Self::concurrency) — claims from a queue carrying one take turns on a lock
+    /// over the queue. A queue already at its limit returns nothing without selecting anything.
     ///
     /// Queue-wide, so a partitioned queue may carry this *and* a
     /// [`partition_rate_limit`](Self::partition_rate_limit), and both are enforced.

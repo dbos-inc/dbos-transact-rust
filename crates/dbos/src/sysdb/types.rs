@@ -2487,24 +2487,32 @@ pub enum OnExistingQueue {
     Leave,
 }
 
-/// What one claim from a queue took, and why it took nothing if it did.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Dequeued {
-    /// The workflows this claim started, in dequeue order.
-    pub workflow_ids: Vec<String>,
-    /// The limit that left this claim no room, when one did.
+/// What one claim from a queue did: started workflows, or stopped before selecting any.
+///
+/// Two outcomes and not a list beside an optional reason, because a claim that stops has selected
+/// nothing: there is no claim that both started workflows and was stopped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Dequeued {
+    /// The claim ran, and started these workflows, in dequeue order.
     ///
-    /// Set only when the claim returned before selecting anything, so `workflow_ids` is then
-    /// empty. `None` with nothing claimed means no row was eligible, or a peer took them first.
-    pub stopped_by: Option<DequeueStop>,
+    /// Empty when no row was eligible or a peer took them first. That is not a stop: nothing
+    /// said the queue was full, so it says nothing about the next partition.
+    Started(Vec<String>),
+    /// A limit with no room left, or a peer's claim lock, stopped the claim before it selected
+    /// anything.
+    Stopped(DequeueStop),
 }
 
-/// The limit that left a claim no room to start anything.
+/// The limit that left a claim no room to start anything, or the peer claim that held it off.
 ///
-/// Each is the first limit, in the order the claim checks them, whose remaining room came to zero:
+/// Each limit is the first, in the order the claim checks them, whose remaining room came to zero:
 /// worker concurrency, then the rate limits, then the concurrency limits, the queue-wide one ahead
-/// of the per-partition one at each step.
+/// of the per-partition one at each step. A claim lock is met between the worker limits and the
+/// rest, since the limits counted in the database are counted only once it is held.
+///
+/// Non-exhaustive: a new way for a claim to stop is not a breaking change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DequeueStop {
     /// This process is already running as many of the queue's workflows as it may.
     WorkerConcurrency,
@@ -2518,6 +2526,16 @@ pub enum DequeueStop {
     Concurrency,
     /// The partition already has as many workflows `PENDING` as its concurrency allows.
     PartitionConcurrency,
+    /// Another claim is spending the queue's shared budget right now, so this one claimed
+    /// nothing. That claim holds the lock on the whole queue, which a claim takes when the queue
+    /// carries a queue-wide concurrency or rate limit.
+    ///
+    /// Not a full queue: the peer is claiming from it, so it still has work, and the next poll
+    /// tries again without backing off.
+    ClaimLock,
+    /// Another claim is spending this partition's budget right now, so this one claimed nothing.
+    /// It says nothing about the next key, whose lock is its own.
+    PartitionClaimLock,
 }
 
 impl DequeueStop {
@@ -2528,10 +2546,11 @@ impl DequeueStop {
     /// same thing. A per-partition limit says nothing about the next key.
     pub fn spans_partitions(self) -> bool {
         match self {
-            Self::WorkerConcurrency | Self::RateLimit | Self::Concurrency => true,
+            Self::WorkerConcurrency | Self::RateLimit | Self::Concurrency | Self::ClaimLock => true,
             Self::PartitionWorkerConcurrency
             | Self::PartitionRateLimit
-            | Self::PartitionConcurrency => false,
+            | Self::PartitionConcurrency
+            | Self::PartitionClaimLock => false,
         }
     }
 }

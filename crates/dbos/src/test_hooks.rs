@@ -57,14 +57,37 @@ pub mod points {
     /// again and must find it identical rather than call it nondeterminism.
     pub const STEP_COMMIT: &str = "step_commit";
 
-    /// In the partitioned sweep, **after** it has chosen each partition's head and **before** it
-    /// locks and claims them. Scope: the queue name.
+    /// In `start_queued_workflows`, **after** the claim has selected and locked the rows it will
+    /// start and **before** it marks them `PENDING`. Scope: the queue name.
     ///
-    /// The window a resume can land in: it can change an `ENQUEUED` head's partition key, and the
-    /// claim must drop a head that is no longer in the partition it was chosen for.
+    /// The window two claimers race in: a hook that enqueues a head this claim cannot see, and
+    /// claims it through another handle, makes two claimers pick different heads.
     ///
-    /// The sweep's transaction is open here, and holds a pool connection, but it has locked no
-    /// row yet, so a hook may write the heads it chose without waiting on the sweep.
+    /// The claim's transaction is open here and holds a pool connection, its row locks, and the
+    /// claim lock when it took one, so a hook must not manage the rows it selected.
+    pub const QUEUE_CLAIM: &str = "queue_claim";
+
+    /// In the partitioned sweep, inside a batch's transaction and **before** it takes the batch's
+    /// partition locks (on CockroachDB, which takes none, before it picks the heads). Scope: the
+    /// queue name.
+    ///
+    /// The window before the locks: a head enqueued here, and claimed by another sweep, is one
+    /// this batch must see when it picks its heads under the locks it is about to take.
+    ///
+    /// The batch's transaction is open and holds a pool connection, and nothing else yet.
+    pub const PARTITION_LOCKS: &str = "partition_locks";
+
+    /// In the partitioned sweep, inside a batch's transaction, **after** it has picked each held
+    /// partition's head under that partition's lock and **before** it locks and claims them.
+    /// Scope: the queue name.
+    ///
+    /// Two races land here. Another sweep that runs now finds these partitions' locks held, and
+    /// passes them by. And a resume can change an `ENQUEUED` head's partition key without any
+    /// partition lock, so the claim must drop a head that is no longer in the partition it was
+    /// picked for.
+    ///
+    /// The batch's transaction is open, and holds a pool connection and the partition locks, but
+    /// it has locked no row yet, so a hook may write the heads it picked without waiting on it.
     pub const PARTITION_CLAIM: &str = "partition_claim";
 }
 
