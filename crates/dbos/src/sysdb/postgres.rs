@@ -350,6 +350,18 @@ pub struct Settings<'a> {
     /// Nothing here is load-bearing whatever it is set to: a wakeup only ever shortens a wait that
     /// re-queries on its own interval regardless.
     pub notification_coalesce: Option<Duration>,
+    /// The most partition heads one partitioned sweep claims, before the caller's own budget.
+    /// Defaults to [`PARTITIONED_DEQUEUE_SWEEP_CAP`].
+    ///
+    /// A bound on the work one sweep does: partitions past it are claimed by the next poll. Set
+    /// lower only to test the bound at a size a test can afford.
+    pub partition_sweep_cap: u32,
+    /// The most partitions a partitioned sweep claims in one transaction. Defaults to
+    /// [`PARTITIONED_DEQUEUE_BATCH_SIZE`].
+    ///
+    /// Bounds how many partition locks a sweep holds at once, and for how long. Set lower only to
+    /// test batching with a handful of partitions.
+    pub partition_batch_size: std::num::NonZeroUsize,
 }
 
 impl Default for Settings<'_> {
@@ -365,6 +377,8 @@ impl Default for Settings<'_> {
             application_name: None,
             polling_concurrency: PollingConcurrency::Default,
             notification_coalesce: None,
+            partition_sweep_cap: PARTITIONED_DEQUEUE_SWEEP_CAP,
+            partition_batch_size: PARTITIONED_DEQUEUE_BATCH_SIZE,
         }
     }
 }
@@ -516,6 +530,10 @@ pub struct PostgresSystemDatabase {
     /// see [`dialect`](Self::dialect).
     dialect: tokio::sync::OnceCell<migrations::Dialect>,
     retry: RetryPolicy,
+    /// See [`Settings::partition_sweep_cap`].
+    partition_sweep_cap: u32,
+    /// See [`Settings::partition_batch_size`].
+    partition_batch_size: std::num::NonZeroUsize,
     executor_id: Option<String>,
     /// The application every row this handle writes is stamped with. See
     /// [`Settings::application_name`].
@@ -660,6 +678,8 @@ impl PostgresSystemDatabase {
             schema: config.settings.schema.to_owned(),
             dialect: tokio::sync::OnceCell::new_with(Some(dialect)),
             retry: config.settings.retry,
+            partition_sweep_cap: config.settings.partition_sweep_cap,
+            partition_batch_size: config.settings.partition_batch_size,
             // Copied out: the handle outlives the borrowed configuration.
             executor_id: config.settings.executor_id.map(str::to_owned),
             application_name: config.settings.application_name.map(str::to_owned),
@@ -789,6 +809,8 @@ impl PostgresSystemDatabase {
             schema: settings.schema.to_owned(),
             dialect: tokio::sync::OnceCell::new(),
             retry: settings.retry,
+            partition_sweep_cap: settings.partition_sweep_cap,
+            partition_batch_size: settings.partition_batch_size,
             // Copied out: the handle outlives the borrowed settings.
             executor_id: settings.executor_id.map(str::to_owned),
             application_name: settings.application_name.map(str::to_owned),
@@ -7331,7 +7353,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         }
         // This worker's own budget bounds the sweep alongside the cap, so a process near its
         // worker concurrency does not claim heads it must immediately sit on.
-        let cap = i64::from(PARTITIONED_DEQUEUE_SWEEP_CAP);
+        let cap = i64::from(self.partition_sweep_cap);
         let sweep_limit = max_tasks.map_or(cap, |budget| budget.min(cap));
         // **Random when the budget is what binds, key order when it is not.** An unbounded sweep
         // reaches every partition, so ordering by key is free and makes the claim deterministic.
@@ -7492,7 +7514,7 @@ impl SystemDatabase for PostgresSystemDatabase {
             ..retry
         };
         let mut started: Vec<String> = Vec::new();
-        for batch in partitions.chunks(PARTITIONED_DEQUEUE_BATCH_SIZE) {
+        for batch in partitions.chunks(self.partition_batch_size.get()) {
             let lock_ids: Vec<i32> = batch.iter().map(|pk| partition_claim_lock_id(pk)).collect();
             let (version_predicate, lock_ids) = (version_predicate.as_str(), lock_ids.as_slice());
             let claimed = with_retry(

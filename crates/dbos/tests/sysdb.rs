@@ -13,7 +13,7 @@ use dbos::sysdb::types::{
 };
 use dbos::sysdb::{
     BackendError, BackendErrorKind, DEFAULT_SCHEMA, Error, INTERNAL_QUEUE,
-    PARTITIONED_DEQUEUE_BATCH_SIZE, PORTABLE_JSON, SystemDatabase,
+    PARTITIONED_DEQUEUE_BATCH_SIZE, PARTITIONED_DEQUEUE_SWEEP_CAP, PORTABLE_JSON, SystemDatabase,
 };
 
 use dbos_test_support as support;
@@ -37,6 +37,22 @@ async fn sysdb() -> (PostgresSystemDatabase, support::TestDatabase) {
         PostgresSystemDatabase::from_pool(pool, &Settings::default()),
         db,
     )
+}
+
+/// [`sysdb`] with settings of the test's own, such as a partitioned sweep's bounds at a size a test
+/// can afford.
+async fn sysdb_with(settings: &Settings<'_>) -> (PostgresSystemDatabase, support::TestDatabase) {
+    let db = test_database().await;
+    let pool = db.pool().await;
+    (PostgresSystemDatabase::from_pool(pool, settings), db)
+}
+
+/// Batches of two partitions, so a sweep over three runs two batches.
+fn two_per_batch() -> Settings<'static> {
+    Settings {
+        partition_batch_size: std::num::NonZeroUsize::new(2).unwrap(),
+        ..Settings::default()
+    }
 }
 
 /// A workflow round-trips through the database unchanged.
@@ -13036,6 +13052,87 @@ async fn enqueue_across_partitions(
     ids
 }
 
+/// **A sweep claims at most its cap's worth of partitions, in key order, and the next sweep the
+/// rest.**
+///
+/// The cap is a bound on one sweep's work, not on what is dequeued: a partition past it waits for
+/// the next poll, and the partitions this sweep claimed are passed by then, as their heads run.
+#[tokio::test]
+async fn a_sweep_claims_at_most_its_cap_and_the_next_one_the_rest() {
+    let (sys, db) = sysdb_with(&Settings {
+        partition_sweep_cap: 3,
+        ..Settings::default()
+    })
+    .await;
+    if skip_dequeue_completeness(&db) {
+        return;
+    }
+    let name = unique_queue("sweep-cap");
+    let queue = partitioned_queue(&sys, name).await;
+    let ids = enqueue_across_partitions(&sys, name, 5).await;
+
+    let first = sys
+        .start_queued_partitioned_workflows(&queue, "exec-1", "v1", "claim", None)
+        .await
+        .unwrap();
+    assert_eq!(first, ids[..3], "the cap's worth, the lowest keys first");
+
+    let second = sys
+        .start_queued_partitioned_workflows(&queue, "exec-1", "v1", "claim", None)
+        .await
+        .unwrap();
+    assert_eq!(second, ids[3..], "the rest, on the next sweep");
+}
+
+/// **The tighter of the cap and the caller's budget bounds a sweep, and decides its order.**
+///
+/// Under the cap the sweep reaches every partition it may, so it takes them in key order. When the
+/// budget is tighter it does not, and taking the lowest keys every time would starve the rest, so
+/// it takes them at random.
+#[tokio::test]
+async fn the_tighter_of_the_cap_and_the_budget_bounds_a_sweep() {
+    let (sys, db) = sysdb_with(&Settings {
+        partition_sweep_cap: 3,
+        ..Settings::default()
+    })
+    .await;
+    if skip_dequeue_completeness(&db) {
+        return;
+    }
+    let name = unique_queue("sweep-cap-or-budget");
+    let queue = partitioned_queue(&sys, name).await;
+    let ids = enqueue_across_partitions(&sys, name, 6).await;
+
+    // A budget looser than the cap: the cap binds, in key order.
+    let capped = sys
+        .start_queued_partitioned_workflows(&queue, "exec-1", "v1", "claim", Some(5))
+        .await
+        .unwrap();
+    assert_eq!(capped, ids[..3]);
+
+    // A budget tighter than the cap: the budget binds, from what is left.
+    let budgeted = sys
+        .start_queued_partitioned_workflows(&queue, "exec-1", "v1", "claim", Some(2))
+        .await
+        .unwrap();
+    assert_eq!(budgeted.len(), 2);
+    assert!(
+        budgeted.iter().all(|id| ids[3..].contains(id)),
+        "claimed {budgeted:?}, which the first sweep already had"
+    );
+}
+
+/// A handle with default settings sweeps with the crate's bounds.
+#[test]
+fn the_default_sweep_bounds_are_the_crates_constants() {
+    let settings = Settings::default();
+    assert_eq!(settings.partition_sweep_cap, PARTITIONED_DEQUEUE_SWEEP_CAP);
+    assert_eq!(
+        settings.partition_batch_size,
+        PARTITIONED_DEQUEUE_BATCH_SIZE
+    );
+}
+
 /// An error a hook makes a sweep fail with, which nothing retries.
 fn injected_failure() -> Error {
     Error::Backend(BackendError {
@@ -13056,14 +13153,14 @@ async fn a_failed_batch_keeps_the_claims_of_the_batches_before_it() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    let (sys, db) = sysdb().await;
+    let (sys, db) = sysdb_with(&two_per_batch()).await;
     if skip_dequeue_completeness(&db) {
         return;
     }
     let name = unique_queue("sweep-batch-fails");
     let queue = partitioned_queue(&sys, name).await;
-    // One partition more than a batch holds, so the sweep runs two.
-    let ids = enqueue_across_partitions(&sys, name, PARTITIONED_DEQUEUE_BATCH_SIZE + 1).await;
+    // One partition more than a batch of two holds, so the sweep runs two batches.
+    let ids = enqueue_across_partitions(&sys, name, 3).await;
 
     let batches = Arc::new(AtomicUsize::new(0));
     let hook = dbos::__test_hooks::on(dbos::__test_hooks::points::PARTITION_CLAIM, name, {
@@ -13084,7 +13181,7 @@ async fn a_failed_batch_keeps_the_claims_of_the_batches_before_it() {
         .expect("the first batch's claims should be returned, not the second's failure");
     assert_eq!(hook.fired(), 2);
     drop(hook);
-    assert_eq!(started, ids[..PARTITIONED_DEQUEUE_BATCH_SIZE]);
+    assert_eq!(started, ids[..2]);
     let last = ids.last().unwrap();
     assert_eq!(
         sys.get_workflow(last).await.unwrap().unwrap().status,
@@ -13120,13 +13217,13 @@ async fn a_later_batch_does_not_wait_out_a_lost_connection() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    let (sys, db) = sysdb().await;
+    let (sys, db) = sysdb_with(&two_per_batch()).await;
     if skip_dequeue_completeness(&db) {
         return;
     }
     let name = unique_queue("sweep-batch-loses-connection");
     let queue = partitioned_queue(&sys, name).await;
-    let ids = enqueue_across_partitions(&sys, name, PARTITIONED_DEQUEUE_BATCH_SIZE + 1).await;
+    let ids = enqueue_across_partitions(&sys, name, 3).await;
 
     // The second batch loses its connection once; retried, it would claim the last partition.
     let batches = Arc::new(AtomicUsize::new(0));
@@ -13156,7 +13253,7 @@ async fn a_later_batch_does_not_wait_out_a_lost_connection() {
         "the failed batch should not have been retried"
     );
     drop(hook);
-    assert_eq!(started, ids[..PARTITIONED_DEQUEUE_BATCH_SIZE]);
+    assert_eq!(started, ids[..2]);
     assert_eq!(
         sys.get_workflow(ids.last().unwrap())
             .await

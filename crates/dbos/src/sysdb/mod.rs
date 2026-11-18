@@ -68,7 +68,8 @@ pub const PARTITIONED_DEQUEUE_SWEEP_CAP: u32 = 8192;
 /// Bounds how many partition locks a sweep holds at once, and for how long: each batch is its own
 /// short transaction, so a peer's sweep meets at most this many held partitions, and only while
 /// this one claims them.
-pub const PARTITIONED_DEQUEUE_BATCH_SIZE: usize = 64;
+pub const PARTITIONED_DEQUEUE_BATCH_SIZE: std::num::NonZeroUsize =
+    std::num::NonZeroUsize::new(64).unwrap();
 
 pub mod error;
 mod masked_url;
@@ -1450,8 +1451,9 @@ pub trait SystemDatabase: Send + Sync {
     /// The partitioned counterpart to
     /// [`start_queued_workflows`](Self::start_queued_workflows), and a different shape rather
     /// than a variation: instead of taking *n* workflows from one queue, it takes *one* from each
-    /// partition, a batch of [`PARTITIONED_DEQUEUE_BATCH_SIZE`] partitions per transaction, so a
-    /// queue with a thousand partitions costs one sweep rather than a thousand polls.
+    /// partition, a batch of partitions per transaction ([`PARTITIONED_DEQUEUE_BATCH_SIZE`] unless
+    /// the backend is told otherwise), so a queue with a thousand partitions costs one sweep rather
+    /// than a thousand polls.
     ///
     /// **Only valid for a queue whose one limit is partition concurrency 1**, which is
     /// [`Error::InvalidInput`] otherwise — no queue-wide concurrency, and neither rate limit. That
@@ -1478,12 +1480,14 @@ pub trait SystemDatabase: Send + Sync {
     /// single process, so it could never bind here.
     ///
     /// `max_tasks` is the caller's own remaining budget — its worker concurrency less what it is
-    /// already running — and bounds the sweep alongside
-    /// [`PARTITIONED_DEQUEUE_SWEEP_CAP`], so a process near its limit does not claim heads it must
-    /// immediately sit on. `None` is unbounded; `Some(0)` returns without a query.
+    /// already running — and bounds the sweep alongside the backend's cap, so a process near its
+    /// limit does not claim heads it must immediately sit on. `None` is unbounded; `Some(0)`
+    /// returns without a query.
     ///
-    /// At most [`PARTITIONED_DEQUEUE_SWEEP_CAP`]
-    /// partitions per sweep; the rest arrive on later polls.
+    /// At most the cap's worth of partitions per sweep ([`PARTITIONED_DEQUEUE_SWEEP_CAP`] unless
+    /// the backend is told otherwise); the rest arrive on later polls. Under the cap the heads are
+    /// claimed in key order; when the caller's budget is the tighter bound, in random order, so a
+    /// budget-bound worker does not take the lowest keys every time.
     async fn start_queued_partitioned_workflows(
         &self,
         queue: &QueueRecord,
