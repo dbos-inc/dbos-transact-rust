@@ -1358,12 +1358,12 @@ pub trait SystemDatabase: Send + Sync {
     /// taken by whichever application dequeues it first, which is how work enqueued by a nameless
     /// client finds a runner.
     ///
-    /// Limits narrow what is taken, rate limits first — a queue already at one returns nothing
-    /// without selecting anything — then the concurrency limits, whose tightest budget wins:
+    /// Limits narrow what is taken, in this order, the tightest budget winning; a limit with no room
+    /// left returns without selecting anything:
     ///
-    /// - **Rate limit**, against the starts in the trailing window.
     /// - **Worker concurrency**, against `local_running_count` — what this process is already
     ///   running, which it knows without asking the database.
+    /// - **Rate limit**, against the starts in the trailing window.
     /// - **Global concurrency**, against the `PENDING` count across every executor.
     ///
     /// **`partition_key` narrows the selection and adds a second scope; it does not move the
@@ -1382,13 +1382,17 @@ pub trait SystemDatabase: Send + Sync {
     /// alone would not do, because two claimers whose candidates differ pick different heads and
     /// lock different rows. The claim then counts, selects and claims at `READ COMMITTED`, so it
     /// sees what the lock's previous holder committed, and locks its rows with `NOWAIT`. The lock
-    /// is named alike in every SDK, so claimers in any language on the same queue take turns.
+    /// key is part of the on-database protocol, so claimers in any language on the same queue take
+    /// turns.
     ///
     /// **A claim that finds the lock held claims nothing** and reports
     /// [`DequeueStop::ClaimLock`] or [`DequeueStop::PartitionClaimLock`]: a peer is claiming
     /// from that budget, so the next poll tries again. CockroachDB grants every advisory lock, so
     /// there the claim takes none and runs at `SERIALIZABLE` instead. Without a shared budget a
     /// claim runs at `READ COMMITTED`, takes no lock, and uses `SKIP LOCKED`.
+    ///
+    /// **A partitioned queue needs a `partition_key`**: its per-partition limits are counted
+    /// within a key, so a claim across every partition is [`Error::InvalidInput`].
     ///
     /// The worker limits are checked first, before any transaction, so a worker with no room
     /// never holds a lock a peer with room is waiting on.
@@ -1467,7 +1471,8 @@ pub trait SystemDatabase: Send + Sync {
     /// two sweeps whose candidates differ pick different heads and lock different rows, and the
     /// `PENDING` gate alone would let both start theirs. A partition whose lock a peer holds is
     /// passed by, left to that peer or to the next poll; the heads of the rest are picked again
-    /// under the locks, so a peer's earlier claim is seen. The locks are named alike in every SDK.
+    /// under the locks, so a peer's earlier claim is seen. The locks' keys are part of the
+    /// on-database protocol.
     /// CockroachDB grants every advisory lock, so there a batch takes none and relies on the
     /// `SERIALIZABLE` it runs at.
     ///

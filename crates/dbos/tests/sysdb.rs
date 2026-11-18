@@ -12161,6 +12161,39 @@ async fn unversioned_work_goes_to_the_latest_version() {
     );
 }
 
+/// **A claim from a partitioned queue needs a partition key.**
+///
+/// The per-partition limits are counted within a key, so a claim with none would take from every
+/// partition at once, past the limit of each.
+#[tokio::test]
+async fn a_claim_from_a_partitioned_queue_needs_a_key() {
+    let (sys, _db) = sysdb().await;
+    let name = unique_queue("keyless-claim");
+    let queue = partitioned_queue(&sys, name).await;
+    enqueue_partitioned(&sys, "wf-keyless-a", name, "a").await;
+    enqueue_partitioned(&sys, "wf-keyless-b", name, "a").await;
+
+    let result = sys
+        .start_queued_workflows(&queue, "exec-1", "v1", "claim", None, 0, 0)
+        .await;
+    assert!(
+        matches!(
+            result,
+            Err(Error::InvalidInput { ref field, .. }) if field == "partition_key"
+        ),
+        "got {result:?}",
+    );
+    assert_eq!(
+        sys.get_workflow("wf-keyless-a")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        WorkflowStatus::Enqueued,
+        "the refusal claimed nothing"
+    );
+}
+
 /// An empty partition key is refused rather than matching nothing.
 ///
 /// `NewWorkflow` and `ForkOptions` both reject one on the way in, so no row can hold it. A
