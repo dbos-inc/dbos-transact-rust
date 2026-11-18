@@ -628,7 +628,9 @@ impl PostgresSystemDatabase {
         // whether it is reported now or as a missing column on some later statement.
         //
         // The dialect is asked here once, for the migrations and for the handle, which keeps it.
-        let prepared = async {
+        //
+        // The runner has already retried what it could; whatever fails here is settled.
+        let dialect = async {
             let dialect = migrations::runner::detect_dialect(&pool).await?;
             if config.migrate {
                 migrations::runner::run_with(
@@ -643,9 +645,8 @@ impl PostgresSystemDatabase {
             }
             Ok::<_, migrations::runner::MigrateError>(dialect)
         }
-        .await;
-        // The runner has already retried what it could; whatever reaches here is settled.
-        let dialect = prepared.map_err(|e| {
+        .await
+        .map_err(|e| {
             Error::Backend(BackendError {
                 message: e.to_string(),
                 sqlstate: None,
