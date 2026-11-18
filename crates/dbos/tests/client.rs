@@ -1313,6 +1313,28 @@ async fn connecting_to_a_database_no_application_has_created_is_refused() {
     assert_eq!(tables, 0, "the client should have created nothing");
 }
 
+/// A client refuses a sharded system schema at connect, and leaves it as it found it.
+#[tokio::test]
+async fn connecting_to_a_sharded_system_schema_is_refused() {
+    let db = raw_database().await;
+    let pool = db.pool().await;
+    dbos_test_support::create_sharded_schema(&pool).await;
+
+    let error = Client::connect(ClientConfig::new(db.url()))
+        .await
+        .expect_err("a sharded schema was accepted");
+    let Error::SystemDatabase(SysdbError::Backend(ref backend)) = error else {
+        panic!("expected a backend error, got {error:?}");
+    };
+    assert_eq!(backend.kind, dbos::sysdb::BackendErrorKind::Permanent);
+    assert!(error.to_string().contains("sharded"), "{error}");
+    assert_eq!(
+        dbos_test_support::sharded_schema_state(&pool).await,
+        (dbos_test_support::SHARDED_SCHEMA_VERSION, 2),
+        "the sharded schema was changed"
+    );
+}
+
 /// Closing is deliberate, and what it closes is the pool every clone shares.
 #[tokio::test]
 async fn closing_ends_the_connection_for_every_clone() {

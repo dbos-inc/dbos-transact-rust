@@ -176,6 +176,43 @@ async fn verify_refuses_a_database_short_of_the_ceiling() {
     );
 }
 
+/// **A sharded system schema is refused**, by both the runner and the check, before either reads
+/// its version or creates anything: that version is in the sharded schema's own numbering, and
+/// migrating on from it would treat the sharded tables as unsharded ones.
+#[tokio::test]
+async fn a_sharded_schema_is_refused_and_left_alone() {
+    let db = raw_database().await;
+    let pool = db.pool().await;
+    support::create_sharded_schema(&pool).await;
+
+    let refused = |error: runner::MigrateError| {
+        assert!(
+            matches!(error, runner::MigrateError::Sharded { ref schema } if schema == SCHEMA),
+            "got {error:?}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("sharded") && message.contains(SCHEMA),
+            "{message}"
+        );
+    };
+    refused(
+        runner::run(&pool, SCHEMA, true)
+            .await
+            .expect_err("a sharded schema was migrated"),
+    );
+    refused(
+        runner::verify(&pool, SCHEMA)
+            .await
+            .expect_err("a sharded schema was verified"),
+    );
+    assert_eq!(
+        support::sharded_schema_state(&pool).await,
+        (support::SHARDED_SCHEMA_VERSION, 2),
+        "the sharded schema was changed"
+    );
+}
+
 /// A fully migrated database passes, which is what makes the check above mean something.
 #[tokio::test]
 async fn verify_accepts_a_fully_migrated_database() {

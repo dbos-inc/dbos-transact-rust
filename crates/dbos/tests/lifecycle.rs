@@ -12,7 +12,7 @@ use dbos::{Config, DBOS, Error};
 use std::borrow::Cow;
 use std::time::Duration;
 
-use dbos_test_support::{TestDatabase, test_database};
+use dbos_test_support::{TestDatabase, raw_database, test_database};
 
 /// A launched instance against a leased database.
 ///
@@ -257,6 +257,28 @@ async fn an_invalid_application_name_is_refused_at_launch() {
     let err = dbos.launch().await.unwrap_err();
     assert!(matches!(err, Error::Config(_)), "{err}");
     assert!(!dbos.is_launched());
+}
+
+/// A launch refuses a sharded system schema before migrating it, and leaves it as it found it.
+#[dbos_test_support::test]
+async fn a_sharded_system_schema_is_refused_at_launch() {
+    let db = raw_database().await;
+    let pool = db.pool().await;
+    dbos_test_support::create_sharded_schema(&pool).await;
+    let dbos = DBOS::new(Config {
+        migrate: true,
+        ..config("sharded-app", &db)
+    });
+
+    let err = dbos.launch().await.unwrap_err();
+    assert!(matches!(err, Error::SystemDatabase(_)), "{err}");
+    assert!(err.to_string().contains("sharded"), "{err}");
+    assert!(!dbos.is_launched());
+    assert_eq!(
+        dbos_test_support::sharded_schema_state(&pool).await,
+        (dbos_test_support::SHARDED_SCHEMA_VERSION, 2),
+        "the sharded schema was migrated"
+    );
 }
 
 /// A launch that fails *after* connecting closes the system database on its way out.

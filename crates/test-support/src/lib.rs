@@ -1481,6 +1481,47 @@ pub async fn set_version_timestamp(
     assert_eq!(updated.rows_affected(), 1, "no version {version_name:?}");
 }
 
+/// The migration version [`create_sharded_schema`] records, in the sharded schema's own numbering.
+pub const SHARDED_SCHEMA_VERSION: i64 = 5;
+
+/// Creates [`DEFAULT_SCHEMA`] as a sharded system schema leaves it, as far as this crate's refusal
+/// of one can see: a `workflow_status` whose primary key leads with `shard_key`, and a
+/// `dbos_migrations` recording [`SHARDED_SCHEMA_VERSION`].
+pub async fn create_sharded_schema(pool: &sqlx::PgPool) {
+    let schema = quote_identifier(DEFAULT_SCHEMA);
+    sqlx::raw_sql(AssertSqlSafe(format!(
+        "CREATE SCHEMA {schema}; \
+         CREATE TABLE {schema}.dbos_migrations (version BIGINT NOT NULL PRIMARY KEY); \
+         INSERT INTO {schema}.dbos_migrations (version) VALUES ({SHARDED_SCHEMA_VERSION}); \
+         CREATE TABLE {schema}.workflow_status ( \
+             shard_key TEXT NOT NULL, workflow_uuid TEXT NOT NULL, status TEXT, \
+             PRIMARY KEY (shard_key, workflow_uuid))"
+    )))
+    .execute(pool)
+    .await
+    .expect("creating the sharded schema failed");
+}
+
+/// The recorded migration version and the table count of [`DEFAULT_SCHEMA`], which a refusal
+/// leaves as [`create_sharded_schema`] made them.
+pub async fn sharded_schema_state(pool: &sqlx::PgPool) -> (i64, i64) {
+    let version: i64 = sqlx::query_scalar(AssertSqlSafe(format!(
+        "SELECT version FROM {}.dbos_migrations",
+        quote_identifier(DEFAULT_SCHEMA)
+    )))
+    .fetch_one(pool)
+    .await
+    .expect("reading the recorded version failed");
+    let tables: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM information_schema.tables WHERE table_schema = $1",
+    )
+    .bind(DEFAULT_SCHEMA)
+    .fetch_one(pool)
+    .await
+    .expect("counting the tables failed");
+    (version, tables)
+}
+
 /// The token of the execution that owns `workflow_id` now, which a test writing as that
 /// execution presents. Panics if no execution owns it.
 pub async fn owner_token(sys: &dyn dbos::sysdb::SystemDatabase, workflow_id: &str) -> String {
