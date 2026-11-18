@@ -631,7 +631,7 @@ impl PostgresSystemDatabase {
         let prepared = async {
             let dialect = migrations::runner::detect_dialect(&pool).await?;
             if config.migrate {
-                migrations::runner::run_in(
+                migrations::runner::run_with(
                     &pool,
                     config.settings.schema,
                     dialect,

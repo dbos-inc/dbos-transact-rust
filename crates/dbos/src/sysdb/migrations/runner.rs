@@ -324,11 +324,11 @@ pub async fn run(
     use_listen_notify: bool,
 ) -> Result<Outcome, MigrateError> {
     let dialect = detect_dialect(pool).await?;
-    run_in(pool, schema, dialect, use_listen_notify).await
+    run_with(pool, schema, dialect, use_listen_notify).await
 }
 
 /// [`run`], for a caller that has already asked the server its dialect.
-pub(crate) async fn run_in(
+pub(crate) async fn run_with(
     pool: &PgPool,
     schema: &str,
     dialect: Dialect,
