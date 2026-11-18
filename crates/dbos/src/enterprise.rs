@@ -123,7 +123,7 @@ impl std::fmt::Debug for ConductorOptions {
     }
 }
 
-/// The running executor, as the enterprise crate's features see it: one engine for all of them.
+/// The running executor, as every enterprise feature sees it.
 ///
 /// Holds the executor's database connection, not the executor: the executor owns what the
 /// enterprise crate builds, so that would be a cycle.
@@ -169,7 +169,7 @@ impl EnterpriseEngine {
         &self.app_version
     }
 
-    /// This `dbos` crate's version, which `executor_info` reports.
+    /// This `dbos` crate's version, which Conductor's `executor_info` reports.
     pub fn dbos_version(&self) -> &'static str {
         env!("CARGO_PKG_VERSION")
     }
