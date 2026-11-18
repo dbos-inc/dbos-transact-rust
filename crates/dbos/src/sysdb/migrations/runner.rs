@@ -129,6 +129,18 @@ pub enum MigrateError {
         /// The version this build's queries are written against.
         required: i64,
     },
+    /// The schema is a sharded DBOS system schema, which this build does not support.
+    ///
+    /// A sharded schema's `workflow_status` has a `shard_key` column, and its tables' primary keys
+    /// lead with it. It records its own migration numbering in `dbos_migrations`, which this
+    /// runner would read as a position in its own sequence and migrate on from there, and no
+    /// statement in this build names a shard key, so every one would read and write across all
+    /// shards' rows. Refused before anything is migrated or verified, and never retried: the
+    /// schema is what it is, and the remedy is to point this build at an unsharded one.
+    Sharded {
+        /// The schema, as configured.
+        schema: String,
+    },
 }
 
 impl std::fmt::Display for MigrateError {
@@ -145,6 +157,13 @@ impl std::fmt::Display for MigrateError {
                  migration {recorded}, and this build needs {required}. Bring it up to date by \
                  launching a DBOS instance with migration enabled, or by migrating out of band."
             ),
+            MigrateError::Sharded { schema } => write!(
+                f,
+                "the DBOS system schema {schema:?} is sharded (its workflow_status table has a \
+                 shard_key column), and DBOS Rust does not support a sharded system database yet. \
+                 Point the schema setting, or the database URL, at an \
+                 unsharded system schema."
+            ),
         }
     }
 }
@@ -154,8 +173,9 @@ impl std::error::Error for MigrateError {
         match self {
             MigrateError::Database(e) | MigrateError::Migration { source: e, .. } => Some(e),
             MigrateError::Render(e) => Some(e),
-            // Nothing failed underneath: the database answered, and its answer was too low.
-            MigrateError::Outdated { .. } => None,
+            // Nothing failed underneath: the database answered, and its answer was too low, or
+            // was a schema this build cannot read.
+            MigrateError::Outdated { .. } | MigrateError::Sharded { .. } => None,
         }
     }
 }
@@ -228,6 +248,27 @@ async fn ensure_schema(pool: &PgPool, schema: &str) -> Result<(), MigrateError> 
             Err(e) if is_already_exists(&e) => {}
             Err(e) => return Err(e.into()),
         }
+    }
+    Ok(())
+}
+
+/// Refuses a sharded system schema: one whose `workflow_status` has a `shard_key` column.
+///
+/// Asked of the catalog, so a schema that does not exist yet, or has no `workflow_status`, passes:
+/// there is nothing sharded about it. See [`MigrateError::Sharded`].
+async fn refuse_sharded(pool: &PgPool, schema: &str) -> Result<(), MigrateError> {
+    let sharded: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
+         WHERE table_schema = $1 AND table_name = 'workflow_status' \
+           AND column_name = 'shard_key')",
+    )
+    .bind(schema)
+    .fetch_one(pool)
+    .await?;
+    if sharded {
+        return Err(MigrateError::Sharded {
+            schema: schema.to_owned(),
+        });
     }
     Ok(())
 }
@@ -311,6 +352,9 @@ async fn drop_invalid_indexes(pool: &PgPool, schema: &str) -> Result<(), sqlx::E
 /// - **A database ahead of this build is left alone.** Another implementation may know
 ///   migrations this one does not. Proceeding would be wrong and refusing to start would be
 ///   worse, so it logs and continues.
+/// - **A sharded schema is refused**, with [`MigrateError::Sharded`], before anything in the
+///   schema is created or read. Its recorded version is in another numbering, so it is not "ahead" or
+///   "behind" in this one.
 /// - **Whole files are executed as one statement batch.** Splitting on `;` would shred the
 ///   `$$`-quoted function bodies.
 /// - **A migration and its version write commit together** wherever a transaction is possible,
@@ -350,6 +394,8 @@ pub(crate) async fn run_with(
 /// `dbos_migrations` has never been migrated, and quietly adding the table would turn that into
 /// version 0 rather than reporting it.
 ///
+/// A sharded schema is refused with [`MigrateError::Sharded`], as [`run`] refuses it.
+///
 /// A database *ahead* of this build passes. That is the same rule [`apply`] follows, and it is
 /// what lets implementations at different versions share one database: the schema only ever
 /// gains, so a newer one still has everything these queries name.
@@ -363,6 +409,9 @@ pub(crate) async fn run_with(
 /// migrated, stopping short of the ceiling, is turned away here rather than read on the
 /// assumption that the missing migrations do not matter.
 pub async fn verify(pool: &PgPool, schema: &str) -> Result<(), MigrateError> {
+    // First, because a sharded schema's recorded version is in another numbering, and comparing
+    // it with this build's would pass or fail it for no reason.
+    refuse_sharded(pool, schema).await?;
     let required = i64::from(SHARED_MIGRATIONS);
     let recorded = match recorded_version(pool, schema).await {
         Ok(version) => version,
@@ -396,6 +445,10 @@ pub async fn apply(
     schema: &str,
     migrations: &[Migration],
 ) -> Result<Outcome, MigrateError> {
+    // Before anything is created or read: a sharded schema records its own migration numbering,
+    // and reading it as a position in this build's would migrate the sharded tables as though
+    // they were unsharded.
+    refuse_sharded(pool, schema).await?;
     ensure_schema(pool, schema).await?;
 
     let latest = migrations.len() as i64;

@@ -593,6 +593,10 @@ pub struct PostgresSystemDatabase {
 impl PostgresSystemDatabase {
     /// Connects, creating the database if it does not exist, and migrates it.
     ///
+    /// A sharded system schema is refused, migrating or not, with a permanent
+    /// [`Error::Backend`]: see
+    /// [`MigrateError::Sharded`](migrations::runner::MigrateError::Sharded).
+    ///
     /// Creating the database is part of connecting rather than part of migrating: you cannot
     /// migrate a database you cannot connect to. Every other DBOS implementation does the same,
     /// so pointing a fresh application at an empty server is expected to work.
@@ -782,6 +786,10 @@ impl PostgresSystemDatabase {
     }
 
     /// Wraps an existing pool, assuming the schema is already migrated.
+    ///
+    /// **Nothing is checked**, a sharded schema included: this constructor makes no query, so it
+    /// cannot refuse one as [`connect`](Self::connect) does. A caller unsure of the schema runs
+    /// [`migrations::runner::verify`] on the pool first.
     ///
     /// For callers that manage their own connections — and for tests, which migrate through the
     /// harness. Takes the same [`Settings`] as [`connect`](Self::connect), so there is one way to
