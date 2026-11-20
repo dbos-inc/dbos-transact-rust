@@ -7,7 +7,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
 use crate::db_connection::DbConnection;
-use crate::enterprise::{ConductorConnection, ConductorEngine};
+use crate::enterprise::{ConductorConnection, EnterpriseEngine};
 use crate::identity::{Environment, Identity};
 use crate::registry::{Registry, RegistrySnapshot};
 use crate::serialization::Serializer;
@@ -96,7 +96,7 @@ impl Executor {
                 prepare(db_conn.sysdb(), &executor_id, &app_version, self_recovery).await?;
             let conductor = match conductor {
                 Some((enterprise, options)) => Some(enterprise.provider().conductor(
-                    ConductorEngine::new(&db_conn, &executor_id, &app_name, &app_version),
+                    EnterpriseEngine::new(&db_conn, &executor_id, &app_name, &app_version),
                     options,
                 )?),
                 None => None,

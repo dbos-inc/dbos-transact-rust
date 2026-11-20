@@ -68,7 +68,7 @@ pub trait EnterpriseProvider: Send + Sync + 'static {
     /// migrated. An error fails the launch.
     fn conductor(
         &self,
-        engine: ConductorEngine,
+        engine: EnterpriseEngine,
         options: ConductorOptions,
     ) -> Result<Box<dyn ConductorConnection>>;
 }
@@ -123,18 +123,18 @@ impl std::fmt::Debug for ConductorOptions {
     }
 }
 
-/// The running executor, as the Conductor client sees it.
+/// The running executor, as every enterprise feature sees it.
 ///
-/// Holds the executor's database connection, not the executor: the executor owns the client, so
-/// that would be a cycle.
-pub struct ConductorEngine {
+/// Holds the executor's database connection, not the executor: the executor owns what the
+/// enterprise crate builds, so that would be a cycle.
+pub struct EnterpriseEngine {
     db_conn: Arc<DbConnection>,
     executor_id: String,
     app_name: String,
     app_version: String,
 }
 
-impl ConductorEngine {
+impl EnterpriseEngine {
     pub(crate) fn new(
         db_conn: &Arc<DbConnection>,
         executor_id: &str,
@@ -154,7 +154,7 @@ impl ConductorEngine {
         self.db_conn.sysdb()
     }
 
-    /// This executor's id, as Conductor knows it.
+    /// This executor's id.
     pub fn executor_id(&self) -> &str {
         &self.executor_id
     }
@@ -169,7 +169,7 @@ impl ConductorEngine {
         &self.app_version
     }
 
-    /// This `dbos` crate's version, which `executor_info` reports.
+    /// This `dbos` crate's version, which Conductor's `executor_info` reports.
     pub fn dbos_version(&self) -> &'static str {
         env!("CARGO_PKG_VERSION")
     }
@@ -185,9 +185,9 @@ impl ConductorEngine {
     }
 }
 
-impl std::fmt::Debug for ConductorEngine {
+impl std::fmt::Debug for EnterpriseEngine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ConductorEngine")
+        f.debug_struct("EnterpriseEngine")
             .field("executor_id", &self.executor_id)
             .field("app_name", &self.app_name)
             .field("app_version", &self.app_version)
@@ -232,7 +232,7 @@ mod tests {
     impl EnterpriseProvider for Nothing {
         fn conductor(
             &self,
-            _: ConductorEngine,
+            _: EnterpriseEngine,
             _: ConductorOptions,
         ) -> Result<Box<dyn ConductorConnection>> {
             Err(crate::Error::Config("no Conductor here".to_owned()))

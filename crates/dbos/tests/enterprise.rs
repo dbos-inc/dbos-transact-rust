@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use dbos::__enterprise::{
-    ConductorConnection, ConductorEngine, ConductorOptions, EnterpriseProvider, async_trait,
+    ConductorConnection, ConductorOptions, EnterpriseEngine, EnterpriseProvider, async_trait,
 };
 use dbos::{Config, DBOS, Enterprise, Error, StartOptions};
 
@@ -26,7 +26,7 @@ const APP_VERSION: &str = "1.0.0";
 struct Seen {
     events: Mutex<Vec<String>>,
     options: Mutex<Option<ConductorOptions>>,
-    engine: Mutex<Option<Arc<ConductorEngine>>>,
+    engine: Mutex<Option<Arc<EnterpriseEngine>>>,
 }
 
 impl Seen {
@@ -38,7 +38,7 @@ impl Seen {
         self.events.lock().unwrap().clone()
     }
 
-    fn engine(&self) -> Arc<ConductorEngine> {
+    fn engine(&self) -> Arc<EnterpriseEngine> {
         Arc::clone(self.engine.lock().unwrap().as_ref().expect("never built"))
     }
 }
@@ -52,7 +52,7 @@ struct FakeEnterprise {
 impl EnterpriseProvider for FakeEnterprise {
     fn conductor(
         &self,
-        engine: ConductorEngine,
+        engine: EnterpriseEngine,
         options: ConductorOptions,
     ) -> dbos::Result<Box<dyn ConductorConnection>> {
         self.seen.record("build");
@@ -69,7 +69,7 @@ impl EnterpriseProvider for FakeEnterprise {
 
 struct FakeConductor {
     seen: Arc<Seen>,
-    engine: Arc<ConductorEngine>,
+    engine: Arc<EnterpriseEngine>,
     hangs_on_stop: bool,
 }
 
